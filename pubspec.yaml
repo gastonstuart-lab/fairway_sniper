@@ -1,0 +1,38 @@
+name: fairway_sniper
+description: "A sophisticated golf tee time automation system that helps you effortlessly secure your preferred slots at Galgorm Castle, complete with a beautiful mobile and web app for seamless management."
+publish_to: "none"
+version: 1.0.0
+
+environment:
+  sdk: ^3.6.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  google_fonts: ^6.1.0
+  firebase_core: ^4.2.0
+  cloud_firestore: '>=5.5.0'
+  firebase_auth: '>=5.3.3'
+  firebase_messaging: ^16.0.0
+  intl: 0.20.2
+  http: ^1.0.0
+  shared_preferences: ^2.0.0
+  url_launcher: ^6.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/icons/dreamflow_icon.jpg
+  remove_alpha_ios: true

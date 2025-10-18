@@ -1,0 +1,85 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Helper function to check if user owns the document
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Helper function to check if user is an admin (god mode)
+    function isAdmin() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+    
+    // User Profiles Collection - Required for admin checks
+    match /users/{userId} {
+      // Anyone authenticated can read user profiles (for admin checks)
+      allow read: if isAuthenticated();
+      
+      // Users can create their own profile
+      allow create: if isOwner(userId);
+      
+      // Users can update their own profile (but cannot set isAdmin themselves)
+      allow update: if isOwner(userId) && 
+                       (!request.resource.data.keys().hasAny(['isAdmin']) || 
+                        resource.data.isAdmin == request.resource.data.isAdmin);
+      
+      // Only admins can delete profiles
+      allow delete: if isAdmin();
+    }
+    
+    // Booking Jobs Collection
+    match /jobs/{jobId} {
+      // Admins can read all jobs, users can read their own
+      allow read: if isAdmin() || 
+                     (isAuthenticated() && resource.data.ownerUid == request.auth.uid);
+      
+      // Users can create jobs with their own UID, admins can create for anyone
+      allow create: if isAdmin() || 
+                       (isAuthenticated() && request.resource.data.ownerUid == request.auth.uid);
+      
+      // Admins can update any job, users can update their own
+      allow update: if isAdmin() || 
+                       (isAuthenticated() && resource.data.ownerUid == request.auth.uid);
+      
+      // Admins can delete any job, users can delete their own
+      allow delete: if isAdmin() || 
+                       (isAuthenticated() && resource.data.ownerUid == request.auth.uid);
+    }
+    
+    // Booking Runs Collection - Execution logs
+    match /runs/{runId} {
+      // Admins can read all runs, users can read runs that have ownerUid matching their uid
+      allow read: if isAdmin() || 
+                     (isAuthenticated() && resource.data.ownerUid == request.auth.uid);
+      
+      // Admins and automation agents can create/update runs
+      allow create, update: if isAdmin() || isAuthenticated();
+      
+      // Only admins can delete runs
+      allow delete: if isAdmin();
+    }
+    
+    // Playwright Agent Control Collection - For admin god-mode control
+    match /agent_commands/{commandId} {
+      // Only admins can read/write agent commands
+      allow read, write: if isAdmin();
+    }
+    
+    // Feedback Collection - User feedback for admin monitoring
+    match /feedback/{feedbackId} {
+      // Users can create feedback, admins can read all feedback
+      allow create: if isAuthenticated();
+      allow read: if isAdmin();
+      allow update, delete: if isAdmin();
+    }
+  }
+}
