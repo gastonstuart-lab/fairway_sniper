@@ -1119,7 +1119,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             child: Row(
               children: [
                 Icon(
-                  isSniper ? Icons.target : Icons.event,
+                  isSniper ? Icons.gps_fixed : Icons.event,
                   color: headerTextColor,
                   size: 20,
                 ),
@@ -1351,84 +1351,87 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const SizedBox(height: 16),
               const Divider(height: 1),
               const SizedBox(height: 16),
-              // Countdown to Booking Time
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF2E7D32).withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(8),
+              // Only show countdown for Sniper mode (Normal mode books immediately)
+              if (job.bookingMode == BookingMode.sniper) ...[
+                // Countdown to Booking Time
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2E7D32).withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.rocket_launch,
+                        size: 20,
+                        color: Color(0xFF2E7D32),
+                      ),
                     ),
-                    child: const Icon(
-                      Icons.rocket_launch,
-                      size: 20,
-                      color: Color(0xFF2E7D32),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Countdown to Booking Time',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: textColor,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '${job.releaseDay} at ${job.releaseTimeLocal}',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: subtextColor,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (timeUntilBooking != null)
-                    StreamBuilder<int>(
-                      stream:
-                          Stream.periodic(const Duration(seconds: 1), (i) => i),
-                      builder: (context, snapshot) {
-                        final updatedTime = job.nextFireTimeUtc!
-                            .difference(DateTime.now().toUtc());
-                        return Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 6),
-                          decoration: BoxDecoration(
-                            gradient: const LinearGradient(
-                              colors: [Color(0xFF2E7D32), Color(0xFF43A047)],
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Countdown to Booking Time',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: textColor,
                             ),
-                            borderRadius: BorderRadius.circular(8),
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(0xFF2E7D32)
-                                    .withValues(alpha: 0.3),
-                                blurRadius: 4,
-                                offset: const Offset(0, 2),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '${job.releaseDay} at ${job.releaseTimeLocal}',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: subtextColor,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (timeUntilBooking != null)
+                      StreamBuilder<int>(
+                        stream:
+                            Stream.periodic(const Duration(seconds: 1), (i) => i),
+                        builder: (context, snapshot) {
+                          final updatedTime = job.nextFireTimeUtc!
+                              .difference(DateTime.now().toUtc());
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF2E7D32), Color(0xFF43A047)],
                               ),
-                            ],
-                          ),
-                          child: Text(
-                            _formatDuration(updatedTime),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
+                              borderRadius: BorderRadius.circular(8),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: const Color(0xFF2E7D32)
+                                      .withValues(alpha: 0.3),
+                                  blurRadius: 4,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
                             ),
-                          ),
-                        );
-                      },
-                    ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              // Countdown to Tee Time
+                            child: Text(
+                              _formatDuration(updatedTime),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+              ],
+              // Countdown to Tee Time (for both Normal and Sniper)
               Row(
                 children: [
                   Container(
@@ -1509,6 +1512,59 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                 ],
               ),
+              // For Normal mode bookings, show BRS website link
+              if (job.bookingMode == BookingMode.normal) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [
+                        const Color(0xFF4A90E2).withValues(alpha: 0.1),
+                        const Color(0xFF357ABD).withValues(alpha: 0.1),
+                      ],
+                    ),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: const Color(0xFF4A90E2).withValues(alpha: 0.3),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.open_in_new,
+                          size: 18, color: Color(0xFF4A90E2)),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Booking Confirmed',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: textColor,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            GestureDetector(
+                              onTap: () => _launchBRSWebsite(),
+                              child: Text(
+                                'View on BRS Website',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: const Color(0xFF4A90E2),
+                                  decoration: TextDecoration.underline,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ],
             if (job.status != 'active')
               Padding(
@@ -1743,6 +1799,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
       return '${minutes}m ${seconds}s';
     } else {
       return '${seconds}s';
+    }
+  }
+
+  Future<void> _launchBRSWebsite() async {
+    final Uri url = Uri.parse('https://members.brsgolf.com/galgorm/');
+    try {
+      if (await canLaunchUrl(url)) {
+        await launchUrl(url, mode: LaunchMode.externalApplication);
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Could not open BRS website')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error opening website: $e')),
+        );
+      }
     }
   }
 

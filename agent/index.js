@@ -905,24 +905,11 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
 
     const browser = await chromium.launch({ headless: true });
 
-    // Try to use stored session from automation/state.json (LIKE TEE-TIMES FUNCTION)
+    // DON'T use stored session for player directory - need fresh login to get correct Player 1 name
     let contextOptions = {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       viewport: { width: 1920, height: 1080 },
     };
-
-    try {
-      const fs = await import('fs');
-      const path = await import('path');
-      const stateFile = path.join(process.cwd(), '../automation/state.json');
-      if (fs.existsSync(stateFile)) {
-        const storageState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-        contextOptions.storageState = storageState;
-        console.log('  Using stored authentication session');
-      }
-    } catch (e) {
-      console.log('  No stored session found');
-    }
 
     const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
@@ -1112,12 +1099,25 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
     const categorizedPlayers = await page.evaluate(() => {
       const select = document.querySelector('select#member_booking_form_player_3');
       if (!select) {
-        return { categories: [], currentMemberId: null, source: 'none' };
+        return { categories: [], currentMemberId: null, currentUserName: null, source: 'none' };
       }
 
-      // Get current member ID
-      const player1Select = document.querySelector('select#member_booking_form_player_1');
-      const currentMemberId = player1Select ? player1Select.value : null;
+      // Get current member ID from the page variable (not Player 1 - that might be someone else's booking!)
+      const currentMemberVar = document.querySelector('var#current-member-id');
+      const currentMemberId = currentMemberVar ? currentMemberVar.getAttribute('data-member-id') : null;
+      let currentUserName = null;
+      
+      // Find the logged-in user's name by searching all player options for their ID
+      if (currentMemberId) {
+        // Search in Player 3 select (which has all players)
+        const allOptions = select.querySelectorAll('option');
+        for (const opt of allOptions) {
+          if (opt.value === currentMemberId) {
+            currentUserName = opt.textContent.trim();
+            break;
+          }
+        }
+      }
 
       const categories = [];
       const allPlayers = [];
@@ -1228,7 +1228,7 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
         }
       }
 
-      return { categories, currentMemberId, source, playerCount: allPlayers.length };
+      return { categories, currentMemberId, currentUserName, source, playerCount: allPlayers.length };
     });
 
     await browser.close();
@@ -1240,6 +1240,9 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
     console.log(
       `  ✅ Found ${totalPlayers} players in ${categorizedPlayers.categories.length} categories (source: ${categorizedPlayers.source})`,
     );
+    if (categorizedPlayers.currentUserName) {
+      console.log(`  👤 Logged-in user: ${categorizedPlayers.currentUserName} (ID: ${categorizedPlayers.currentMemberId})`);
+    }
     if (totalPlayers === 0) {
       console.log('  ⚠️ WARNING: No players extracted; booking form may not have been fully loaded');
     }
@@ -1248,6 +1251,7 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
       success: true,
       categories: categorizedPlayers.categories,
       currentMemberId: categorizedPlayers.currentMemberId,
+      currentUserName: categorizedPlayers.currentUserName,
       count: totalPlayers,
       fetchedAt: new Date().toISOString(),
     });
@@ -1256,6 +1260,65 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch player directory',
+    });
+  }
+});
+
+// Immediate booking endpoint for Normal mode
+// Request body: { username, password, targetDate, preferredTimes: [time1, time2], players: [name1, name2, ...], pushToken }
+app.post('/api/book-now', async (req, res) => {
+  try {
+    const {
+      username,
+      password,
+      targetDate,
+      preferredTimes,
+      players,
+      pushToken,
+    } = req.body;
+
+    // Validate required fields
+    if (!username || !password) {
+      return res.status(400).json({ error: 'BRS credentials are required' });
+    }
+
+    if (!targetDate) {
+      return res.status(400).json({ error: 'Target date is required' });
+    }
+
+    if (!preferredTimes || preferredTimes.length === 0) {
+      return res.status(400).json({ error: 'Preferred times are required' });
+    }
+
+    console.log('\n📲 Immediate Normal Mode Booking Triggered');
+    console.log(`   Target Date: ${targetDate}`);
+    console.log(`   Preferred Times: ${preferredTimes.join(', ')}`);
+    console.log(`   Players: ${players.join(', ')}`);
+
+    // Execute booking immediately
+    const result = await runBooking({
+      jobId: 'immediate-' + Date.now(), // Temporary ID for immediate bookings
+      ownerUid: 'web-user',
+      loginUrl: 'https://members.brsgolf.com/galgorm/login',
+      username,
+      password,
+      preferredTimes,
+      targetFireTime: new Date(), // Fire immediately
+      pushToken,
+      targetPlayDate: targetDate,
+    });
+
+    res.json({
+      success: result.success,
+      result: result.result,
+      error: result.error || null,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('📲 Immediate booking error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to execute immediate booking',
     });
   }
 });

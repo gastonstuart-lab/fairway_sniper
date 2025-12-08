@@ -216,35 +216,159 @@ class _NewJobWizardState extends State<NewJobWizard> {
     );
 
     print('🔵 Job created: ${job.toJson()}');
-    print('🔵 Saving to Firebase...');
 
     try {
-      // Persist credentials if user opted to use or entered them
+      // Persist credentials if user opted to use or enter them
       await _firebaseService.saveBRSCredentials(
           userId, _brsEmailController.text.trim(), _brsPasswordController.text,
           club: _club);
-      final jobId = await _firebaseService.createJob(job);
-      print('✅ Job saved successfully with ID: $jobId');
 
-      if (mounted) {
-        Navigator.of(context).pop();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-              content: Text('Booking job created successfully! ID: $jobId')),
+      // For Normal mode: execute booking immediately
+      if (_mode == BookingMode.normal) {
+        print('🎯 NORMAL MODE - Executing immediate booking...');
+        _showBookingProgressDialog();
+
+        final bookingResult = await _executeImmediateBooking(
+          username: _brsEmailController.text.trim(),
+          password: _brsPasswordController.text,
+          targetDate: _selectedDate!,
+          preferredTimes: [_selectedTime!],
+          players: players,
+          pushToken: fcmToken,
         );
+
+        if (mounted) Navigator.of(context).pop(); // Close progress dialog
+
+        if (bookingResult['success']) {
+          print('✅ Booking executed successfully!');
+          // Save job record to Firebase for history
+          final jobId = await _firebaseService.createJob(
+            job.copyWith(
+              status: 'completed',
+              nextFireTimeUtc: DateTime.now(), // Mark as already executed
+            ),
+          );
+          print('✅ Job saved to Firebase with ID: $jobId');
+
+          if (mounted) {
+            Navigator.of(context).pop();
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  '✅ Tee time booked successfully!\nResult: ${bookingResult['result']}',
+                ),
+                backgroundColor: Colors.green,
+              ),
+            );
+          }
+        } else {
+          print('❌ Booking failed: ${bookingResult['error']}');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Booking failed: ${bookingResult['error']}'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+        }
+      } else {
+        // For Sniper mode: save job to Firebase and schedule for release time
+        print('🎯 SNIPER MODE - Saving job for scheduled execution...');
+        final jobId = await _firebaseService.createJob(job);
+        print('✅ Job saved successfully with ID: $jobId');
+
+        if (mounted) {
+          Navigator.of(context).pop();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Booking job created successfully! ID: $jobId'),
+            ),
+          );
+        }
       }
     } catch (e, stackTrace) {
-      print('❌ Error saving job: $e');
+      print('❌ Error in _saveJob: $e');
       print('❌ Stack trace: $stackTrace');
 
       if (mounted) {
+        if (Navigator.of(context).canPop()) {
+          Navigator.of(context).pop(); // Close progress dialog if open
+        }
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Error creating job: $e'),
+            content: Text('Error: $e'),
             backgroundColor: Colors.red,
           ),
         );
       }
+    }
+  }
+
+  void _showBookingProgressDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: const [
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('Booking tee time...\nPlease wait'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<Map<String, dynamic>> _executeImmediateBooking({
+    required String username,
+    required String password,
+    required DateTime targetDate,
+    required List<String> preferredTimes,
+    required List<String> players,
+    required String? pushToken,
+  }) async {
+    try {
+      final client = http.Client();
+      final response = await client.post(
+        Uri.parse('$_agentBaseUrl/api/book-now'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'username': username,
+          'password': password,
+          'targetDate': targetDate.toIso8601String(),
+          'preferredTimes': preferredTimes,
+          'players': players,
+          'pushToken': pushToken,
+        }),
+      ).timeout(const Duration(seconds: 120));
+
+      print('📲 Booking response status: ${response.statusCode}');
+      print('📲 Booking response body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final result = jsonDecode(response.body) as Map<String, dynamic>;
+        return {
+          'success': result['success'] ?? false,
+          'result': result['result'] ?? 'unknown',
+          'error': result['error'],
+        };
+      } else {
+        return {
+          'success': false,
+          'result': 'error',
+          'error': 'Server error: ${response.statusCode}',
+        };
+      }
+    } catch (e) {
+      print('❌ Immediate booking error: $e');
+      return {
+        'success': false,
+        'result': 'error',
+        'error': e.toString(),
+      };
     }
   }
 
@@ -1171,12 +1295,27 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     if (selected != null) {
       print('🎯 Selected players from modal: $selected');
+      
+      // Auto-prepend logged-in user if not already in list
+      final directory = await _playerDirectoryService.getDirectory(
+        username: _brsEmailController.text,
+        password: _brsPasswordController.text,
+      );
+      
+      final List<String> finalPlayers = [];
+      if (directory?.currentUserName != null && 
+          !selected.contains(directory!.currentUserName)) {
+        print('👤 Auto-adding logged-in user: ${directory.currentUserName}');
+        finalPlayers.add(directory.currentUserName!);
+      }
+      finalPlayers.addAll(selected);
+      
       setState(() {
-        _selectedPlayers = selected
+        _selectedPlayers = finalPlayers
             .map((name) => name.trim())
             .where((name) => name.isNotEmpty)
             .toList();
-        print('🎯 After processing: $_selectedPlayers');
+        print('🎯 Final player list: $_selectedPlayers');
       });
     }
   }
