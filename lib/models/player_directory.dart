@@ -63,10 +63,12 @@ class PlayerCategory {
 class PlayerDirectory {
   final List<PlayerCategory> categories;
   final DateTime fetchedAt;
+  final String? currentUserName; // Name of the logged-in user (from BRS Player 1 slot)
 
   PlayerDirectory({
     required this.categories,
     required this.fetchedAt,
+    this.currentUserName,
   });
 
   factory PlayerDirectory.fromFirestore(Map<String, dynamic> data) {
@@ -80,6 +82,7 @@ class PlayerDirectory {
     return PlayerDirectory(
       categories: categories,
       fetchedAt: fetchedAtTimestamp.toDate(),
+      currentUserName: data['currentUserName'] as String?,
     );
   }
 
@@ -87,6 +90,7 @@ class PlayerDirectory {
     return {
       'categories': categories.map((c) => c.toMap()).toList(),
       'fetchedAt': Timestamp.fromDate(fetchedAt),
+      if (currentUserName != null) 'currentUserName': currentUserName,
     };
   }
 

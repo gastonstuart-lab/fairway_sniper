@@ -158,9 +158,15 @@ class PlayerDirectoryService {
           .map((c) => PlayerCategory.fromMap(c as Map<String, dynamic>))
           .toList();
 
+      final currentUserName = data['currentUserName'] as String?;
+      if (currentUserName != null) {
+        print('👤 Current user: $currentUserName');
+      }
+
       return PlayerDirectory(
         categories: categories,
         fetchedAt: DateTime.now(),
+        currentUserName: currentUserName,
       );
     } catch (e) {
       print('❌ Error fetching player directory from agent: $e');
