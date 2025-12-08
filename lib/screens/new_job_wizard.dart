@@ -1,6 +1,14 @@
-import 'package:flutter/material.dart';
-import 'package:fairway_sniper/services/firebase_service.dart';
+import 'dart:convert';
+
 import 'package:fairway_sniper/models/booking_job.dart';
+import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/services/player_directory_service.dart';
+import 'package:fairway_sniper/widgets/player_selector_modal.dart';
+import 'package:fairway_sniper/widgets/player_list_editor.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:intl/intl.dart';
 
 class NewJobWizard extends StatefulWidget {
   const NewJobWizard({super.key});
@@ -11,6 +19,7 @@ class NewJobWizard extends StatefulWidget {
 
 class _NewJobWizardState extends State<NewJobWizard> {
   final _firebaseService = FirebaseService();
+  late final PlayerDirectoryService _playerDirectoryService;
   final _pageController = PageController();
   int _currentPage = 0;
 
@@ -21,24 +30,35 @@ class _NewJobWizardState extends State<NewJobWizard> {
   String _club = 'galgorm';
   String _releaseDay = 'Tuesday';
   String _releaseTime = '19:20';
-  String _targetDay = 'Saturday';
   DateTime? _targetDate;
-  final List<String> _preferredTimes = [];
-  final List<TextEditingController> _playerControllers = [TextEditingController()];
-
-  final List<String> _weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-  // Standard Galgorm Castle tee times (7-day advance booking window)
-  final List<String> _availableTimes = [
-    '08:00', '08:10', '08:20', '08:30', '08:40', '08:50',
-    '09:00', '09:10', '09:20', '09:30', '09:40', '09:50',
-    '10:00', '10:10', '10:20', '10:30', '10:40', '10:50',
-    '11:00', '11:10', '11:20', '11:30', '11:40', '11:50',
-    '12:00', '12:10', '12:20', '12:30', '12:40', '12:50',
-    '13:00', '13:10', '13:20', '13:30', '13:40', '13:50',
-    '14:00', '14:10', '14:20', '14:30', '14:40', '14:50',
-    '15:00', '15:10', '15:20', '15:30', '15:40', '15:50',
-    '16:00', '16:10', '16:20', '16:30',
+  String? _selectedTime; // For Normal mode: single time selection
+  DateTime? _selectedDate; // For Normal mode: which day the selected time is on
+  int _playerCount = 2; // For Normal mode: how many slots needed
+  List<String> _selectedPlayers = []; // Player names from directory
+  final List<TextEditingController> _playerControllers = [
+    TextEditingController()
   ];
+  static const int _rangeWindowDays = 5;
+  late final String _agentBaseUrl = _resolveAgentBaseUrl();
+  bool _isFetchingAvailability = false;
+  String? _availabilityError;
+  DateTime? _availabilityFetchedAt;
+  DateTime? _focusedAvailabilityDate;
+  List<_DayAvailability> _availabilityDays = [];
+  BookingMode _mode = BookingMode.normal; // booking strategy selection
+  Map<String, String>? _savedCreds; // loaded from Firestore user profile
+  bool _useSavedCreds = true; // default to using saved if present
+  bool _loadingSavedCreds = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _playerDirectoryService = PlayerDirectoryService(
+      firebaseService: _firebaseService,
+      agentBaseUrl: _agentBaseUrl,
+    );
+    _loadSavedCreds();
+  }
 
   @override
   void dispose() {
@@ -51,12 +71,34 @@ class _NewJobWizardState extends State<NewJobWizard> {
     super.dispose();
   }
 
+  Future<void> _loadSavedCreds() async {
+    final uid = _firebaseService.currentUserId;
+    if (uid == null) return;
+    setState(() => _loadingSavedCreds = true);
+    try {
+      final creds = await _firebaseService.loadBRSCredentials(uid);
+      if (!mounted) return;
+      setState(() {
+        _savedCreds = creds;
+        _loadingSavedCreds = false;
+      });
+      if (creds != null) {
+        // Prefill (user can toggle off to edit)
+        _brsEmailController.text = creds['username'] ?? '';
+        _brsPasswordController.text = creds['password'] ?? '';
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loadingSavedCreds = false);
+    }
+  }
+
   Future<void> _nextPage() async {
     // Validate page 0 (BRS Credentials)
     if (_currentPage == 0) {
       final username = _brsEmailController.text.trim();
       final password = _brsPasswordController.text.trim();
-      
+
       if (username.isEmpty || password.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -67,28 +109,57 @@ class _NewJobWizardState extends State<NewJobWizard> {
         return;
       }
     }
-    
-    // Validate page 1 (schedule)
+
+    // Validate booking selection on page 1 (Live availability)
     if (_currentPage == 1) {
-      if (_targetDate == null) {
+      if (_selectedTime == null || _selectedDate == null) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('⚠️ Please select a target play date'),
+            content: Text('Select one tee time before continuing'),
             backgroundColor: Colors.orange,
           ),
         );
         return;
       }
     }
-    
-    if (_currentPage < 4) {
+
+    // Validate players on page 2
+    if (_currentPage == 2) {
+      if (_selectedPlayers.length < _playerCount) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Add $_playerCount player(s) to match party size'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        return;
+      }
+    }
+
+    // Page 1 validation removed - we skipped the Club & Schedule page for Normal mode
+
+    if (_currentPage < 3) {
+      // Changed from 4 to 3 (now 4 pages total)
       _pageController.nextPage(
         duration: const Duration(milliseconds: 300),
         curve: Curves.easeInOut,
       );
     }
   }
-  
+
+  void _handlePageChanged(int page) {
+    setState(() => _currentPage = page);
+    if (page == 1) {
+      // Changed from page 2 to page 1 (now the booking page is second)
+      final hasCredentials = _brsEmailController.text.trim().isNotEmpty &&
+          _brsPasswordController.text.trim().isNotEmpty;
+      if (hasCredentials &&
+          _availabilityDays.isEmpty &&
+          !_isFetchingAvailability) {
+        _refreshRangeFromAgent();
+      }
+    }
+  }
 
   void _previousPage() {
     if (_currentPage > 0) {
@@ -101,30 +172,23 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
   Future<void> _saveJob() async {
     print('🔵 _saveJob called');
-    
+
     final userId = _firebaseService.currentUserId;
     print('🔵 User ID: $userId');
-    
+
     if (userId == null) {
       print('❌ No user ID found');
       return;
     }
 
-    final players = _playerControllers.map((c) => c.text.trim()).where((p) => p.isNotEmpty).toList();
+    // Use selected players from directory
+    final players = _selectedPlayers.isNotEmpty ? _selectedPlayers : ['Guest'];
     print('🔵 Players: $players');
-    
-    if (players.isEmpty) {
-      print('❌ No players found');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please add at least one player')),
-      );
-      return;
-    }
 
-    if (_preferredTimes.isEmpty) {
-      print('❌ No preferred times found');
+    if (_selectedTime == null || _selectedDate == null) {
+      print('❌ No tee time selected');
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select at least one preferred time')),
+        const SnackBar(content: Text('Please select a tee time slot')),
       );
       return;
     }
@@ -133,6 +197,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
     final fcmToken = await _firebaseService.getFCMToken();
     print('🔵 FCM Token: ${fcmToken ?? "null"}');
 
+    // Normal mode: single selected time, immediate booking
     final job = BookingJob(
       ownerUid: userId,
       brsEmail: _brsEmailController.text.trim(),
@@ -141,29 +206,37 @@ class _NewJobWizardState extends State<NewJobWizard> {
       timezone: 'Europe/London',
       releaseDay: _releaseDay,
       releaseTimeLocal: _releaseTime,
-      targetDay: _targetDay,
-      preferredTimes: _preferredTimes,
+      targetDay: DateFormat('EEEE').format(_selectedDate!),
+      preferredTimes: [_selectedTime!], // Single time for Normal mode
       players: players,
       pushToken: fcmToken,
+      bookingMode: _mode,
+      targetPlayDate:
+          _selectedDate, // Store exact date for Normal mode immediate booking
     );
 
     print('🔵 Job created: ${job.toJson()}');
     print('🔵 Saving to Firebase...');
 
     try {
+      // Persist credentials if user opted to use or entered them
+      await _firebaseService.saveBRSCredentials(
+          userId, _brsEmailController.text.trim(), _brsPasswordController.text,
+          club: _club);
       final jobId = await _firebaseService.createJob(job);
       print('✅ Job saved successfully with ID: $jobId');
 
       if (mounted) {
         Navigator.of(context).pop();
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Booking job created successfully! ID: $jobId')),
+          SnackBar(
+              content: Text('Booking job created successfully! ID: $jobId')),
         );
       }
     } catch (e, stackTrace) {
       print('❌ Error saving job: $e');
       print('❌ Stack trace: $stackTrace');
-      
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -180,7 +253,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
     return Container(
       decoration: const BoxDecoration(
         image: DecorationImage(
-          image: AssetImage('assets/images/ultra-hd-golf-course-green-grass-o7ygl39odg1jxipx.jpg'),
+          image: AssetImage(
+              'assets/images/ultra-hd-golf-course-green-grass-o7ygl39odg1jxipx.jpg'),
           fit: BoxFit.cover,
         ),
       ),
@@ -208,11 +282,10 @@ class _NewJobWizardState extends State<NewJobWizard> {
                   child: PageView(
                     controller: _pageController,
                     physics: const NeverScrollableScrollPhysics(),
-                    onPageChanged: (page) => setState(() => _currentPage = page),
+                    onPageChanged: _handlePageChanged,
                     children: [
                       _buildPage0BrsCredentials(),
-                      _buildPage1(),
-                      _buildPage2(),
+                      _buildPage2(), // Skip page 1 (Club & Schedule) for Normal mode - go straight to booking
                       _buildPage3(),
                       _buildPage4(),
                     ],
@@ -231,10 +304,11 @@ class _NewJobWizardState extends State<NewJobWizard> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
       child: Row(
-        children: List.generate(5, (index) {
+        children: List.generate(4, (index) {
+          // Changed from 5 to 4 steps
           final isActive = index == _currentPage;
           final isCompleted = index < _currentPage;
-          
+
           return Expanded(
             child: Container(
               height: 4,
@@ -273,6 +347,69 @@ class _NewJobWizardState extends State<NewJobWizard> {
                   color: Colors.grey.shade600,
                 ),
           ),
+          const SizedBox(height: 16),
+          if (_loadingSavedCreds)
+            const LinearProgressIndicator()
+          else if (_savedCreds != null) ...[
+            Card(
+              color: Colors.green.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    const Icon(Icons.check_circle, color: Colors.green),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Saved credentials found. Use them or toggle off to enter different ones.',
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodySmall
+                            ?.copyWith(color: Colors.green.shade800),
+                      ),
+                    ),
+                    Switch(
+                      value: _useSavedCreds,
+                      onChanged: (v) {
+                        setState(() => _useSavedCreds = v);
+                        if (v && _savedCreds != null) {
+                          _brsEmailController.text =
+                              _savedCreds!['username'] ?? '';
+                          _brsPasswordController.text =
+                              _savedCreds!['password'] ?? '';
+                        } else if (!v) {
+                          _brsEmailController.clear();
+                          _brsPasswordController.clear();
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ] else ...[
+            Card(
+              color: Colors.yellow.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline, color: Colors.orange),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'No saved credentials yet. They will be stored after you create your first job.',
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodySmall
+                            ?.copyWith(color: Colors.orange.shade800),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 32),
           TextField(
             controller: _brsEmailController,
@@ -285,9 +422,11 @@ class _NewJobWizardState extends State<NewJobWizard> {
                 icon: Icon(
                   _obscureUsername ? Icons.visibility : Icons.visibility_off,
                 ),
-                onPressed: () => setState(() => _obscureUsername = !_obscureUsername),
+                onPressed: () =>
+                    setState(() => _obscureUsername = !_obscureUsername),
               ),
             ),
+            enabled: !_useSavedCreds || _savedCreds == null,
           ),
           const SizedBox(height: 20),
           TextField(
@@ -301,9 +440,11 @@ class _NewJobWizardState extends State<NewJobWizard> {
                 icon: Icon(
                   _obscurePassword ? Icons.visibility : Icons.visibility_off,
                 ),
-                onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                onPressed: () =>
+                    setState(() => _obscurePassword = !_obscurePassword),
               ),
             ),
+            enabled: !_useSavedCreds || _savedCreds == null,
           ),
           const SizedBox(height: 24),
           Container(
@@ -337,12 +478,16 @@ class _NewJobWizardState extends State<NewJobWizard> {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(Icons.warning_amber_rounded, color: Colors.orange.shade700),
+                Icon(Icons.warning_amber_rounded,
+                    color: Colors.orange.shade700),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
                     'Important: If your BRS Golf credentials are incorrect, the booking process will fail. Please double-check your username and password.',
-                    style: TextStyle(fontSize: 13, color: Colors.orange.shade900, fontWeight: FontWeight.w500),
+                    style: TextStyle(
+                        fontSize: 13,
+                        color: Colors.orange.shade900,
+                        fontWeight: FontWeight.w500),
                   ),
                 ),
               ],
@@ -353,256 +498,632 @@ class _NewJobWizardState extends State<NewJobWizard> {
     );
   }
 
-  Widget _buildPage1() {
+  // _buildPage1 removed - Normal mode skips Club & Schedule configuration
+  // and goes straight from credentials to booking page
+
+  Widget _buildPage2() {
+    final theme = Theme.of(context);
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Club & Schedule',
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  fontWeight: FontWeight.bold,
-                ),
+            'Book a Tee Time',
+            style: theme.textTheme.headlineMedium?.copyWith(
+              fontWeight: FontWeight.bold,
+            ),
           ),
           const SizedBox(height: 8),
           Text(
-            'Configure your booking schedule',
-            style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  color: Colors.grey.shade600,
-                ),
+            'Choose your party size, then select ONE available slot to book immediately',
+            style: theme.textTheme.bodyLarge?.copyWith(
+              color: Colors.grey.shade600,
+            ),
           ),
-          const SizedBox(height: 32),
-          _buildSectionTitle('Golf Club'),
+          const SizedBox(height: 24),
+          _buildSectionTitle('Party Size'),
           Card(
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: DropdownButtonHideUnderline(
-                child: DropdownButton<String>(
-                  value: _club,
-                  isExpanded: true,
-                  items: [
-                    DropdownMenuItem(value: 'galgorm', child: Text('Galgorm Castle')),
-                  ],
-                  onChanged: (value) => setState(() => _club = value!),
-                ),
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  const Icon(Icons.group),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Text('How many players?',
+                        style: theme.textTheme.titleMedium),
+                  ),
+                  SegmentedButton<int>(
+                    segments: const [
+                      ButtonSegment(value: 1, label: Text('1')),
+                      ButtonSegment(value: 2, label: Text('2')),
+                      ButtonSegment(value: 3, label: Text('3')),
+                      ButtonSegment(value: 4, label: Text('4')),
+                    ],
+                    selected: {_playerCount},
+                    onSelectionChanged: (Set<int> newSelection) {
+                      final nextCount = newSelection.first;
+                      setState(() {
+                        _playerCount = nextCount;
+                        if (_selectedPlayers.length > nextCount) {
+                          _selectedPlayers =
+                              _selectedPlayers.take(nextCount).toList();
+                        }
+                      });
+                    },
+                  ),
+                ],
               ),
             ),
           ),
           const SizedBox(height: 24),
-          _buildSectionTitle('Release Day & Time'),
-          Text(
-            'When do tee times become available?',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Colors.grey.shade600,
-                ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                flex: 2,
-                child: Card(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<String>(
-                        value: _releaseDay,
-                        isExpanded: true,
-                        items: _weekdays.map((day) => DropdownMenuItem(value: day, child: Text(day))).toList(),
-                        onChanged: (value) => setState(() => _releaseDay = value!),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Card(
-                  child: InkWell(
-                    onTap: () async {
-                      final TimeOfDay? picked = await showTimePicker(
-                        context: context,
-                        initialTime: TimeOfDay(
-                          hour: int.parse(_releaseTime.split(':')[0]),
-                          minute: int.parse(_releaseTime.split(':')[1]),
-                        ),
-                        builder: (context, child) {
-                          return Theme(
-                            data: Theme.of(context).copyWith(
-                              timePickerTheme: TimePickerThemeData(
-                                backgroundColor: Colors.white,
-                                dialBackgroundColor: Colors.grey.shade100,
-                              ),
-                            ),
-                            child: child!,
-                          );
-                        },
-                      );
-                      if (picked != null) {
-                        setState(() {
-                          _releaseTime = '${picked.hour.toString().padLeft(2, '0')}:${picked.minute.toString().padLeft(2, '0')}';
-                        });
-                      }
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          if (_selectedTime != null && _selectedDate != null) ...[
+            Card(
+              color: theme.colorScheme.primaryContainer,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    Icon(Icons.check_circle, color: theme.colorScheme.primary),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            _releaseTime,
-                            style: const TextStyle(fontSize: 16),
+                            'Selected Slot',
+                            style: theme.textTheme.labelMedium?.copyWith(
+                              color: theme.colorScheme.onPrimaryContainer,
+                            ),
                           ),
-                          const Icon(Icons.access_time, size: 20),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${DateFormat('EEEE d MMM').format(_selectedDate!)} at $_selectedTime',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.bold,
+                              color: theme.colorScheme.onPrimaryContainer,
+                            ),
+                          ),
                         ],
                       ),
                     ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          _buildSectionTitle('Target Play Date'),
-          Text(
-            'Select the date you want to play',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Colors.grey.shade600,
-                ),
-          ),
-          const SizedBox(height: 12),
-          Card(
-            child: InkWell(
-              onTap: () async {
-                final DateTime? picked = await showDatePicker(
-                  context: context,
-                  initialDate: _targetDate ?? DateTime.now().add(const Duration(days: 7)),
-                  firstDate: DateTime.now(),
-                  lastDate: DateTime.now().add(const Duration(days: 365)),
-                  builder: (context, child) {
-                    return Theme(
-                      data: Theme.of(context).copyWith(
-                        colorScheme: ColorScheme.light(
-                          primary: const Color(0xFF2E7D32),
-                          onPrimary: Colors.white,
-                          surface: Colors.white,
-                          onSurface: Colors.black87,
-                        ),
-                      ),
-                      child: child!,
-                    );
-                  },
-                );
-                if (picked != null) {
-                  setState(() {
-                    _targetDate = picked;
-                    final weekdayMap = {
-                      DateTime.monday: 'Monday',
-                      DateTime.tuesday: 'Tuesday',
-                      DateTime.wednesday: 'Wednesday',
-                      DateTime.thursday: 'Thursday',
-                      DateTime.friday: 'Friday',
-                      DateTime.saturday: 'Saturday',
-                      DateTime.sunday: 'Sunday',
-                    };
-                    _targetDay = weekdayMap[picked.weekday]!;
-                  });
-                }
-              },
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Expanded(
-                      child: Text(
-                        _targetDate != null
-                            ? '${_targetDay}, ${_targetDate!.day}/${_targetDate!.month}/${_targetDate!.year}'
-                            : 'Tap to select date',
-                        style: TextStyle(
-                          fontSize: 16,
-                          color: _targetDate != null ? Colors.black87 : Colors.grey.shade600,
-                        ),
-                      ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => setState(() {
+                        _selectedTime = null;
+                        _selectedDate = null;
+                      }),
                     ),
-                    const Icon(Icons.calendar_today, size: 20),
                   ],
                 ),
               ),
             ),
-          ),
+            const SizedBox(height: 24),
+          ],
+          _buildLiveAvailabilitySection(theme),
         ],
       ),
     );
   }
 
-  Widget _buildPage2() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Preferred Tee Times',
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  fontWeight: FontWeight.bold,
-                ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'Select up to 3 times in order of preference',
-            style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  color: Colors.grey.shade600,
-                ),
-          ),
-          const SizedBox(height: 24),
-          
-          // Show selected times
-          if (_preferredTimes.isNotEmpty) ...[
-            _buildSectionTitle('Selected Times'),
-            ...List.generate(_preferredTimes.length, (index) {
-              return Card(
-                margin: const EdgeInsets.only(bottom: 8),
-                child: ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: Theme.of(context).colorScheme.primary,
-                    child: Text('${index + 1}', style: const TextStyle(color: Colors.white)),
-                  ),
-                  title: Text(_preferredTimes[index], style: const TextStyle(fontWeight: FontWeight.w600)),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.close),
-                    onPressed: () => setState(() => _preferredTimes.removeAt(index)),
-                  ),
-                ),
-              );
-            }),
-            const SizedBox(height: 24),
-          ],
-          
-          // Show available times
-          if (_preferredTimes.length < 3) ...[
-            _buildSectionTitle('Available Times (Tap to Select)'),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: _availableTimes.where((t) => !_preferredTimes.contains(t)).map((time) {
-                return ActionChip(
-                  label: Text(time),
-                  backgroundColor: Theme.of(context).colorScheme.primary.withValues(alpha: 0.1),
-                  side: BorderSide(color: Theme.of(context).colorScheme.primary),
-                  onPressed: () {
-                    if (_preferredTimes.length < 3) {
-                      setState(() => _preferredTimes.add(time));
-                    }
-                  },
-                );
-              }).toList(),
-            ),
-          ],
-        ],
+  Widget _buildLiveAvailabilitySection(ThemeData theme) {
+    final hasCredentials = _brsEmailController.text.trim().isNotEmpty &&
+        _brsPasswordController.text.trim().isNotEmpty;
+    final bool canScan = hasCredentials && !_isFetchingAvailability;
+
+    final List<Widget> body = [];
+
+    if (_isFetchingAvailability) {
+      body.add(const LinearProgressIndicator());
+      body.add(const SizedBox(height: 12));
+      body.add(Text(
+        'Scanning tee sheets for the next $_rangeWindowDays days…',
+        style: theme.textTheme.bodyMedium,
+      ));
+    } else if (!hasCredentials) {
+      body.add(Text(
+        'Enter your BRS credentials on Step 1 to preview live availability.',
+        style:
+            theme.textTheme.bodyMedium?.copyWith(color: Colors.grey.shade700),
+      ));
+    } else if (_availabilityError != null) {
+      body.add(Text(
+        _availabilityError!,
+        style: theme.textTheme.bodyMedium?.copyWith(
+          color: Colors.red.shade700,
+          fontWeight: FontWeight.w600,
+        ),
+      ));
+      if (_availabilityDays.isNotEmpty) {
+        body.add(const SizedBox(height: 12));
+        body.add(Text(
+          'Showing the last successful scan below.',
+          style:
+              theme.textTheme.bodySmall?.copyWith(color: Colors.grey.shade600),
+        ));
+        body.add(const SizedBox(height: 12));
+        for (var i = 0; i < _availabilityDays.length; i++) {
+          body.add(_buildAvailabilityDayCard(_availabilityDays[i], theme));
+          if (i < _availabilityDays.length - 1) {
+            body.add(const SizedBox(height: 12));
+          }
+        }
+      }
+    } else if (_availabilityDays.isEmpty) {
+      body.add(Text(
+        'No live data yet. Tap scan to fetch the next $_rangeWindowDays days.',
+        style:
+            theme.textTheme.bodyMedium?.copyWith(color: Colors.grey.shade700),
+      ));
+    } else {
+      if (_availabilityFetchedAt != null) {
+        final formatted =
+            DateFormat('EEE d MMM · HH:mm').format(_availabilityFetchedAt!);
+        body.add(Text(
+          'Last scanned: $formatted',
+          style:
+              theme.textTheme.bodySmall?.copyWith(color: Colors.grey.shade600),
+        ));
+        body.add(const SizedBox(height: 12));
+      }
+      if (_targetDate != null &&
+          !_availabilityDays
+              .any((day) => _isSameDate(day.date, _targetDate!))) {
+        body.add(Text(
+          'Your selected target date is outside the next $_rangeWindowDays days.',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: Colors.orange.shade700),
+        ));
+        body.add(const SizedBox(height: 12));
+      }
+      for (var i = 0; i < _availabilityDays.length; i++) {
+        body.add(_buildAvailabilityDayCard(_availabilityDays[i], theme));
+        if (i < _availabilityDays.length - 1) {
+          body.add(const SizedBox(height: 12));
+        }
+      }
+    }
+
+    if (body.isNotEmpty) {
+      body.add(const SizedBox(height: 16));
+    }
+    body.add(
+      Align(
+        alignment: Alignment.centerLeft,
+        child: ElevatedButton.icon(
+          onPressed: canScan ? _refreshRangeFromAgent : null,
+          icon: const Icon(Icons.rss_feed),
+          label: Text(_availabilityDays.isEmpty
+              ? 'Scan Next $_rangeWindowDays Days'
+              : 'Refresh Availability'),
+        ),
       ),
     );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              'Live Availability (Next $_rangeWindowDays Days)',
+              style: theme.textTheme.titleMedium
+                  ?.copyWith(fontWeight: FontWeight.w600),
+            ),
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              tooltip: 'Refresh availability',
+              onPressed: canScan ? _refreshRangeFromAgent : null,
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Card(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: body,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAvailabilityDayCard(_DayAvailability day, ThemeData theme) {
+    final bool isTargetDay =
+        _targetDate != null && _isSameDate(day.date, _targetDate!);
+    final bool isFocusedDay = _focusedAvailabilityDate != null &&
+        _isSameDate(day.date, _focusedAvailabilityDate!);
+    final Color focusColor = theme.colorScheme.primary;
+    final Color borderColor = isFocusedDay ? focusColor : Colors.grey.shade200;
+
+    return Card(
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: borderColor, width: isFocusedDay ? 1.5 : 1),
+      ),
+      elevation: isFocusedDay ? 2 : 0,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _formatAvailabilityDay(day.date),
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: isFocusedDay ? focusColor : null,
+                    ),
+                  ),
+                ),
+                if (isTargetDay)
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: focusColor.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: focusColor),
+                    ),
+                    child: Text(
+                      'Target day',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: focusColor,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (day.times.isEmpty)
+              Text(
+                'No bookable tee times detected.',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: Colors.grey.shade600),
+              )
+            else
+              Builder(builder: (context) {
+                // Only show slots that can fit the selected party size (when we have capacity data)
+                final filteredTimes = day.times.where((time) {
+                  final summary = day.slotSummaries[time];
+                  final bool hasSlotData =
+                      summary != null && summary.openSlots != null;
+                  if (!hasSlotData)
+                    return true; // keep if no data so user can try
+                  return (summary.openSlots ?? 0) >= _playerCount;
+                }).toList();
+
+                if (filteredTimes.isEmpty) {
+                  return Text(
+                    'No tee times have at least $_playerCount slots available.',
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: Colors.grey.shade600),
+                  );
+                }
+
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: filteredTimes.map((time) {
+                    final summary = day.slotSummaries[time];
+                    // If no slot summary, assume it's bookable (agent returned simple time list)
+                    final bool hasSlotData =
+                        summary != null && summary.openSlots != null;
+                    final bool hasEnoughSlots = hasSlotData
+                        ? (summary.openSlots ?? 0) >= _playerCount
+                        : true; // Default to enabled if no slot data
+                    final bool selected = _selectedTime == time &&
+                        _selectedDate != null &&
+                        _isSameDate(_selectedDate!, day.date);
+                    final bool isWaitList = summary?.status == 'waiting-list';
+                    final Color baseColor =
+                        isWaitList ? Colors.orange.shade700 : focusColor;
+
+                    // Disable slots that don't have enough capacity (only if we have slot data)
+                    final bool enabled = hasEnoughSlots || isWaitList;
+
+                    return FilterChip(
+                      label: Text(
+                        _formatSlotLabel(time, summary, _playerCount),
+                        style: TextStyle(
+                          color: selected
+                              ? Colors.white
+                              : (enabled ? baseColor : Colors.grey.shade400),
+                          fontWeight:
+                              selected ? FontWeight.w600 : FontWeight.w500,
+                        ),
+                      ),
+                      selected: selected,
+                      showCheckmark: false,
+                      onSelected: enabled
+                          ? (shouldSelect) =>
+                              _togglePreferredTime(time, shouldSelect, day.date)
+                          : null,
+                      backgroundColor:
+                          baseColor.withValues(alpha: enabled ? 0.08 : 0.03),
+                      selectedColor: baseColor,
+                      disabledColor: Colors.grey.shade200,
+                      shape: StadiumBorder(
+                        side: BorderSide(
+                            color: enabled
+                                ? baseColor.withValues(
+                                    alpha: selected ? 1 : 0.4)
+                                : Colors.grey.shade300),
+                      ),
+                    );
+                  }).toList(),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatAvailabilityDay(DateTime date) {
+    return DateFormat('EEEE d MMM').format(date);
+  }
+
+  String _formatSlotLabel(String time, _SlotSummary? summary, int neededSlots) {
+    if (summary == null) return time; // Just show time if no detail
+    final open = summary.openSlots;
+    final total = summary.totalSlots;
+
+    String label = time;
+    if (open != null && total != null) {
+      label = '$time · $open/$total open';
+    } else if (open != null) {
+      final unit = open == 1 ? 'slot' : 'slots';
+      label = '$time · $open $unit';
+    } else if (total != null) {
+      label = '$time · $total capacity';
+    } else if (summary.status == 'waiting-list') {
+      label = '$time · wait list';
+    }
+
+    return label;
+  }
+
+  void _togglePreferredTime(String time, bool shouldSelect, DateTime dayDate) {
+    // Normal mode: single selection only
+    setState(() {
+      if (shouldSelect) {
+        _selectedTime = time;
+        _selectedDate = dayDate;
+      } else {
+        if (_selectedTime == time &&
+            _selectedDate != null &&
+            _isSameDate(_selectedDate!, dayDate)) {
+          _selectedTime = null;
+          _selectedDate = null;
+        }
+      }
+    });
+  }
+
+  Future<void> _refreshRangeFromAgent() async {
+    final username = _brsEmailController.text.trim();
+    final password = _brsPasswordController.text.trim();
+
+    if (username.isEmpty || password.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content:
+              Text('Enter your BRS credentials on Step 1 to scan availability'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      setState(() {
+        _availabilityError =
+            'BRS credentials are required to fetch live availability.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isFetchingAvailability = true;
+      _availabilityError = null;
+    });
+
+    List<_DayAvailability> nextDays = _availabilityDays;
+    DateTime? fetchedAt = _availabilityFetchedAt;
+    DateTime? focusedDate = _focusedAvailabilityDate;
+    String? error;
+
+    try {
+      final uri = Uri.parse('$_agentBaseUrl/api/fetch-tee-times-range');
+      final payload = {
+        'startDate': DateTime.now().toIso8601String(),
+        'days': _rangeWindowDays,
+        'username': username,
+        'password': password,
+        'club': _club,
+        'reuseBrowser': true,
+      };
+      debugPrint('[AvailabilityRange] Base URL: $_agentBaseUrl');
+      debugPrint('[AvailabilityRange] POST: $uri');
+      debugPrint('[AvailabilityRange] Payload: ' + jsonEncode(payload));
+      final response = await http.post(
+        uri,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(payload),
+      );
+      debugPrint('[AvailabilityRange] Status: ${response.statusCode}');
+      debugPrint('[AvailabilityRange] Raw Body (truncated): ' +
+          response.body.substring(0, response.body.length.clamp(0, 500)));
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final dynamic decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic>) {
+          if (decoded['success'] == true && decoded['days'] is List) {
+            final parsed = _parseAvailabilityDays(decoded['days'] as List);
+            nextDays = parsed;
+            fetchedAt = DateTime.now();
+            focusedDate = _computeFocusedAvailabilityDate(parsed);
+          } else {
+            final agentError = decoded['error']?.toString();
+            error = agentError == null || agentError.isEmpty
+                ? 'Agent response did not include success=true.'
+                : 'Agent reported error: $agentError';
+          }
+        } else {
+          error = 'Agent returned an unexpected response (not a Map).';
+        }
+      } else {
+        error =
+            'Agent request failed with status ${response.statusCode}. Body: ' +
+                response.body.substring(0, response.body.length.clamp(0, 300));
+      }
+    } catch (e, st) {
+      debugPrint('[AvailabilityRange] Exception: $e');
+      debugPrint('[AvailabilityRange] Stack: $st');
+      error = 'Failed to contact agent: $e';
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      _isFetchingAvailability = false;
+      if (error != null) {
+        _availabilityError = error;
+      } else {
+        _availabilityError = null;
+        _availabilityDays = nextDays;
+        _availabilityFetchedAt = fetchedAt;
+        _focusedAvailabilityDate = focusedDate;
+      }
+    });
+  }
+
+  List<_DayAvailability> _parseAvailabilityDays(List<dynamic> rawDays) {
+    final List<_DayAvailability> parsed = [];
+    for (final raw in rawDays) {
+      if (raw is! Map) continue;
+      final map = raw.cast<String, dynamic>();
+      final dateStr = map['date']?.toString() ?? '';
+      DateTime? date;
+      if (dateStr.isNotEmpty) {
+        try {
+          date = DateTime.parse(dateStr);
+        } catch (_) {
+          date = null;
+        }
+      }
+      date ??= DateTime.now();
+
+      final times = <String>[];
+      final seen = <String>{};
+      final rawTimes = map['times'];
+      if (rawTimes is List) {
+        for (final entry in rawTimes) {
+          if (entry == null) continue;
+          final normalized = entry.toString().padLeft(5, '0');
+          if (seen.add(normalized)) {
+            times.add(normalized);
+          }
+        }
+      }
+
+      times.sort();
+
+      final slots = <String, _SlotSummary>{};
+      final rawSlots = map['slots'];
+      if (rawSlots is List) {
+        for (final entry in rawSlots) {
+          if (entry is! Map) continue;
+          final slotMap = entry.cast<String, dynamic>();
+          final timeStr = slotMap['time']?.toString();
+          if (timeStr == null || timeStr.isEmpty) continue;
+          final normalized = timeStr.padLeft(5, '0');
+          slots[normalized] = _SlotSummary(
+            time: normalized,
+            status: slotMap['status']?.toString() ?? 'bookable',
+            openSlots: _firstInt(slotMap, const [
+              'openSlots',
+              'open',
+              'available',
+              'slotsAvailable',
+              'spaces',
+            ]),
+            totalSlots: _firstInt(slotMap, const [
+              'totalSlots',
+              'total',
+              'capacity',
+              'slots',
+            ]),
+          );
+        }
+      }
+
+      parsed.add(
+          _DayAvailability(date: date, times: times, slotSummaries: slots));
+    }
+    parsed.sort((a, b) => a.date.compareTo(b.date));
+    return parsed;
+  }
+
+  DateTime? _computeFocusedAvailabilityDate(List<_DayAvailability> days) {
+    if (days.isEmpty) return null;
+    if (_targetDate != null) {
+      for (final day in days) {
+        if (_isSameDate(day.date, _targetDate!)) {
+          return day.date;
+        }
+      }
+    }
+    return days.first.date;
+  }
+
+  bool _isSameDate(DateTime a, DateTime b) {
+    return a.year == b.year && a.month == b.month && a.day == b.day;
+  }
+
+  int? _asNullableInt(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is double) return value.round();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  int? _firstInt(Map<String, dynamic> map, List<String> keys) {
+    for (final key in keys) {
+      if (map.containsKey(key)) {
+        final val = _asNullableInt(map[key]);
+        if (val != null) return val;
+      }
+    }
+    return null;
+  }
+
+  static String _resolveAgentBaseUrl() {
+    const override =
+        String.fromEnvironment('FS_AGENT_BASE_URL', defaultValue: '');
+    if (override.isNotEmpty) {
+      return override;
+    }
+    if (kIsWeb) {
+      return 'http://localhost:3000';
+    }
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+        return 'http://10.0.2.2:3000';
+      case TargetPlatform.iOS:
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+      case TargetPlatform.linux:
+      case TargetPlatform.fuchsia:
+        return 'http://localhost:3000';
+    }
   }
 
   Widget _buildPage3() {
@@ -612,62 +1133,55 @@ class _NewJobWizardState extends State<NewJobWizard> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Players',
+            'Select Players',
             style: Theme.of(context).textTheme.headlineMedium?.copyWith(
                   fontWeight: FontWeight.bold,
                 ),
           ),
           const SizedBox(height: 8),
           Text(
-            'Add up to 4 players for your booking',
+            'Choose up to $_playerCount players from your club directory',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: Colors.grey.shade600,
                 ),
           ),
           const SizedBox(height: 32),
-          ...List.generate(_playerControllers.length, (index) {
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 16),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _playerControllers[index],
-                      decoration: InputDecoration(
-                        labelText: 'Player ${index + 1}',
-                        prefixIcon: const Icon(Icons.person),
-                      ),
-                    ),
-                  ),
-                  if (index > 0)
-                    IconButton(
-                      icon: const Icon(Icons.remove_circle_outline),
-                      color: Colors.red,
-                      onPressed: () {
-                        setState(() {
-                          _playerControllers[index].dispose();
-                          _playerControllers.removeAt(index);
-                        });
-                      },
-                    ),
-                ],
-              ),
-            );
-          }),
-          if (_playerControllers.length < 4)
-            OutlinedButton.icon(
-              onPressed: () => setState(() => _playerControllers.add(TextEditingController())),
-              icon: const Icon(Icons.add),
-              label: const Text('Add Player'),
-            ),
+          PlayerListEditor(
+            playerNames: _selectedPlayers,
+            onPlayersChanged: (updated) {
+              setState(() => _selectedPlayers = updated);
+            },
+            onAddPlayers: _showPlayerSelector,
+            maxPlayers: _playerCount,
+          ),
         ],
       ),
     );
   }
 
+  Future<void> _showPlayerSelector() async {
+    final selected = await PlayerSelectorModal.show(
+      context: context,
+      directoryService: _playerDirectoryService,
+      initialSelectedNames: _selectedPlayers,
+      maxPlayers: _playerCount,
+      username: _brsEmailController.text,
+      password: _brsPasswordController.text,
+    );
+
+    if (selected != null) {
+      print('🎯 Selected players from modal: $selected');
+      setState(() {
+        _selectedPlayers = selected
+            .map((name) => name.trim())
+            .where((name) => name.isNotEmpty)
+            .toList();
+        print('🎯 After processing: $_selectedPlayers');
+      });
+    }
+  }
+
   Widget _buildPage4() {
-    final players = _playerControllers.map((c) => c.text.trim()).where((p) => p.isNotEmpty).toList();
-    
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
       child: Column(
@@ -693,24 +1207,18 @@ class _NewJobWizardState extends State<NewJobWizard> {
             Icons.golf_course,
           ),
           _buildReviewCard(
-            'Release Schedule',
-            '$_releaseDay at $_releaseTime',
-            Icons.schedule,
-          ),
-          _buildReviewCard(
-            'Target Day',
-            _targetDay,
-            Icons.calendar_today,
-          ),
-          _buildReviewCard(
-            'Preferred Times',
-            _preferredTimes.join(', '),
+            'Selected Slot',
+            _selectedTime != null && _selectedDate != null
+                ? '${DateFormat('EEEE d MMM').format(_selectedDate!)} at $_selectedTime'
+                : 'Not selected',
             Icons.access_time,
           ),
           _buildReviewCard(
-            'Players (${players.length})',
-            players.join(', '),
-            Icons.people,
+            'Players',
+            _selectedPlayers.isNotEmpty
+                ? _selectedPlayers.join(', ')
+                : 'None selected',
+            Icons.group,
           ),
         ],
       ),
@@ -727,7 +1235,10 @@ class _NewJobWizardState extends State<NewJobWizard> {
             Container(
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.1),
+                color: Theme.of(context)
+                    .colorScheme
+                    .primary
+                    .withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(10),
               ),
               child: Icon(icon, color: Theme.of(context).colorScheme.primary),
@@ -795,12 +1306,38 @@ class _NewJobWizardState extends State<NewJobWizard> {
           Expanded(
             flex: 2,
             child: ElevatedButton(
-              onPressed: _currentPage == 4 ? _saveJob : _nextPage,
-              child: Text(_currentPage == 4 ? 'Create Job' : 'Continue'),
+              onPressed: _currentPage == 3 ? _saveJob : _nextPage,
+              child: Text(_currentPage == 3 ? 'Create Job' : 'Continue'),
             ),
           ),
         ],
       ),
     );
   }
+}
+
+class _DayAvailability {
+  _DayAvailability({
+    required this.date,
+    required this.times,
+    required this.slotSummaries,
+  });
+
+  final DateTime date;
+  final List<String> times;
+  final Map<String, _SlotSummary> slotSummaries;
+}
+
+class _SlotSummary {
+  _SlotSummary({
+    required this.time,
+    required this.status,
+    this.openSlots,
+    this.totalSlots,
+  });
+
+  final String time;
+  final String status;
+  final int? openSlots;
+  final int? totalSlots;
 }

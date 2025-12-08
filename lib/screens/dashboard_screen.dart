@@ -5,8 +5,7 @@ import 'package:fairway_sniper/services/weather_service.dart';
 import 'package:fairway_sniper/services/golf_news_service.dart';
 import 'package:fairway_sniper/models/booking_job.dart';
 import 'package:fairway_sniper/models/booking_run.dart';
-import 'package:fairway_sniper/screens/new_job_wizard.dart';
-import 'package:fairway_sniper/screens/login_screen.dart';
+import 'package:fairway_sniper/screens/mode_selection_screen.dart';
 import 'package:fairway_sniper/screens/admin_dashboard.dart';
 import 'package:fairway_sniper/screens/course_info_screen.dart';
 import 'package:intl/intl.dart';
@@ -357,7 +356,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ),
         floatingActionButton: FloatingActionButton.extended(
           onPressed: () => Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => const NewJobWizard()),
+            MaterialPageRoute(builder: (_) => const ModeSelectionScreen()),
           ),
           icon: const Icon(Icons.add),
           label: const Text('New Booking Job'),
@@ -387,7 +386,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
 
     Map<String, dynamic>? bookingWeather;
-    if (activeJob != null && activeJob.preferredTimes.isNotEmpty && _weatherForecast != null) {
+    if (activeJob != null &&
+        activeJob.preferredTimes.isNotEmpty &&
+        _weatherForecast != null) {
       bookingWeather = _weatherService.getHourlyWeatherForTime(
         _weatherForecast!,
         activeJob.preferredTimes.first,
@@ -447,7 +448,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        _weatherService.getWeatherDescription(currentWeatherCode),
+                        _weatherService
+                            .getWeatherDescription(currentWeatherCode),
                         style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                               color: textColor,
                               fontWeight: FontWeight.w600,
@@ -456,10 +458,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       const SizedBox(height: 8),
                       Text(
                         '${currentTemp.round()}°C',
-                        style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                              color: textColor,
-                              fontWeight: FontWeight.bold,
-                            ),
+                        style:
+                            Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                  color: textColor,
+                                  fontWeight: FontWeight.bold,
+                                ),
                       ),
                       const SizedBox(height: 4),
                       Text(
@@ -479,7 +482,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const SizedBox(height: 12),
               Row(
                 children: [
-                  Icon(Icons.golf_course, color: Theme.of(context).colorScheme.primary, size: 20),
+                  Icon(Icons.golf_course,
+                      color: Theme.of(context).colorScheme.primary, size: 20),
                   const SizedBox(width: 8),
                   Text(
                     'Tee Time Weather (${activeJob!.preferredTimes.first})',
@@ -494,7 +498,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Row(
                 children: [
                   Text(
-                    _weatherService.getWeatherEmoji(bookingWeather['weathercode'] as int),
+                    _weatherService
+                        .getWeatherEmoji(bookingWeather['weathercode'] as int),
                     style: const TextStyle(fontSize: 28),
                   ),
                   const SizedBox(width: 12),
@@ -503,24 +508,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          _weatherService.getWeatherDescription(bookingWeather['weathercode'] as int),
-                          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                color: textColor,
-                              ),
+                          _weatherService.getWeatherDescription(
+                              bookingWeather['weathercode'] as int),
+                          style:
+                              Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                    color: textColor,
+                                  ),
                         ),
                         const SizedBox(height: 4),
                         Text(
                           '${bookingWeather['temperature'].round()}°C  •  Wind: ${bookingWeather['windspeed'].round()} km/h',
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: subtextColor,
-                              ),
+                          style:
+                              Theme.of(context).textTheme.bodySmall?.copyWith(
+                                    color: subtextColor,
+                                  ),
                         ),
                         if (bookingWeather['precipitation_probability'] != null)
                           Text(
                             '☔ Rain chance: ${bookingWeather['precipitation_probability']}%',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: subtextColor,
-                                ),
+                            style:
+                                Theme.of(context).textTheme.bodySmall?.copyWith(
+                                      color: subtextColor,
+                                    ),
                           ),
                       ],
                     ),
@@ -1164,6 +1173,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // Info/Details button
+                    IconButton(
+                      icon: Icon(
+                        Icons.info_outline,
+                        color: job.bookingMode == BookingMode.sniper
+                            ? Colors.red.shade400
+                            : Colors.blue.shade400,
+                        size: 28,
+                      ),
+                      tooltip: 'View Details',
+                      onPressed: () => _showJobDetailsDialog(job),
+                    ),
                     // Toggle Active/Pause button
                     IconButton(
                       icon: Icon(
@@ -2104,6 +2125,136 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
     );
   }
+
+  void _showJobDetailsDialog(BookingJob job) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(
+              job.bookingMode == BookingMode.sniper
+                  ? Icons.my_location
+                  : Icons.golf_course,
+              color: job.bookingMode == BookingMode.sniper
+                  ? Colors.red.shade400
+                  : Colors.amber.shade700,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                job.bookingMode == BookingMode.sniper
+                    ? 'Sniper Booking'
+                    : 'Normal Booking',
+                style: TextStyle(
+                  color: job.bookingMode == BookingMode.sniper
+                      ? Colors.red.shade400
+                      : Colors.amber.shade700,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildDetailRow('Club', job.club, Icons.location_on),
+              const Divider(),
+              _buildDetailRow(
+                'Target Day',
+                job.targetDay,
+                Icons.calendar_today,
+              ),
+              const Divider(),
+              _buildDetailRow(
+                'Preferred Times',
+                job.preferredTimes.join(', '),
+                Icons.access_time,
+              ),
+              const Divider(),
+              _buildDetailRow(
+                'Players',
+                job.players.join(', '),
+                Icons.people,
+              ),
+              const Divider(),
+              _buildDetailRow(
+                'Status',
+                job.status.toUpperCase(),
+                job.status == 'active' ? Icons.play_circle : Icons.pause_circle,
+              ),
+              if (job.bookingMode == BookingMode.sniper) ...[
+                const Divider(),
+                _buildDetailRow(
+                  'Release Day',
+                  job.releaseDay,
+                  Icons.event_available,
+                ),
+                const Divider(),
+                _buildDetailRow(
+                  'Release Time',
+                  job.releaseTimeLocal,
+                  Icons.schedule,
+                ),
+              ],
+              if (job.targetPlayDate != null) ...[
+                const Divider(),
+                _buildDetailRow(
+                  'Target Date',
+                  DateFormat('EEE, MMM d, yyyy').format(job.targetPlayDate!),
+                  Icons.event,
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDetailRow(String label, String value, IconData icon) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 20, color: Colors.grey.shade600),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.grey.shade600,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class LocalTimeCard extends StatefulWidget {
@@ -2144,7 +2295,8 @@ class _LocalTimeCardState extends State<LocalTimeCard> {
         ? Colors.grey.shade900.withValues(alpha: 0.85)
         : Colors.white.withValues(alpha: 0.95);
     final textColor = widget.isDarkMode ? Colors.white : Colors.black87;
-    final subtextColor = widget.isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
+    final subtextColor =
+        widget.isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
 
     return Card(
       color: cardBg,
@@ -2160,7 +2312,8 @@ class _LocalTimeCardState extends State<LocalTimeCard> {
                 ),
                 borderRadius: BorderRadius.circular(12),
               ),
-              child: const Icon(Icons.access_time, color: Colors.white, size: 24),
+              child:
+                  const Icon(Icons.access_time, color: Colors.white, size: 24),
             ),
             const SizedBox(width: 16),
             Expanded(
