@@ -1079,125 +1079,197 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ? targetDateTime.difference(DateTime.now())
             : null;
 
+    // Determine mode colors
+    final isSniper = job.bookingMode == BookingMode.sniper;
+    final headerColor = isSniper
+        ? const Color(0xFFFF6B35) // Bright orange for sniper
+        : const Color(0xFF4A90E2); // Blue for normal
+    final headerTextColor = Colors.white;
+
     return Card(
       elevation: 4,
       color: cardBg,
       shadowColor: job.status == 'active'
-          ? const Color(0xFFFFD700).withValues(alpha: 0.3)
+          ? (isSniper ? Colors.orange : Colors.blue).withValues(alpha: 0.3)
           : Colors.black12,
       margin: const EdgeInsets.only(bottom: 16),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(16),
         side: job.status == 'active'
             ? BorderSide(
-                color: const Color(0xFFFFD700).withValues(alpha: 0.3), width: 1)
+                color: (isSniper ? Colors.orange : Colors.blue)
+                    .withValues(alpha: 0.3),
+                width: 1)
             : BorderSide.none,
       ),
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Mode Header
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            decoration: BoxDecoration(
+              color: headerColor,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(16),
+                topRight: Radius.circular(16),
+              ),
+            ),
+            child: Row(
               children: [
-                Container(
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    gradient: job.status == 'active'
-                        ? const LinearGradient(
-                            colors: [Color(0xFFFFD700), Color(0xFFFFA000)],
-                          )
-                        : null,
-                    color: job.status != 'active' ? Colors.grey.shade300 : null,
-                    borderRadius: BorderRadius.circular(14),
-                    boxShadow: job.status == 'active'
-                        ? [
-                            BoxShadow(
-                              color: const Color(0xFFFFD700)
-                                  .withValues(alpha: 0.4),
-                              blurRadius: 8,
-                              offset: const Offset(0, 2),
-                            ),
-                          ]
-                        : null,
-                  ),
-                  child: Icon(
-                    Icons.golf_course,
-                    color: job.status == 'active' ? Colors.white : Colors.grey,
-                    size: 30,
+                Icon(
+                  isSniper ? Icons.target : Icons.event,
+                  color: headerTextColor,
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  isSniper ? '🎯 SNIPER MODE' : '📅 NORMAL BOOKING',
+                  style: TextStyle(
+                    color: headerTextColor,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                    letterSpacing: 0.5,
                   ),
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '${job.targetDay} at ${job.preferredTimes.first}',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 17,
-                          color: job.status == 'active'
-                              ? textColor
-                              : (_isDarkMode
-                                  ? Colors.grey.shade500
-                                  : Colors.grey.shade700),
-                        ),
+                const Spacer(),
+                if (isSniper)
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      'Waiting for Release',
+                      style: TextStyle(
+                        color: headerTextColor,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
                       ),
-                      const SizedBox(height: 4),
-                      Row(
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          // Job Details
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        gradient: job.status == 'active'
+                            ? LinearGradient(
+                                colors: isSniper
+                                    ? [Color(0xFFFF6B35), Color(0xFFFF8A50)]
+                                    : [Color(0xFF4A90E2), Color(0xFF357ABD)],
+                              )
+                            : null,
+                        color:
+                            job.status != 'active' ? Colors.grey.shade300 : null,
+                        borderRadius: BorderRadius.circular(14),
+                        boxShadow: job.status == 'active'
+                            ? [
+                                BoxShadow(
+                                  color: (isSniper
+                                          ? Color(0xFFFF6B35)
+                                          : Color(0xFF4A90E2))
+                                      .withValues(alpha: 0.4),
+                                  blurRadius: 8,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ]
+                            : null,
+                      ),
+                      child: Icon(
+                        Icons.golf_course,
+                        color: job.status == 'active'
+                            ? Colors.white
+                            : Colors.grey,
+                        size: 30,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Icon(Icons.people, size: 14, color: subtextColor),
-                          const SizedBox(width: 4),
                           Text(
-                            '${job.players.length} players',
-                            style: TextStyle(color: subtextColor, fontSize: 13),
-                          ),
-                          const SizedBox(width: 12),
-                          Icon(Icons.location_on,
-                              size: 14, color: subtextColor),
-                          const SizedBox(width: 4),
-                          Expanded(
-                            child: Text(
-                              job.club,
-                              style:
-                                  TextStyle(color: subtextColor, fontSize: 13),
-                              overflow: TextOverflow.ellipsis,
+                            '${job.targetDay} at ${job.preferredTimes.first}',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 17,
+                              color: job.status == 'active'
+                                  ? textColor
+                                  : (_isDarkMode
+                                      ? Colors.grey.shade500
+                                      : Colors.grey.shade700),
                             ),
+                          ),
+                          const SizedBox(height: 4),
+                          Row(
+                            children: [
+                              Icon(Icons.people,
+                                  size: 14, color: subtextColor),
+                              const SizedBox(width: 4),
+                              Text(
+                                '${job.players.length} players',
+                                style: TextStyle(
+                                    color: subtextColor, fontSize: 13),
+                              ),
+                              const SizedBox(width: 12),
+                              Icon(Icons.location_on,
+                                  size: 14, color: subtextColor),
+                              const SizedBox(width: 4),
+                              Expanded(
+                                child: Text(
+                                  job.club,
+                                  style: TextStyle(
+                                      color: subtextColor, fontSize: 13),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
                           ),
                         ],
                       ),
-                    ],
-                  ),
-                ),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // Info/Details button
-                    IconButton(
-                      icon: Icon(
-                        Icons.info_outline,
-                        color: job.bookingMode == BookingMode.sniper
-                            ? Colors.red.shade400
-                            : Colors.blue.shade400,
-                        size: 28,
-                      ),
-                      tooltip: 'View Details',
-                      onPressed: () => _showJobDetailsDialog(job),
                     ),
-                    // Toggle Active/Pause button
-                    IconButton(
-                      icon: Icon(
-                        job.status == 'active'
-                            ? Icons.pause_circle
-                            : Icons.play_circle,
-                        color: job.status == 'active'
-                            ? Colors.orange
-                            : Colors.green,
-                        size: 28,
-                      ),
-                      tooltip:
-                          job.status == 'active' ? 'Pause Job' : 'Activate Job',
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Info/Details button
+                        IconButton(
+                          icon: Icon(
+                            Icons.info_outline,
+                            color: isSniper
+                                ? Colors.red.shade400
+                                : Colors.blue.shade400,
+                            size: 28,
+                          ),
+                          tooltip: 'View Details',
+                          onPressed: () => _showJobDetailsDialog(job),
+                        ),
+                        // Toggle Active/Pause button
+                        IconButton(
+                          icon: Icon(
+                            job.status == 'active'
+                                ? Icons.pause_circle
+                                : Icons.play_circle,
+                            color: job.status == 'active'
+                                ? Colors.orange
+                                : Colors.green,
+                            size: 28,
+                          ),
+                          tooltip: job.status == 'active'
+                              ? 'Pause Job'
+                              : 'Activate Job',
                       onPressed: () async {
                         await _firebaseService.updateJob(
                           job.id!,
@@ -1465,8 +1537,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                 ),
               ),
-          ],
-        ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
