@@ -245,10 +245,14 @@ async function loginToBRS(page, loginUrl, username, password) {
 
   // Wait for redirect away from login page or visible tee-sheet nav
   const loggedInSignal = page
-    .locator('a[href*="/tee-sheet"], a:has-text("Tee Sheet"), button:has-text("Book")')
+    .locator(
+      'a[href*="/tee-sheet"], a:has-text("Tee Sheet"), button:has-text("Book")',
+    )
     .first();
   await Promise.race([
-    loggedInSignal.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {}),
+    loggedInSignal
+      .waitFor({ state: 'visible', timeout: 15000 })
+      .catch(() => {}),
     page.waitForURL(/(?!.*\/login)/, { timeout: 15000 }).catch(() => {}),
   ]);
 
@@ -286,7 +290,7 @@ async function navigateToTeeSheet(page, date) {
   throw new Error('No tee sheet detected after several day hops');
 }
 
-async function tryBookTime(page, time) {
+async function tryBookTime(page, time, players = []) {
   const hhmm = time.replace(/[^0-9]/g, '');
   const slotSelectors = [
     `a[href*="/bookings/book/${hhmm}"]`,
@@ -307,23 +311,72 @@ async function tryBookTime(page, time) {
     return false;
   }
 
+  console.log(`  📍 Clicking tee time slot: ${time}`);
   await slot.click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+
+  // Populate player selections if provided
+  if (players && players.length > 0) {
+    console.log(`  👥 Populating ${players.length} player(s)...`);
+    
+    for (let i = 0; i < Math.min(players.length, 4); i++) {
+      const playerId = players[i];
+      const playerSlotId = `member_booking_form_player_${i + 1}`;
+      
+      try {
+        // Using Select2 select element
+        const selectLocator = page.locator(`#${playerSlotId}`);
+        
+        // Click to open the select
+        await selectLocator.click({ timeout: 5000 });
+        await page.waitForTimeout(300);
+        
+        // Type to search for player
+        await page.keyboard.type(playerId.toString());
+        await page.waitForTimeout(300);
+        
+        // Wait for and click first result
+        const result = page.locator('.select2-results__option').first();
+        if (await result.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await result.click({ timeout: 5000 });
+          console.log(`    ✅ Added player ${i + 1}: ${playerId}`);
+        } else {
+          console.warn(`    ⚠️ Could not find player ${playerId} in search results`);
+        }
+        
+        await page.waitForTimeout(300);
+      } catch (err) {
+        console.warn(`    ⚠️ Error populating player ${i + 1}: ${err.message}`);
+      }
+    }
+  }
+
   await page.waitForTimeout(500);
 
-  // Confirm booking on the form
-  const confirmSelectors = [
+  // Confirm booking on the form - use the exact button ID found
+  const confirmBtn = page.locator('#member_booking_form_confirm_booking');
+  
+  if (await confirmBtn.isVisible().catch(() => false)) {
+    console.log(`  ✅ Clicking confirm button...`);
+    await confirmBtn.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    console.log(`  ✅ Booking confirmed for ${time}`);
+    return true;
+  }
+
+  // Fallback selectors if main button not found
+  const fallbackSelectors = [
     'button:has-text("Confirm")',
     'button:has-text("Book Now")',
     'button[type="submit"]',
-    'a:has-text("Confirm")',
   ];
 
-  for (const sel of confirmSelectors) {
+  for (const sel of fallbackSelectors) {
     const btn = page.locator(sel).first();
     if (await btn.isVisible().catch(() => false)) {
+      console.log(`  ✅ Clicked fallback confirm button...`);
       await btn.click({ timeout: 8000 }).catch(() => {});
       await page.waitForTimeout(500);
-      console.log(`  ✅ Clicked confirm for ${time}`);
       return true;
     }
   }
@@ -333,7 +386,11 @@ async function tryBookTime(page, time) {
 }
 
 // Compute the next release window in UTC based on a weekly release day/time
-function computeNextFireUTC(releaseDay, releaseTimeLocal, tz = CONFIG.TZ_LONDON) {
+function computeNextFireUTC(
+  releaseDay,
+  releaseTimeLocal,
+  tz = CONFIG.TZ_LONDON,
+) {
   const dayMap = {
     monday: 1,
     tuesday: 2,
@@ -385,6 +442,7 @@ async function runBooking(config) {
     targetFireTime,
     pushToken,
     targetPlayDate,
+    players = [],
   } = config;
 
   if (!username || !password) {
@@ -432,7 +490,9 @@ async function runBooking(config) {
     console.log(`\n[2/5] Navigating to ${loginUrl}...`);
     await loginToBRS(page, loginUrl, username, password);
 
-    console.log(`\n[3/5] Loading tee sheet for ${teeDate.toISOString().slice(0, 10)}...`);
+    console.log(
+      `\n[3/5] Loading tee sheet for ${teeDate.toISOString().slice(0, 10)}...`,
+    );
     await navigateToTeeSheet(page, teeDate);
 
     // Coarse wait until near target time
@@ -453,7 +513,7 @@ async function runBooking(config) {
     for (const [index, time] of preferredTimes.entries()) {
       try {
         console.log(`Trying time slot: ${time}`);
-        const booked = await tryBookTime(page, time);
+        const booked = await tryBookTime(page, time, players);
         if (booked) {
           bookedTime = time;
           fallbackLevel = index;
@@ -847,12 +907,10 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
   try {
     const { startDate, days, username, password } = req.body;
     if (!startDate || !days || !username || !password) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: 'startDate, days, username, password are required',
-        });
+      return res.status(400).json({
+        success: false,
+        error: 'startDate, days, username, password are required',
+      });
     }
 
     const start = new Date(startDate);
@@ -883,12 +941,10 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
     });
   } catch (error) {
     console.error('  ❌ Error fetching tee times range:', error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        error: error.message || 'Failed to fetch tee times range',
-      });
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch tee times range',
+    });
   }
 });
 
@@ -1054,20 +1110,28 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
     // Extract players from Player 3 select dropdown (Player 1/2 may be disabled if existing booking)
     console.log('  🔍 Extracting players from form...');
     let player2Selector = 'select#member_booking_form_player_3';
-    
+
     // Wait for the select to exist
     await page.waitForSelector(player2Selector, { timeout: 15000 });
-    
+
     // Try to open Select2 dropdown by clicking the container
-    const select2Container = page.locator('.select2-container[aria-owns*="player_3"]').first();
+    const select2Container = page
+      .locator('.select2-container[aria-owns*="player_3"]')
+      .first();
     const isVisible = await select2Container.isVisible().catch(() => false);
     if (isVisible) {
-      console.log('  🎯 Found Select2 container for Player 3, opening dropdown...');
+      console.log(
+        '  🎯 Found Select2 container for Player 3, opening dropdown...',
+      );
       await select2Container.click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(2000);
-      
+
       // Now try to find and type in search to trigger loading
-      const searchInput = page.locator('.select2-search__field, input[aria-label*="search"], input[role="combobox"]').first();
+      const searchInput = page
+        .locator(
+          '.select2-search__field, input[aria-label*="search"], input[role="combobox"]',
+        )
+        .first();
       const searchVisible = await searchInput.isVisible().catch(() => false);
       if (searchVisible) {
         console.log('  ⌨️  Found search input, typing to load options...');
@@ -1078,35 +1142,51 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
         await page.waitForTimeout(2000);
       }
     } else {
-      console.log('  📌 Select2 container not found, trying direct select click...');
+      console.log(
+        '  📌 Select2 container not found, trying direct select click...',
+      );
       const player2Locator = page.locator(player2Selector);
       await player2Locator.click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(2000);
     }
-    
+
     // SAVE PAGE HTML FOR DEBUGGING
     const pageHtml = await page.content();
     const fs = await import('fs');
     const path = await import('path');
     const outputDir = path.join(process.cwd(), 'output');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, '-')
+      .slice(0, -5);
     const debugFile = path.join(outputDir, `booking-form-${timestamp}.html`);
     await fs.promises.mkdir(outputDir, { recursive: true }).catch(() => {});
     await fs.promises.writeFile(debugFile, pageHtml, 'utf8').catch(() => {});
-    console.log(`  💾 Saved page HTML to agent/output/booking-form-${timestamp}.html`);
+    console.log(
+      `  💾 Saved page HTML to agent/output/booking-form-${timestamp}.html`,
+    );
 
     // Extract from Select2 rendered dropdown OR from hidden select fallback
     const categorizedPlayers = await page.evaluate(() => {
-      const select = document.querySelector('select#member_booking_form_player_3');
+      const select = document.querySelector(
+        'select#member_booking_form_player_3',
+      );
       if (!select) {
-        return { categories: [], currentMemberId: null, currentUserName: null, source: 'none' };
+        return {
+          categories: [],
+          currentMemberId: null,
+          currentUserName: null,
+          source: 'none',
+        };
       }
 
       // Get current member ID from the page variable (not Player 1 - that might be someone else's booking!)
       const currentMemberVar = document.querySelector('var#current-member-id');
-      const currentMemberId = currentMemberVar ? currentMemberVar.getAttribute('data-member-id') : null;
+      const currentMemberId = currentMemberVar
+        ? currentMemberVar.getAttribute('data-member-id')
+        : null;
       let currentUserName = null;
-      
+
       // Find the logged-in user's name by searching all player options for their ID
       if (currentMemberId) {
         // Search in Player 3 select (which has all players)
@@ -1128,15 +1208,18 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
         if (window.jQuery && window.jQuery.fn.select2) {
           const $select = window.jQuery(select);
           const select2Instance = $select.data('select2');
-          
+
           if (select2Instance && select2Instance.$results) {
             source = 'select2-internal-data';
-            
+
             // Get all options from Select2 internal structure
             const $allOptions = $select.find('option');
             const players = Array.from($allOptions)
-              .filter(opt => opt.value && opt.value.trim() !== '' && opt.value !== '-2')
-              .map(opt => ({
+              .filter(
+                (opt) =>
+                  opt.value && opt.value.trim() !== '' && opt.value !== '-2',
+              )
+              .map((opt) => ({
                 id: opt.value,
                 name: opt.textContent.trim(),
                 type: 'member',
@@ -1157,16 +1240,23 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
 
       // APPROACH 2: If Select2 failed, try rendered dropdown elements
       if (allPlayers.length === 0) {
-        const select2Results = document.querySelectorAll('.select2-results__option');
+        const select2Results = document.querySelectorAll(
+          '.select2-results__option',
+        );
         if (select2Results.length > 0) {
           source = 'select2-dropdown';
           const players = Array.from(select2Results)
-            .map(el => ({
+            .map((el) => ({
               id: el.getAttribute('data-select2-id') || el.textContent.trim(),
               name: el.textContent.trim(),
               type: 'member',
             }))
-            .filter(p => p.name && p.name !== '' && p.name !== 'Start typing to find player...');
+            .filter(
+              (p) =>
+                p.name &&
+                p.name !== '' &&
+                p.name !== 'Start typing to find player...',
+            );
 
           if (players.length > 0) {
             categories.push({
@@ -1181,14 +1271,17 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
       // APPROACH 3: If both failed, try the hidden select's option tags
       if (allPlayers.length === 0) {
         source = 'native-select-options';
-        
+
         // Get from optgroups first
         const optgroups = Array.from(select.querySelectorAll('optgroup'));
         optgroups.forEach((group) => {
           const categoryName = group.getAttribute('label') || 'Players';
           const options = Array.from(group.querySelectorAll('option'));
           const players = options
-            .filter((opt) => opt.value && opt.value.trim() !== '' && opt.value !== '-2')
+            .filter(
+              (opt) =>
+                opt.value && opt.value.trim() !== '' && opt.value !== '-2',
+            )
             .map((opt) => ({
               id: opt.value,
               name: opt.textContent.trim(),
@@ -1228,7 +1321,13 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
         }
       }
 
-      return { categories, currentMemberId, currentUserName, source, playerCount: allPlayers.length };
+      return {
+        categories,
+        currentMemberId,
+        currentUserName,
+        source,
+        playerCount: allPlayers.length,
+      };
     });
 
     await browser.close();
@@ -1241,10 +1340,14 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
       `  ✅ Found ${totalPlayers} players in ${categorizedPlayers.categories.length} categories (source: ${categorizedPlayers.source})`,
     );
     if (categorizedPlayers.currentUserName) {
-      console.log(`  👤 Logged-in user: ${categorizedPlayers.currentUserName} (ID: ${categorizedPlayers.currentMemberId})`);
+      console.log(
+        `  👤 Logged-in user: ${categorizedPlayers.currentUserName} (ID: ${categorizedPlayers.currentMemberId})`,
+      );
     }
     if (totalPlayers === 0) {
-      console.log('  ⚠️ WARNING: No players extracted; booking form may not have been fully loaded');
+      console.log(
+        '  ⚠️ WARNING: No players extracted; booking form may not have been fully loaded',
+      );
     }
 
     res.json({
@@ -1306,6 +1409,7 @@ app.post('/api/book-now', async (req, res) => {
       targetFireTime: new Date(), // Fire immediately
       pushToken,
       targetPlayDate: targetDate,
+      players: players || [],
     });
 
     res.json({
