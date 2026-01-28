@@ -5,11 +5,13 @@
   "private": true,
   "main": "index.js",
   "scripts": {
-    "test": "node -r dotenv/config ./node_modules/@playwright/test/cli.js",
-    "book": "node -r dotenv/config ./node_modules/@playwright/test/cli.js test tests/book_production.spec.ts --workers=1 --reporter=list",
-    "book:live": "node -r dotenv/config -e \"process.env.FS_DRY_RUN='false'\" ./node_modules/@playwright/test/cli.js test tests/book_production.spec.ts --workers=1 --reporter=list",
-    "snipe": "node -r dotenv/config ./node_modules/@playwright/test/cli.js test tests/book_production.spec.ts --workers=1 --trace on",
-    "codegen": "npx playwright codegen"
+    "test": "playwright test",
+    "book": "playwright test tests/book_production.spec.ts --workers=1",
+    "book:live": "cross-env FS_DRY_RUN=false playwright test tests/book_production.spec.ts --workers=1",
+    "normal": "cross-env FS_MODE=normal npx playwright test tests/book_production.spec.ts --workers=1 --reporter=list",
+    "snipe": "cross-env FS_MODE=snipe npx playwright test tests/book_production.spec.ts --workers=1 --trace on",
+    "release": "cross-env FS_MODE=snipe node scripts/wait-and-snipe.js",
+    "codegen": "playwright codegen"
   },
   "keywords": [],
   "author": "",
@@ -18,6 +20,7 @@
   "devDependencies": {
     "@playwright/test": "^1.56.1",
     "@types/node": "^24.8.1",
+    "cross-env": "^10.1.0",
     "date-fns-tz": "^1.3.8",
     "dotenv": "^17.2.3",
     "ts-node": "^10.9.2",

@@ -182,12 +182,11 @@ test('🎯 Book tee time (production)', async ({ page }) => {
     const confirmed = await autoConfirm(root);
 
     if (!confirmed) {
-      console.log('\n⚠️ Auto-confirm failed - check for confirm button');
-      // Don't throw - may need manual intervention
+      throw new Error('❌ BOOKING FAILED: Confirmation not completed or success message not detected');
     }
 
     // 11. Success
-    console.log('\n🎉 Booking complete!');
+    console.log('\n🎉 BOOKING SUCCESSFULLY CONFIRMED!');
   } catch (error) {
     console.error(`\n❌ Booking failed: ${error.message}`);
     console.error(`   Please check configuration and try again.`);

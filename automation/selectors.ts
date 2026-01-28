@@ -400,6 +400,7 @@ export async function isOnTargetDate(
 
 /**
  * Fill players 2-4 automatically (Player 1 is implicit logged-in user)
+ * Handles both text inputs and dropdown/combobox selects
  */
 export async function fillPlayers(
   page: Page | FrameLocator,
@@ -410,23 +411,65 @@ export async function fillPlayers(
   for (let i = 0; i < players.length && i < 3; i++) {
     const playerName = players[i];
     const playerNum = i + 2; // Player 2, 3, 4
+    let filled = false;
 
-    const input = page
-      .getByPlaceholder(new RegExp(`player\\s*${playerNum}|name\\s*${playerNum}`, 'i'))
-      .first()
-      .or(page.locator(`input[name*="player${playerNum}"], input[id*="player${playerNum}"]`).first());
+    // Try dropdown/select first
+    try {
+      const selectLabel = page.getByLabel(new RegExp(`player\\s*${playerNum}`, 'i')).first();
+      if (await selectLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await selectLabel.selectOption({ label: playerName });
+        console.log(`  ✓ Player ${playerNum}: ${playerName} (dropdown)`);
+        filled = true;
+      }
+    } catch (e) {
+      // Try next method
+    }
 
-    if (await input.isVisible().catch(() => false)) {
-      await input.fill(playerName);
-      console.log(`  ✓ Player ${playerNum}: ${playerName}`);
-    } else {
-      console.log(`  ⚠️ Player ${playerNum} input not found`);
+    // Try combobox role (Material Design dropdowns)
+    if (!filled) {
+      try {
+        const combobox = page.getByRole('combobox', { name: new RegExp(`player\\s*${playerNum}`, 'i') }).first();
+        if (await combobox.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await combobox.click();
+          await page.waitForTimeout(500);
+          const option = page.getByRole('option', { name: playerName }).first();
+          await option.click();
+          console.log(`  ✓ Player ${playerNum}: ${playerName} (combobox)`);
+          filled = true;
+        }
+      } catch (e) {
+        // Try next method
+      }
+    }
+
+    // Fallback to text input
+    if (!filled) {
+      try {
+        const input = page
+          .getByPlaceholder(new RegExp(`player\\s*${playerNum}|name\\s*${playerNum}`, 'i'))
+          .first()
+          .or(page.locator(`input[name*="player${playerNum}"], input[id*="player${playerNum}"]`).first());
+
+        if (await input.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await input.fill(playerName);
+          console.log(`  ✓ Player ${playerNum}: ${playerName} (text input)`);
+          filled = true;
+        }
+      } catch (e) {
+        // Continue
+      }
+    }
+
+    if (!filled) {
+      console.log(`  ⚠️ Player ${playerNum} field not found or not accessible`);
     }
   }
 }
 
 /**
  * Auto-confirm booking (clicks Confirm/Book button)
+ * Waits for and verifies success message after confirmation
+ * Returns true only if confirmation detected
  */
 export async function autoConfirm(
   page: Page | FrameLocator,
@@ -440,10 +483,55 @@ export async function autoConfirm(
 
   if (await confirmBtn.isVisible().catch(() => false)) {
     await confirmBtn.click();
-    console.log('  ✅ Confirm clicked');
-    return true;
+    console.log('  ✅ Confirm button clicked');
+    
+    // Wait for success message
+    await page.waitForTimeout(2000);
+    
+    // Verify booking success
+    const success = await verifyBookingSuccess(page);
+    if (success) {
+      console.log('  ✅ BOOKING SUCCESS CONFIRMED');
+      return true;
+    } else {
+      console.log('  ⚠️ Booking may not have completed - success message not found');
+      return false;
+    }
   }
 
-  console.log('  ⚠️ Confirm button not found');
+  console.log('  ❌ Confirm button not found');
+  return false;
+}
+
+/**
+ * Verify booking success by checking for confirmation messages
+ */
+export async function verifyBookingSuccess(
+  page: Page | FrameLocator,
+): Promise<boolean> {
+  console.log('🔍 Verifying booking success...');
+
+  const successIndicators = [
+    /booking\s+confirmed/i,
+    /successfully\s+booked/i,
+    /confirmation/i,
+    /reference\s+(number|code)/i,
+    /booking\s+complete/i,
+    /thank\s+you/i,
+  ];
+
+  for (const pattern of successIndicators) {
+    try {
+      const element = page.getByText(pattern).first();
+      if (await element.isVisible({ timeout: 3000 }).catch(() => false)) {
+        console.log(`  ✅ Success message found: "${await element.textContent().catch(() => '')}"`);
+        return true;
+      }
+    } catch (e) {
+      // Continue checking other patterns
+    }
+  }
+
+  console.log('  ⚠️ No success confirmation message detected');
   return false;
 }

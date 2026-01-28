@@ -290,101 +290,310 @@ async function navigateToTeeSheet(page, date) {
   throw new Error('No tee sheet detected after several day hops');
 }
 
-async function tryBookTime(page, time, players = []) {
-  const hhmm = time.replace(/[^0-9]/g, '');
-  const slotSelectors = [
-    `a[href*="/bookings/book/${hhmm}"]`,
-    `a:has-text("${time}")`,
-  ];
+// ========================================
+// PLAYER SELECTION & CONFIRMATION HELPER
+// ========================================
 
-  let slot = null;
-  for (const sel of slotSelectors) {
-    const locator = page.locator(sel).first();
-    if ((await locator.count()) > 0) {
-      slot = locator;
-      break;
+/**
+ * Utility: escape regex special characters
+ */
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Fill player dropdowns and confirm booking
+ * @param {Page} page - Playwright page
+ * @param {string[]} players - List of player names to fill (max 3 for slots 2, 3, 4)
+ * @param {number} openSlots - Number of available slots (1-4)
+ * @returns {Promise<{filled: string[], skippedReason?: string, confirmationText?: string}>}
+ */
+async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
+  const result = {
+    filled: [],
+    skippedReason: null,
+    confirmationText: null,
+  };
+
+  // Only try to fill as many players as slots permit (max 3 additional players = slots 2, 3, 4)
+  const playersToFill = players.slice(0, Math.min(openSlots, 3));
+
+  console.log(`  👥 Attempting to fill ${playersToFill.length} player(s) (${openSlots} slot(s) available)...`);
+
+  // If no additional players needed, skip directly to confirmation
+  if (playersToFill.length === 0 && openSlots > 0) {
+    console.log(`  ℹ️ Only logged-in user (Player 1) needed. Skipping player selection.`);
+    result.skippedReason = 'logged-in-user-only';
+  } else if (playersToFill.length === 0) {
+    console.log(`  ℹ️ No players provided. Skipping player selection.`);
+    result.skippedReason = 'no-players-provided';
+  }
+
+  // Attempt to fill each player slot (2, 3, 4)
+  for (let i = 0; i < playersToFill.length; i++) {
+    const playerName = playersToFill[i];
+    const playerNum = i + 2; // Player 2, 3, 4
+    let filled = false;
+
+    try {
+      console.log(`    🔍 Player ${playerNum}: "${playerName}"...`);
+
+      // Strategy A: Try getByRole('combobox')
+      let combobox = null;
+      try {
+        combobox = page.getByRole('combobox', {
+          name: new RegExp(`player\\s*${playerNum}`, 'i'),
+        }).first();
+
+        const isVisible = await combobox.isVisible({ timeout: 2000 }).catch(() => false);
+        if (isVisible) {
+          await combobox.click();
+          await page.waitForTimeout(300);
+
+          // Try to select by option role
+          const option = page.getByRole('option', {
+            name: new RegExp(escapeRegex(playerName), 'i'),
+          }).first();
+
+          if ((await option.count()) > 0) {
+            await option.click();
+            console.log(`    ✅ Player ${playerNum}: ${playerName} (combobox role)`);
+            result.filled.push(playerName);
+            filled = true;
+          } else {
+            // Try typing into the combobox to search
+            console.log(`    💬 Typing "${playerName}" into search...`);
+            await page.keyboard.type(playerName, { delay: 30 });
+            await page.waitForTimeout(400);
+
+            const searchResult = page.getByRole('option', {
+              name: new RegExp(escapeRegex(playerName), 'i'),
+            }).first();
+
+            if ((await searchResult.count()) > 0) {
+              await searchResult.click();
+              console.log(`    ✅ Player ${playerNum}: ${playerName} (typed search)`);
+              result.filled.push(playerName);
+              filled = true;
+            } else {
+              console.log(`    ⚠️ Player ${playerNum}: No match for "${playerName}"`);
+            }
+          }
+        }
+      } catch (e) {
+        // Strategy A failed, try next
+        console.log(`    ℹ️ Strategy A (getByRole combobox) failed: ${e.message.substring(0, 50)}`);
+      }
+
+      // Strategy B: Try getByLabel
+      if (!filled) {
+        try {
+          const label = page.getByLabel(new RegExp(`player\\s*${playerNum}`, 'i')).first();
+          const isVisible = await label.isVisible({ timeout: 2000 }).catch(() => false);
+
+          if (isVisible) {
+            await label.selectOption({ label: playerName }).catch(async () => {
+              // If selectOption fails, try clicking and then option selection
+              await label.click();
+              await page.waitForTimeout(300);
+              const option = page.getByRole('option', {
+                name: new RegExp(escapeRegex(playerName), 'i'),
+              }).first();
+              await option.click();
+            });
+            console.log(`    ✅ Player ${playerNum}: ${playerName} (getByLabel)`);
+            result.filled.push(playerName);
+            filled = true;
+          }
+        } catch (e) {
+          console.log(`    ℹ️ Strategy B (getByLabel) failed: ${e.message.substring(0, 50)}`);
+        }
+      }
+
+      // Strategy C: Find container and search within
+      if (!filled) {
+        try {
+          const containers = page.locator('div, fieldset, section');
+          const containerCount = await containers.count();
+
+          for (let c = 0; c < containerCount && !filled; c++) {
+            const container = containers.nth(c);
+            const text = await container.innerText().catch(() => '');
+
+            if (text.includes(`Player ${playerNum}`) || text.includes(`player ${playerNum}`)) {
+              const comboboxInContainer = container.locator('[role="combobox"]').first();
+
+              if ((await comboboxInContainer.count()) > 0) {
+                await comboboxInContainer.click();
+                await page.waitForTimeout(300);
+
+                const option = page.getByRole('option', {
+                  name: new RegExp(escapeRegex(playerName), 'i'),
+                }).first();
+
+                if ((await option.count()) > 0) {
+                  await option.click();
+                  console.log(`    ✅ Player ${playerNum}: ${playerName} (container search)`);
+                  result.filled.push(playerName);
+                  filled = true;
+                  break;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.log(`    ℹ️ Strategy C (container search) failed: ${e.message.substring(0, 50)}`);
+        }
+      }
+
+      if (!filled) {
+        console.log(`    ⚠️ Player ${playerNum} field not found or player not selectable`);
+        // Do not fail the booking; this is expected when openSlots < required players
+      }
+    } catch (error) {
+      console.log(`    ❌ Error filling Player ${playerNum}: ${error.message}`);
     }
   }
 
-  if (!slot) {
-    console.log(`  ⚠️ No slot link found for ${time}`);
-    return false;
-  }
+  // Now click Confirm button
+  console.log(`  🎯 Clicking Confirm button...`);
 
-  console.log(`  📍 Clicking tee time slot: ${time}`);
-  await slot.click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(1000);
+  try {
+    // Strategy 1: getByRole button with confirm text
+    let confirmBtn = page.getByRole('button', {
+      name: /confirm|book|complete|finish|final|create.*booking|proceed/i,
+    }).first();
 
-  // Populate player selections if provided
-  if (players && players.length > 0) {
-    console.log(`  👥 Populating ${players.length} player(s)...`);
+    let btnVisible = await confirmBtn.isVisible({ timeout: 3000 }).catch(() => false);
 
-    for (let i = 0; i < Math.min(players.length, 4); i++) {
-      const playerId = players[i];
-      const playerSlotId = `member_booking_form_player_${i + 1}`;
+    // Strategy 2: Fallback locators
+    if (!btnVisible) {
+      confirmBtn = page.locator('button:has-text("Confirm"), button:has-text("Book"), button:has-text("Complete")').first();
+      btnVisible = await confirmBtn.isVisible({ timeout: 2000 }).catch(() => false);
+    }
 
-      try {
-        // Using Select2 select element
-        const selectLocator = page.locator(`#${playerSlotId}`);
+    if (btnVisible) {
+      await confirmBtn.click({ timeout: 5000 });
+      console.log(`    ✅ Confirm button clicked`);
 
-        // Click to open the select
-        await selectLocator.click({ timeout: 5000 });
-        await page.waitForTimeout(300);
+      // Wait for navigation/response
+      await page.waitForTimeout(2000);
 
-        // Type to search for player
-        await page.keyboard.type(playerId.toString());
-        await page.waitForTimeout(300);
+      // Verify booking success
+      const successPatterns = [
+        /booking.*confirmed/i,
+        /successfully.*booked/i,
+        /confirmation/i,
+        /reference.*number/i,
+        /booking.*complete/i,
+        /thank\s+you/i,
+        /your.*booking/i,
+      ];
 
-        // Wait for and click first result
-        const result = page.locator('.select2-results__option').first();
-        if (await result.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await result.click({ timeout: 5000 });
-          console.log(`    ✅ Added player ${i + 1}: ${playerId}`);
-        } else {
-          console.warn(
-            `    ⚠️ Could not find player ${playerId} in search results`,
-          );
+      for (const pattern of successPatterns) {
+        try {
+          const element = page.getByText(pattern).first();
+          const isVisible = await element.isVisible({ timeout: 2000 }).catch(() => false);
+
+          if (isVisible) {
+            const confirmText = await element.textContent().catch(() => '');
+            console.log(`    ✅ Success detected: "${confirmText}"`);
+            result.confirmationText = confirmText;
+            return result;
+          }
+        } catch (e) {
+          // Continue checking other patterns
         }
+      }
 
-        await page.waitForTimeout(300);
-      } catch (err) {
-        console.warn(`    ⚠️ Error populating player ${i + 1}: ${err.message}`);
+      // Fallback: Check if we're now on a bookings list page
+      try {
+        const bookingsHeading = page.getByText(/my.*bookings|your.*bookings|booked.*tee/i).first();
+        if ((await bookingsHeading.count()) > 0) {
+          const headingText = await bookingsHeading.textContent().catch(() => '');
+          console.log(`    ✅ Success detected (bookings page): "${headingText}"`);
+          result.confirmationText = headingText;
+          return result;
+        }
+      } catch (e) {
+        // Not a bookings page
+      }
+
+      console.log(`    ⚠️ No success confirmation message detected, but confirm clicked`);
+      result.confirmationText = 'confirm-clicked-no-confirmation-text';
+      return result;
+    } else {
+      console.log(`    ❌ Confirm button not found (timeout)`);
+      result.confirmationText = 'confirm-button-not-found';
+      return result;
+    }
+  } catch (error) {
+    console.log(`    ❌ Error clicking confirm: ${error.message}`);
+    result.confirmationText = `error: ${error.message}`;
+    return result;
+  }
+}
+
+async function tryBookTime(page, time, players = [], openSlots = 3) {
+  // Wait for tee sheet to be fully loaded
+  console.log(`  ⏳ Waiting for tee sheet to load...`);
+  await page.waitForSelector('tr', { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+
+  // Find all table rows
+  const rows = page.locator('tr');
+  const rowCount = await rows.count();
+
+  console.log(`  🔍 Scanning ${rowCount} rows for time ${time}...`);
+
+  let bookButton = null;
+
+  // Scan rows to find the one with the matching time
+  for (let i = 0; i < rowCount; i++) {
+    const row = rows.nth(i);
+    const rowText = await row.innerText().catch(() => '');
+
+    // Check if this row contains the target time
+    if (rowText.includes(time)) {
+      console.log(`  ✅ Found row with time ${time}`);
+
+      // Look for Book button in this row
+      const bookBtn = row
+        .locator(':is(button,a,[role="button"])')
+        .filter({ hasText: /\bbook(\s+now)?\b/i })
+        .first();
+
+      if ((await bookBtn.count()) > 0) {
+        bookButton = bookBtn;
+        break;
       }
     }
   }
 
-  await page.waitForTimeout(500);
-
-  // Confirm booking on the form - use the exact button ID found
-  const confirmBtn = page.locator('#member_booking_form_confirm_booking');
-
-  if (await confirmBtn.isVisible().catch(() => false)) {
-    console.log(`  ✅ Clicking confirm button...`);
-    await confirmBtn.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(500);
-    console.log(`  ✅ Booking confirmed for ${time}`);
-    return true;
+  if (!bookButton) {
+    console.log(`  ⚠️ No booking button found for ${time}`);
+    return { booked: false, error: 'no-booking-button-found' };
   }
 
-  // Fallback selectors if main button not found
-  const fallbackSelectors = [
-    'button:has-text("Confirm")',
-    'button:has-text("Book Now")',
-    'button[type="submit"]',
-  ];
+  console.log(`  📍 Clicking booking button for ${time}...`);
+  await bookButton.click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2000); // Wait for booking form to load
 
-  for (const sel of fallbackSelectors) {
-    const btn = page.locator(sel).first();
-    if (await btn.isVisible().catch(() => false)) {
-      console.log(`  ✅ Clicked fallback confirm button...`);
-      await btn.click({ timeout: 8000 }).catch(() => {});
-      await page.waitForTimeout(500);
-      return true;
-    }
-  }
+  // Add dialog handler to avoid freezes
+  page.on('dialog', (dialog) => dialog.accept());
 
-  console.log(`  ⚠️ Confirm button not found after selecting ${time}`);
-  return false;
+  // Call the unified player selection and confirmation helper
+  const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
+
+  // Return detailed result
+  return {
+    booked: confirmResult.confirmationText !== null && confirmResult.confirmationText !== 'confirm-button-not-found',
+    playersFilled: confirmResult.filled,
+    playersRequested: players.slice(0, Math.min(openSlots, 3)),
+    confirmationText: confirmResult.confirmationText,
+    skippedReason: confirmResult.skippedReason,
+    error: confirmResult.confirmationText === 'confirm-button-not-found' ? 'confirm-button-not-found' : null,
+  };
 }
 
 // Compute the next release window in UTC based on a weekly release day/time
@@ -445,6 +654,7 @@ async function runBooking(config) {
     pushToken,
     targetPlayDate,
     players = [],
+    slotsData = [],  // Array of {time, openSlots, status}
   } = config;
 
   if (!username || !password) {
@@ -515,11 +725,21 @@ async function runBooking(config) {
     for (const [index, time] of preferredTimes.entries()) {
       try {
         console.log(`Trying time slot: ${time}`);
-        const booked = await tryBookTime(page, time, players);
-        if (booked) {
+        
+        // Find openSlots for this time from slotsData
+        const slotInfo = slotsData.find(s => s.time === time);
+        const openSlots = slotInfo ? slotInfo.openSlots : 3; // default to 3 if not found
+        
+        const bookingResult = await tryBookTime(page, time, players, openSlots);
+        if (bookingResult && bookingResult.booked) {
           bookedTime = time;
           fallbackLevel = index;
+          notes.push(`Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`);
           break;
+        } else if (bookingResult) {
+          const msg = `Could not complete booking for ${time}: ${bookingResult.error || bookingResult.confirmationText}`;
+          console.log(msg);
+          notes.push(msg);
         }
       } catch (error) {
         const msg = `Failed to book ${time}: ${error.message}`;
@@ -569,11 +789,20 @@ async function runBooking(config) {
     console.log(`RESULT: ${result.toUpperCase()}`);
     if (bookedTime) console.log(`BOOKED TIME: ${bookedTime}`);
     console.log(`LATENCY: ${latencyMs}ms`);
+    console.log(`NOTES: ${notes.join(' | ')}`);
     console.log('='.repeat(60));
 
     await browser.close();
 
-    return { success: result === 'success' || result === 'fallback', result };
+    return {
+      success: result === 'success' || result === 'fallback',
+      result,
+      bookedTime,
+      fallbackLevel,
+      latencyMs,
+      notes: notes.join(' | '),
+      playersRequested: players,
+    };
   } catch (error) {
     console.error('\n❌ ERROR:', error);
 
@@ -1441,6 +1670,7 @@ app.post('/api/snipe', async (req, res) => {
       pushToken: null,
       targetPlayDate: targetDate,
       players: players || [],
+      slotsData: times || [],  // Pass the full slots array with openSlots info
     });
 
     res.json({
@@ -1448,7 +1678,21 @@ app.post('/api/snipe', async (req, res) => {
       booked: result.success,
       result: result.result || null,
       error: result.error || null,
-      slots: slots,
+      mode: 'sniper',
+      booking: {
+        targetDate,
+        selectedTime: result.bookedTime,
+        preferredTimes,
+        playersRequested: result.playersRequested,
+        openSlots: result.bookedTime
+          ? times.find(s => s.time === result.bookedTime)?.openSlots
+          : null,
+      },
+      timing: {
+        latencyMs: result.latencyMs,
+        fallbackLevel: result.fallbackLevel,
+      },
+      notes: result.notes,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -1492,6 +1736,13 @@ app.post('/api/book-now', async (req, res) => {
     console.log(`   Preferred Times: ${preferredTimes.join(', ')}`);
     console.log(`   Players: ${players.join(', ')}`);
 
+    // First, fetch available slots to pass to booking function
+    const { times, slots: slotsData } = await fetchAvailableTeeTimesFromBRS(
+      new Date(targetDate),
+      username,
+      password,
+    ).catch(() => ({ times: [], slots: [] }));
+
     // Execute booking immediately
     const result = await runBooking({
       jobId: 'immediate-' + Date.now(), // Temporary ID for immediate bookings
@@ -1504,12 +1755,29 @@ app.post('/api/book-now', async (req, res) => {
       pushToken,
       targetPlayDate: targetDate,
       players: players || [],
+      slotsData: slotsData || [],  // Pass slots data for accurate player fill logic
     });
 
     res.json({
       success: result.success,
+      booked: result.success,
       result: result.result,
       error: result.error || null,
+      mode: 'normal',
+      booking: {
+        targetDate,
+        selectedTime: result.bookedTime,
+        preferredTimes,
+        playersRequested: result.playersRequested,
+        openSlots: result.bookedTime
+          ? slotsData?.find(s => s.time === result.bookedTime)?.openSlots
+          : null,
+      },
+      timing: {
+        latencyMs: result.latencyMs,
+        fallbackLevel: result.fallbackLevel,
+      },
+      notes: result.notes,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -1517,6 +1785,7 @@ app.post('/api/book-now', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to execute immediate booking',
+      timestamp: new Date().toISOString(),
     });
   }
 });
