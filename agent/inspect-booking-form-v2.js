@@ -27,8 +27,7 @@ async function main() {
     });
 
     const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       viewport: { width: 1280, height: 720 },
     });
 
@@ -56,13 +55,17 @@ async function main() {
       .getByPlaceholder(/8 digit GUI|ILGU|username/i)
       .first()
       .fill(USERNAME);
-    await page.getByPlaceholder(/password/i).first().fill(PASSWORD);
+    await page
+      .getByPlaceholder(/password/i)
+      .first()
+      .fill(PASSWORD);
     await page.getByRole('button', { name: /login/i }).first().click();
     await page.waitForTimeout(3000);
 
     // Step 5: Navigate to tee sheet
     console.log('5️⃣  Navigating to tee sheet...');
-    const teeSheetUrl = 'https://members.brsgolf.com/galgorm/tee-sheet/1/2025/12/09';
+    const teeSheetUrl =
+      'https://members.brsgolf.com/galgorm/tee-sheet/1/2025/12/09';
     await page.goto(teeSheetUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,
@@ -92,7 +95,7 @@ async function main() {
     const firstBookingLink = page.locator('a[href*="/bookings/book/"]').first();
     const firstHref = await firstBookingLink.getAttribute('href');
     console.log(`   First booking link: ${firstHref}`);
-    
+
     await firstBookingLink.click({ timeout: 10000 });
     await page.waitForTimeout(2000);
 
@@ -182,7 +185,9 @@ async function main() {
     console.log(`\n   ✅ Saved analysis: ${analysisFile}`);
 
     console.log('\n✅ INSPECTION COMPLETE\n');
-    console.log(`   Output files saved to: ${path.resolve(INSPECTION_OUTPUT)}\n`);
+    console.log(
+      `   Output files saved to: ${path.resolve(INSPECTION_OUTPUT)}\n`,
+    );
 
     await browser.close();
   } catch (error) {

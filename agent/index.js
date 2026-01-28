@@ -318,32 +318,34 @@ async function tryBookTime(page, time, players = []) {
   // Populate player selections if provided
   if (players && players.length > 0) {
     console.log(`  👥 Populating ${players.length} player(s)...`);
-    
+
     for (let i = 0; i < Math.min(players.length, 4); i++) {
       const playerId = players[i];
       const playerSlotId = `member_booking_form_player_${i + 1}`;
-      
+
       try {
         // Using Select2 select element
         const selectLocator = page.locator(`#${playerSlotId}`);
-        
+
         // Click to open the select
         await selectLocator.click({ timeout: 5000 });
         await page.waitForTimeout(300);
-        
+
         // Type to search for player
         await page.keyboard.type(playerId.toString());
         await page.waitForTimeout(300);
-        
+
         // Wait for and click first result
         const result = page.locator('.select2-results__option').first();
         if (await result.isVisible({ timeout: 2000 }).catch(() => false)) {
           await result.click({ timeout: 5000 });
           console.log(`    ✅ Added player ${i + 1}: ${playerId}`);
         } else {
-          console.warn(`    ⚠️ Could not find player ${playerId} in search results`);
+          console.warn(
+            `    ⚠️ Could not find player ${playerId} in search results`,
+          );
         }
-        
+
         await page.waitForTimeout(300);
       } catch (err) {
         console.warn(`    ⚠️ Error populating player ${i + 1}: ${err.message}`);
@@ -355,7 +357,7 @@ async function tryBookTime(page, time, players = []) {
 
   // Confirm booking on the form - use the exact button ID found
   const confirmBtn = page.locator('#member_booking_form_confirm_booking');
-  
+
   if (await confirmBtn.isVisible().catch(() => false)) {
     console.log(`  ✅ Clicking confirm button...`);
     await confirmBtn.click({ timeout: 8000 }).catch(() => {});

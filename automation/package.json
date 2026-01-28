@@ -1,0 +1,23 @@
+{
+  "name": "automation",
+  "type": "module",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "node -r dotenv/config ./node_modules/@playwright/test/cli.js",
+    "codegen": "npx playwright codegen"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@types/node": "^24.8.1",
+    "date-fns-tz": "^1.3.8",
+    "dotenv": "^17.2.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

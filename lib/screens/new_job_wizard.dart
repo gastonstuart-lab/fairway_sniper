@@ -332,18 +332,20 @@ class _NewJobWizardState extends State<NewJobWizard> {
   }) async {
     try {
       final client = http.Client();
-      final response = await client.post(
-        Uri.parse('$_agentBaseUrl/api/book-now'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'username': username,
-          'password': password,
-          'targetDate': targetDate.toIso8601String(),
-          'preferredTimes': preferredTimes,
-          'players': players,
-          'pushToken': pushToken,
-        }),
-      ).timeout(const Duration(seconds: 120));
+      final response = await client
+          .post(
+            Uri.parse('$_agentBaseUrl/api/book-now'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'username': username,
+              'password': password,
+              'targetDate': targetDate.toIso8601String(),
+              'preferredTimes': preferredTimes,
+              'players': players,
+              'pushToken': pushToken,
+            }),
+          )
+          .timeout(const Duration(seconds: 120));
 
       print('📲 Booking response status: ${response.statusCode}');
       print('📲 Booking response body: ${response.body}');
@@ -1295,21 +1297,21 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     if (selected != null) {
       print('🎯 Selected players from modal: $selected');
-      
+
       // Auto-prepend logged-in user if not already in list
       final directory = await _playerDirectoryService.getDirectory(
         username: _brsEmailController.text,
         password: _brsPasswordController.text,
       );
-      
+
       final List<String> finalPlayers = [];
-      if (directory?.currentUserName != null && 
+      if (directory?.currentUserName != null &&
           !selected.contains(directory!.currentUserName)) {
         print('👤 Auto-adding logged-in user: ${directory.currentUserName}');
         finalPlayers.add(directory.currentUserName!);
       }
       finalPlayers.addAll(selected);
-      
+
       setState(() {
         _selectedPlayers = finalPlayers
             .map((name) => name.trim())

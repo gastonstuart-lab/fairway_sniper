@@ -1,0 +1,16 @@
+version: '3.7'
+services:
+  agent:
+    build: .
+    container_name: fairway-sniper-agent
+    ports:
+      - '3000:3000'
+    environment:
+      - AGENT_RUN_MAIN=false
+      - AGENT_HEADLESS=false
+      - PUBLISH_AVAILABLE_TIMES=false
+    volumes:
+      - ./output:/usr/src/app/output
+      - ./logs:/usr/src/app/logs
+    shm_size: '1gb'
+    restart: unless-stopped

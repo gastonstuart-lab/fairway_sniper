@@ -4,8 +4,8 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.1.0'
-        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.8.22'
+        classpath 'com.android.tools.build:gradle:8.3.0'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.23'
     }
 }
 
@@ -22,7 +22,7 @@ subprojects {
         if (project.hasProperty("kotlin")) {
             project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).all {
                 kotlinOptions {
-                    jvmTarget = "1.8"
+                    jvmTarget = "17"
                 }
             }
         }
@@ -35,6 +35,10 @@ subprojects {
                 project.plugins.hasPlugin("com.android.library")) {
             project.android {
                 compileSdkVersion 34
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
             }
         }
         if (project.hasProperty('android')) {

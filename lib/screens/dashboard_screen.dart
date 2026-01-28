@@ -1172,8 +1172,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                     : [Color(0xFF4A90E2), Color(0xFF357ABD)],
                               )
                             : null,
-                        color:
-                            job.status != 'active' ? Colors.grey.shade300 : null,
+                        color: job.status != 'active'
+                            ? Colors.grey.shade300
+                            : null,
                         borderRadius: BorderRadius.circular(14),
                         boxShadow: job.status == 'active'
                             ? [
@@ -1190,9 +1191,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                       child: Icon(
                         Icons.golf_course,
-                        color: job.status == 'active'
-                            ? Colors.white
-                            : Colors.grey,
+                        color:
+                            job.status == 'active' ? Colors.white : Colors.grey,
                         size: 30,
                       ),
                     ),
@@ -1216,8 +1216,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           const SizedBox(height: 4),
                           Row(
                             children: [
-                              Icon(Icons.people,
-                                  size: 14, color: subtextColor),
+                              Icon(Icons.people, size: 14, color: subtextColor),
                               const SizedBox(width: 4),
                               Text(
                                 '${job.players.length} players',
@@ -1270,329 +1269,337 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           tooltip: job.status == 'active'
                               ? 'Pause Job'
                               : 'Activate Job',
-                      onPressed: () async {
-                        await _firebaseService.updateJob(
-                          job.id!,
-                          {
-                            'status':
-                                job.status == 'active' ? 'paused' : 'active'
+                          onPressed: () async {
+                            await _firebaseService.updateJob(
+                              job.id!,
+                              {
+                                'status':
+                                    job.status == 'active' ? 'paused' : 'active'
+                              },
+                            );
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    job.status == 'active'
+                                        ? '⏸️ Job paused'
+                                        : '▶️ Job activated',
+                                  ),
+                                  duration: const Duration(seconds: 2),
+                                ),
+                              );
+                            }
                           },
-                        );
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                job.status == 'active'
-                                    ? '⏸️ Job paused'
-                                    : '▶️ Job activated',
-                              ),
-                              duration: const Duration(seconds: 2),
-                            ),
-                          );
-                        }
-                      },
-                    ),
-                    // Delete button
-                    IconButton(
-                      icon: const Icon(
-                        Icons.delete_forever,
-                        color: Colors.red,
-                        size: 28,
-                      ),
-                      tooltip: 'Delete Job',
-                      onPressed: () async {
-                        // Show confirmation dialog
-                        final confirm = await showDialog<bool>(
-                          context: context,
-                          builder: (context) => AlertDialog(
-                            title: const Text('Delete Booking Job?'),
-                            content: const Text(
-                              'This will permanently remove this booking job and all its history. This action cannot be undone.',
-                            ),
-                            actions: [
-                              TextButton(
-                                onPressed: () =>
-                                    Navigator.of(context).pop(false),
-                                child: const Text('Cancel'),
-                              ),
-                              ElevatedButton(
-                                onPressed: () =>
-                                    Navigator.of(context).pop(true),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.red,
-                                ),
-                                child: const Text(
-                                  'Delete',
-                                  style: TextStyle(color: Colors.white),
-                                ),
-                              ),
-                            ],
+                        ),
+                        // Delete button
+                        IconButton(
+                          icon: const Icon(
+                            Icons.delete_forever,
+                            color: Colors.red,
+                            size: 28,
                           ),
-                        );
-
-                        if (confirm == true) {
-                          await _firebaseService.deleteJob(job.id!);
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('🗑️ Booking job deleted'),
-                                backgroundColor: Colors.red,
+                          tooltip: 'Delete Job',
+                          onPressed: () async {
+                            // Show confirmation dialog
+                            final confirm = await showDialog<bool>(
+                              context: context,
+                              builder: (context) => AlertDialog(
+                                title: const Text('Delete Booking Job?'),
+                                content: const Text(
+                                  'This will permanently remove this booking job and all its history. This action cannot be undone.',
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(false),
+                                    child: const Text('Cancel'),
+                                  ),
+                                  ElevatedButton(
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(true),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.red,
+                                    ),
+                                    child: const Text(
+                                      'Delete',
+                                      style: TextStyle(color: Colors.white),
+                                    ),
+                                  ),
+                                ],
                               ),
                             );
-                          }
-                        }
-                      },
-                    ),
-                  ],
-                ),
-              ],
-            ),
-            if (job.status == 'active') ...[
-              const SizedBox(height: 16),
-              const Divider(height: 1),
-              const SizedBox(height: 16),
-              // Only show countdown for Sniper mode (Normal mode books immediately)
-              if (job.bookingMode == BookingMode.sniper) ...[
-                // Countdown to Booking Time
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF2E7D32).withValues(alpha: 0.1),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Icon(
-                        Icons.rocket_launch,
-                        size: 20,
-                        color: Color(0xFF2E7D32),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Countdown to Booking Time',
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              color: textColor,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            '${job.releaseDay} at ${job.releaseTimeLocal}',
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: subtextColor,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (timeUntilBooking != null)
-                      StreamBuilder<int>(
-                        stream:
-                            Stream.periodic(const Duration(seconds: 1), (i) => i),
-                        builder: (context, snapshot) {
-                          final updatedTime = job.nextFireTimeUtc!
-                              .difference(DateTime.now().toUtc());
-                          return Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 12, vertical: 6),
-                            decoration: BoxDecoration(
-                              gradient: const LinearGradient(
-                                colors: [Color(0xFF2E7D32), Color(0xFF43A047)],
-                              ),
-                              borderRadius: BorderRadius.circular(8),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: const Color(0xFF2E7D32)
-                                      .withValues(alpha: 0.3),
-                                  blurRadius: 4,
-                                  offset: const Offset(0, 2),
-                                ),
-                              ],
-                            ),
-                            child: Text(
-                              _formatDuration(updatedTime),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-              ],
-              // Countdown to Tee Time (for both Normal and Sniper)
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [
-                          const Color(0xFFFFD700).withValues(alpha: 0.2),
-                          const Color(0xFFFFA000).withValues(alpha: 0.2),
-                        ],
-                      ),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Icon(
-                      Icons.emoji_events,
-                      size: 20,
-                      color: Color(0xFFF57C00),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Countdown to Tee Time',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: textColor,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '${job.targetDay} at ${job.preferredTimes.first}',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: subtextColor,
-                          ),
+
+                            if (confirm == true) {
+                              await _firebaseService.deleteJob(job.id!);
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('🗑️ Booking job deleted'),
+                                    backgroundColor: Colors.red,
+                                  ),
+                                );
+                              }
+                            }
+                          },
                         ),
                       ],
                     ),
-                  ),
-                  if (timeUntilTeeTime != null)
-                    StreamBuilder<int>(
-                      stream:
-                          Stream.periodic(const Duration(seconds: 1), (i) => i),
-                      builder: (context, snapshot) {
-                        final updated =
-                            targetDateTime!.difference(DateTime.now());
-                        return Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 6),
+                  ],
+                ),
+                if (job.status == 'active') ...[
+                  const SizedBox(height: 16),
+                  const Divider(height: 1),
+                  const SizedBox(height: 16),
+                  // Only show countdown for Sniper mode (Normal mode books immediately)
+                  if (job.bookingMode == BookingMode.sniper) ...[
+                    // Countdown to Booking Time
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
                           decoration: BoxDecoration(
-                            gradient: const LinearGradient(
-                              colors: [Color(0xFFFFD700), Color(0xFFF57C00)],
-                            ),
+                            color:
+                                const Color(0xFF2E7D32).withValues(alpha: 0.1),
                             borderRadius: BorderRadius.circular(8),
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(0xFFFFD700)
-                                    .withValues(alpha: 0.4),
-                                blurRadius: 4,
-                                offset: const Offset(0, 2),
+                          ),
+                          child: const Icon(
+                            Icons.rocket_launch,
+                            size: 20,
+                            color: Color(0xFF2E7D32),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Countdown to Booking Time',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: textColor,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                '${job.releaseDay} at ${job.releaseTimeLocal}',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: subtextColor,
+                                ),
                               ),
                             ],
                           ),
-                          child: Text(
-                            _formatDuration(updated),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
-                            ),
+                        ),
+                        if (timeUntilBooking != null)
+                          StreamBuilder<int>(
+                            stream: Stream.periodic(
+                                const Duration(seconds: 1), (i) => i),
+                            builder: (context, snapshot) {
+                              final updatedTime = job.nextFireTimeUtc!
+                                  .difference(DateTime.now().toUtc());
+                              return Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 12, vertical: 6),
+                                decoration: BoxDecoration(
+                                  gradient: const LinearGradient(
+                                    colors: [
+                                      Color(0xFF2E7D32),
+                                      Color(0xFF43A047)
+                                    ],
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: const Color(0xFF2E7D32)
+                                          .withValues(alpha: 0.3),
+                                      blurRadius: 4,
+                                      offset: const Offset(0, 2),
+                                    ),
+                                  ],
+                                ),
+                                child: Text(
+                                  _formatDuration(updatedTime),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              );
+                            },
                           ),
-                        );
-                      },
-                    ),
-                ],
-              ),
-              // For Normal mode bookings, show BRS website link
-              if (job.bookingMode == BookingMode.normal) ...[
-                const SizedBox(height: 16),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [
-                        const Color(0xFF4A90E2).withValues(alpha: 0.1),
-                        const Color(0xFF357ABD).withValues(alpha: 0.1),
                       ],
                     ),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: const Color(0xFF4A90E2).withValues(alpha: 0.3),
-                    ),
-                  ),
-                  child: Row(
+                    const SizedBox(height: 12),
+                  ],
+                  // Countdown to Tee Time (for both Normal and Sniper)
+                  Row(
                     children: [
-                      const Icon(Icons.open_in_new,
-                          size: 18, color: Color(0xFF4A90E2)),
-                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              const Color(0xFFFFD700).withValues(alpha: 0.2),
+                              const Color(0xFFFFA000).withValues(alpha: 0.2),
+                            ],
+                          ),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.emoji_events,
+                          size: 20,
+                          color: Color(0xFFF57C00),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              'Booking Confirmed',
+                              'Countdown to Tee Time',
                               style: TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.w600,
                                 color: textColor,
                               ),
                             ),
-                            const SizedBox(height: 4),
-                            GestureDetector(
-                              onTap: () => _launchBRSWebsite(),
-                              child: Text(
-                                'View on BRS Website',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: const Color(0xFF4A90E2),
-                                  decoration: TextDecoration.underline,
-                                ),
+                            const SizedBox(height: 2),
+                            Text(
+                              '${job.targetDay} at ${job.preferredTimes.first}',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: subtextColor,
                               ),
                             ),
                           ],
                         ),
                       ),
+                      if (timeUntilTeeTime != null)
+                        StreamBuilder<int>(
+                          stream: Stream.periodic(
+                              const Duration(seconds: 1), (i) => i),
+                          builder: (context, snapshot) {
+                            final updated =
+                                targetDateTime!.difference(DateTime.now());
+                            return Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                gradient: const LinearGradient(
+                                  colors: [
+                                    Color(0xFFFFD700),
+                                    Color(0xFFF57C00)
+                                  ],
+                                ),
+                                borderRadius: BorderRadius.circular(8),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: const Color(0xFFFFD700)
+                                        .withValues(alpha: 0.4),
+                                    blurRadius: 4,
+                                    offset: const Offset(0, 2),
+                                  ),
+                                ],
+                              ),
+                              child: Text(
+                                _formatDuration(updated),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            );
+                          },
+                        ),
                     ],
                   ),
-                ),
-              ],
-            ],
-            if (job.status != 'active')
-              Padding(
-                padding: const EdgeInsets.only(top: 12),
-                child: Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: _isDarkMode
-                        ? Colors.grey.shade800.withValues(alpha: 0.5)
-                        : Colors.grey.shade100,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(Icons.pause_circle, size: 16, color: subtextColor),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Job Paused',
-                        style: TextStyle(
-                          fontSize: 13,
-                          color: subtextColor,
-                          fontWeight: FontWeight.w500,
+                  // For Normal mode bookings, show BRS website link
+                  if (job.bookingMode == BookingMode.normal) ...[
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            const Color(0xFF4A90E2).withValues(alpha: 0.1),
+                            const Color(0xFF357ABD).withValues(alpha: 0.1),
+                          ],
+                        ),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: const Color(0xFF4A90E2).withValues(alpha: 0.3),
                         ),
                       ),
-                    ],
+                      child: Row(
+                        children: [
+                          const Icon(Icons.open_in_new,
+                              size: 18, color: Color(0xFF4A90E2)),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Booking Confirmed',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: textColor,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                GestureDetector(
+                                  onTap: () => _launchBRSWebsite(),
+                                  child: Text(
+                                    'View on BRS Website',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: const Color(0xFF4A90E2),
+                                      decoration: TextDecoration.underline,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+                if (job.status != 'active')
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: _isDarkMode
+                            ? Colors.grey.shade800.withValues(alpha: 0.5)
+                            : Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.pause_circle,
+                              size: 16, color: subtextColor),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Job Paused',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: subtextColor,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
-                ),
-              ),
               ],
             ),
           ),

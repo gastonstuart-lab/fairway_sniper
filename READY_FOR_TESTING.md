@@ -1,13 +1,14 @@
 # 🎯 READY FOR LIVE TESTING - Quick Start Guide
 
 **Status:** ✅ **COMPLETE** - All code implemented and documented  
-**Next Action:** Execute real booking to validate player population  
+**Next Action:** Execute real booking to validate player population
 
 ---
 
 ## 📌 What You've Got Now
 
 ### 1. Complete Form Understanding ✅
+
 The BRS booking form has been **fully reverse-engineered**:
 
 ```
@@ -21,6 +22,7 @@ Form Fields Discovered:
 ```
 
 ### 2. Player Population Logic ✅
+
 Code now **automatically populates** player fields:
 
 ```javascript
@@ -34,6 +36,7 @@ Code now **automatically populates** player fields:
 ```
 
 ### 3. API Ready ✅
+
 The `/api/book-now` endpoint is fully functional:
 
 ```bash
@@ -54,6 +57,7 @@ Body:
 ## 🚀 How to Test It
 
 ### Option A: Direct API Test (Fastest)
+
 ```powershell
 # Start the agent if not running
 $env:PORT="3000"; node agent/index.js
@@ -64,6 +68,7 @@ node test-book-now.js 12390624 cantona7777 2025-12-10
 ```
 
 ### Option B: Manual API Call
+
 ```powershell
 $body = @{
   username = "12390624"
@@ -82,6 +87,7 @@ $response | ConvertTo-Json | Write-Host
 ```
 
 ### Option C: Through Flutter UI (Full Integration)
+
 1. Start Flutter: `flutter run -d chrome`
 2. Create a "Normal Mode" booking
 3. Select player: "Sharpe, Mal"
@@ -94,6 +100,7 @@ $response | ConvertTo-Json | Write-Host
 ## 📊 What Happens When You Test
 
 ### Expected Flow:
+
 ```
 [Test Triggered]
   ↓
@@ -119,6 +126,7 @@ $response | ConvertTo-Json | Write-Host
 ```
 
 ### What to Look For:
+
 - ✅ Browser opens (non-headless)
 - ✅ Login succeeds
 - ✅ Tee sheet loads
@@ -131,6 +139,7 @@ $response | ConvertTo-Json | Write-Host
 ## 🧪 Test Scenarios
 
 ### Test 1: Single Player (Baseline)
+
 ```json
 {
   "username": "12390624",
@@ -140,30 +149,37 @@ $response | ConvertTo-Json | Write-Host
   "players": [685]
 }
 ```
+
 **Expected:** Sharpe, Mal appears in Player 1 slot, booking succeeds
 
 ### Test 2: Multiple Players
+
 ```json
 {
   "players": [685, 16660, 15221]
 }
 ```
+
 **Expected:** Three players fill slots 1-3, booking succeeds
 
 ### Test 3: Different Time
+
 ```json
 {
   "preferredTimes": ["09:30", "10:00"]
 }
 ```
+
 **Expected:** Agent tries first preferred time first, falls back if full
 
 ### Test 4: Future Date
+
 ```json
 {
   "targetDate": "2025-12-15"
 }
 ```
+
 **Expected:** Works for any valid date on BRS system
 
 ---
@@ -171,12 +187,14 @@ $response | ConvertTo-Json | Write-Host
 ## 📋 Code Files Modified
 
 ### Core Implementation
+
 - **`agent/index.js`**
   - `tryBookTime()` - Player selection logic
   - `runBooking()` - Config handling
   - `/api/book-now` - Endpoint
 
 ### Testing & Documentation
+
 - **`agent/test-book-now.js`** - Test script
 - **`agent/inspect-booking-form-v2.js`** - Form discovery
 - **`FORM_INSPECTION_COMPLETE.md`** - Technical reference
@@ -187,6 +205,7 @@ $response | ConvertTo-Json | Write-Host
 ## 🔍 How to Debug if Something Goes Wrong
 
 ### Check Agent Logs
+
 ```powershell
 # Terminal where agent is running
 # Look for these messages:
@@ -197,9 +216,11 @@ $response | ConvertTo-Json | Write-Host
 ```
 
 ### Enable Headless=false
+
 Already enabled in test script - you'll see browser open
 
 ### Check Form Structure Changed
+
 ```bash
 # Re-run inspection
 node agent/inspect-booking-form-v2.js
@@ -210,35 +231,39 @@ node agent/inspect-booking-form-v2.js
 
 ### Common Issues
 
-| Issue | Solution |
-|-------|----------|
-| "No slot link found" | Tee sheet didn't load, check internet |
-| "Confirm button not found" | Form structure changed, re-run inspection |
-| "Could not find player in results" | Player ID wrong, check member ID |
-| "Booking failed" | BRS form validation, check requirements |
-| "Select2 dropdown didn't open" | Timing issue, add more waitForTimeout |
+| Issue                              | Solution                                  |
+| ---------------------------------- | ----------------------------------------- |
+| "No slot link found"               | Tee sheet didn't load, check internet     |
+| "Confirm button not found"         | Form structure changed, re-run inspection |
+| "Could not find player in results" | Player ID wrong, check member ID          |
+| "Booking failed"                   | BRS form validation, check requirements   |
+| "Select2 dropdown didn't open"     | Timing issue, add more waitForTimeout     |
 
 ---
 
 ## ✨ Success Criteria
 
 ### Level 1: API Works
+
 - [ ] `/api/book-now` endpoint accepts requests
 - [ ] Agent launches browser
 - [ ] Form loads successfully
 - [ ] API returns response (success or error)
 
 ### Level 2: Form Population Works
+
 - [ ] Player name appears in form field
 - [ ] Confirm button is accessible
 - [ ] No JavaScript errors
 
 ### Level 3: Booking Completes
+
 - [ ] Confirm button click succeeds
 - [ ] BRS processes booking
 - [ ] Booking appears in BRS account
 
 ### Level 4: Multi-Player Works
+
 - [ ] Multiple players populate correctly
 - [ ] All form fields fill in order
 - [ ] Booking completes with all players
@@ -248,6 +273,7 @@ node agent/inspect-booking-form-v2.js
 ## 📞 Quick Reference
 
 ### Test Credentials
+
 ```
 Username: 12390624
 Password: cantona7777
@@ -255,6 +281,7 @@ Club: Galgorm Golf Club
 ```
 
 ### Known Player IDs
+
 ```
 685      → Sharpe, Mal
 16660    → Morgan, Leo
@@ -264,6 +291,7 @@ Club: Galgorm Golf Club
 ```
 
 ### API Endpoints
+
 ```
 POST /api/book-now              → Immediate booking
 POST /api/fetch-tee-times       → Get available slots
@@ -275,25 +303,29 @@ POST /api/brs/fetch-player-directory → Get all players
 ## 🎯 Your Next Actions (in order)
 
 1. **Start Agent Server**
+
    ```powershell
    $env:PORT="3000"; node agent/index.js
    ```
 
 2. **Run Test (Choose One)**
+
    ```powershell
    # Option A: Test script
    node agent/test-book-now.js
-   
+
    # Option B: Manual PowerShell call
    # (See section above)
    ```
 
 3. **Watch Browser**
+
    - See what happens
    - Check for form population
    - Verify booking completes
 
 4. **Check Results**
+
    - API response status
    - Booking in BRS account
    - Agent logs for errors
@@ -311,7 +343,7 @@ POST /api/brs/fetch-player-directory → Get all players
 ✅ Booking will be created in BRS  
 ✅ Player name will be auto-populated  
 ✅ All necessary fields will be filled  
-✅ Normal mode booking will be fully functional  
+✅ Normal mode booking will be fully functional
 
 **Time to complete full flow:** ~30 seconds per booking
 

@@ -63,7 +63,8 @@ class PlayerCategory {
 class PlayerDirectory {
   final List<PlayerCategory> categories;
   final DateTime fetchedAt;
-  final String? currentUserName; // Name of the logged-in user (from BRS Player 1 slot)
+  final String?
+      currentUserName; // Name of the logged-in user (from BRS Player 1 slot)
 
   PlayerDirectory({
     required this.categories,
@@ -102,7 +103,7 @@ class PlayerDirectory {
   /// Search for players by name (case-insensitive)
   List<Player> searchPlayers(String query) {
     if (query.isEmpty) return getAllPlayers();
-    
+
     final lowerQuery = query.toLowerCase();
     return getAllPlayers()
         .where((player) => player.name.toLowerCase().contains(lowerQuery))

@@ -1,4 +1,5 @@
 # Fairway Sniper - Comprehensive Build Status Report
+
 **Date:** December 8, 2025  
 **Version:** v1.0-working-baseline (+ immediate normal booking feature)  
 **Overall Health:** 🟡 **85% Complete** | **Ready for Testing**
@@ -8,6 +9,7 @@
 ## 1. EXECUTIVE SUMMARY
 
 ### What's Working ✅
+
 - **Flutter App**: Fully functional UI/UX with authentication, job creation, and dashboard
 - **Agent Server**: Scraping endpoints operational; login & navigation automated
 - **Player Directory**: Successfully extracting 768 players from BRS Golf system
@@ -17,6 +19,7 @@
 - **Two Booking Modes**: Both Normal (immediate) and Sniper (scheduled) workflows implemented
 
 ### Critical Gaps ⚠️
+
 1. **BOOKING EXECUTION NEVER TESTED** - Agent has never successfully completed an actual BRS booking
 2. **Player Form Filling**: Multi-player selection form not implemented in agent
 3. **Sniper Scheduler**: Background job execution mechanism not running
@@ -29,9 +32,11 @@
 ## 2. DETAILED COMPONENT ANALYSIS
 
 ### 2.1 Flutter Application (`lib/`)
+
 **Status: 95% Complete** ✅
 
 **Implemented:**
+
 - `LoginScreen` - Firebase Auth (email/password signup & signin)
 - `ModeSelectionScreen` - User chooses Normal or Sniper mode
 - `NewJobWizard` - Unified wizard for Normal mode (4-page flow)
@@ -48,17 +53,20 @@
 - `CourseInfoScreen` - Course details & rules
 
 **Services:**
+
 - `FirebaseService` - Auth, Firestore CRUD, FCM token management
 - `PlayerDirectoryService` - Agent integration for fetching 768 players
 - `WeatherService` - Golf course weather integration
 - `GolfNewsService` - Golf news feed
 
 **Models:**
+
 - `BookingJob` - Job data model with mode enum (normal/sniper)
 - `BookingRun` - Execution history tracking
 - `PlayerDirectory` - Player list with currentUserName support
 
 **Recent Improvements (Today):**
+
 - ✅ Auto-prepends logged-in user to player selection
 - ✅ Immediate booking execution for Normal mode
 - ✅ Color-coded dashboard headers (blue/orange)
@@ -66,6 +74,7 @@
 - ✅ Progress dialog during booking execution
 
 **Missing/Incomplete:**
+
 - ❌ Mobile app testing on actual Android device
 - ⚠️ Offline mode (currently requires constant connectivity)
 - ⚠️ Booking history/past bookings visualization
@@ -74,34 +83,37 @@
 ---
 
 ### 2.2 Node.js Agent (`agent/`)
+
 **Status: 70% Complete** ⚠️
 
 **Operational Endpoints:**
 
-| Endpoint | Status | Purpose |
-|----------|--------|---------|
-| `GET /api/health` | ✅ Working | Service health check |
-| `POST /api/fetch-tee-times` | ✅ Working | Single-day availability lookup |
-| `POST /api/fetch-tee-times-range` | ✅ Working | 7-day range availability |
-| `POST /api/brs/fetch-player-directory` | ✅ Working | 768 players extraction |
-| `POST /api/book-now` | ✅ Ready | **NEW** Immediate normal booking |
+| Endpoint                               | Status     | Purpose                          |
+| -------------------------------------- | ---------- | -------------------------------- |
+| `GET /api/health`                      | ✅ Working | Service health check             |
+| `POST /api/fetch-tee-times`            | ✅ Working | Single-day availability lookup   |
+| `POST /api/fetch-tee-times-range`      | ✅ Working | 7-day range availability         |
+| `POST /api/brs/fetch-player-directory` | ✅ Working | 768 players extraction           |
+| `POST /api/book-now`                   | ✅ Ready   | **NEW** Immediate normal booking |
 
 **Booking Logic Components:**
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| `loginToBRS()` | ✅ Working | Robust login with multi-selector detection |
-| `navigateToTeeSheet()` | ✅ Working | Date-aware sheet navigation with fallback |
-| `tryBookTime()` | ⚠️ **NOT TESTED** | Clicks booking link + confirms (untested live) |
-| `runBooking()` | ⚠️ **NOT TESTED** | Full orchestration (untested on real BRS) |
-| Timing precision | ✅ Working | Coarse wait + spin-wait for millisecond accuracy |
+| Component              | Status            | Notes                                            |
+| ---------------------- | ----------------- | ------------------------------------------------ |
+| `loginToBRS()`         | ✅ Working        | Robust login with multi-selector detection       |
+| `navigateToTeeSheet()` | ✅ Working        | Date-aware sheet navigation with fallback        |
+| `tryBookTime()`        | ⚠️ **NOT TESTED** | Clicks booking link + confirms (untested live)   |
+| `runBooking()`         | ⚠️ **NOT TESTED** | Full orchestration (untested on real BRS)        |
+| Timing precision       | ✅ Working        | Coarse wait + spin-wait for millisecond accuracy |
 
 **Firebase Integration:**
+
 - ✅ Firestore job querying (`fsGetOneActiveJob`)
 - ✅ Run record creation (`fsAddRun`, `fsFinishRun`)
 - ✅ FCM push notifications (`sendPushFCM`)
 
 **Dependencies:**
+
 - Playwright (browser automation)
 - Express.js (HTTP server)
 - Firebase Admin SDK
@@ -111,17 +123,20 @@
 **Critical Issues:**
 
 1. **No Live Booking Test Ever Run**
+
    - `tryBookTime()` and `runBooking()` written but never executed against live BRS
    - Form selectors may not match actual BRS markup
    - Player selection form not implemented
    - No validation that booking actually saved
 
 2. **Missing Player Selection Form Filling**
+
    - Current code only handles time slot selection
    - Multi-player dropdown (Player 1, 2, 3, 4) not implemented
    - Need to populate Player 2/3 with names from `_selectedPlayers`
 
 3. **No Sniper Scheduler Running**
+
    - Agent has `main()` but no persistent daemon
    - Would need Node process manager (PM2) or Cloud Function scheduling
    - No background polling of Firestore for active jobs
@@ -134,15 +149,18 @@
 ---
 
 ### 2.3 Firebase Backend
+
 **Status: 95% Complete** ✅
 
 **Configured:**
+
 - ✅ Firebase Auth (email/password provider)
 - ✅ Cloud Firestore (jobs + runs collections)
 - ✅ Firebase Cloud Messaging (FCM)
 - ✅ Security rules (basic user isolation)
 
 **Collections:**
+
 ```
 users/
   ├── {uid}/
@@ -170,6 +188,7 @@ runs/
 ```
 
 **Missing:**
+
 - ⚠️ Booking confirmations storage (BRS confirmation email parsing)
 - ⚠️ User booking history (past successful bookings)
 - ⚠️ Audit trail for booking attempts
@@ -177,9 +196,11 @@ runs/
 ---
 
 ### 2.4 Automation Tests (`automation/`)
+
 **Status: 60% Complete** ⚠️
 
 **Existing Test Specs:**
+
 - `login.spec.ts` - Login flow validation
 - `range_endpoint.spec.ts` - 7-day fetch testing
 - `book_tee_time.spec.ts` - **INCOMPLETE** manual booking test
@@ -187,6 +208,7 @@ runs/
 - Others - Various helper functions
 
 **Status:**
+
 - ✅ Can login to BRS
 - ✅ Can navigate to tee sheet
 - ✅ Can fetch available times
@@ -198,40 +220,46 @@ runs/
 ## 3. THE CRITICAL MISSING PIECE: LIVE BOOKING EXECUTION
 
 ### What Needs to Happen
+
 The app flow is complete UP TO the booking attempt:
+
 1. ✅ User selects tee time
-2. ✅ User selects players  
+2. ✅ User selects players
 3. ✅ Credentials sent to agent
 4. ❌ **Agent needs to fill booking form and confirm**
 5. ❌ **Agent needs to verify booking succeeded**
 6. ❌ **Confirmation returned to user**
 
 ### What `tryBookTime()` Currently Does
+
 ```javascript
 async function tryBookTime(page, time) {
   // 1. Find booking link for the time slot
   const slot = page.locator(`a[href*="/bookings/book/${hhmm}"]`);
-  
+
   // 2. Click it
   await slot.click();
-  
+
   // 3. Find and click confirm button
   const btn = page.locator('button:has-text("Confirm")');
   await btn.click();
-  
+
   // 4. Return true if clicked
   return true;
 }
 ```
 
 ### What's Missing
+
 1. **Player Form Handling** ⚠️ CRITICAL
+
    - After clicking time slot, BRS shows booking form
    - Form has Player 1-4 select dropdowns
    - `tryBookTime()` doesn't populate these
    - Need to inject player names into correct selectors
 
 2. **Post-Booking Verification** ⚠️ CRITICAL
+
    - No check that booking actually saved
    - Should navigate to bookings page or check for success message
    - Currently just returns `true` if confirm button exists
@@ -246,6 +274,7 @@ async function tryBookTime(page, time) {
 ## 4. ROADMAP TO PRODUCTION (Remaining 15%)
 
 ### Phase 1: Complete & Test Booking Logic (3-4 hours)
+
 **Priority: CRITICAL**
 
 ```
@@ -254,19 +283,19 @@ async function tryBookTime(page, time) {
     - Add player dropdown population logic
     - Verify each player field is filled
     - Estimated time: 1-1.5 hours
-    
+
 [2] Add post-booking verification
     - Screenshot/inspect confirmation page
     - Check for success message patterns
     - Fallback detection for already-booked scenarios
     - Estimated time: 1 hour
-    
+
 [3] Run live booking test
     - Execute booking on test account
     - Verify BRS website shows booking
     - Collect actual form HTML for debugging
     - Estimated time: 1.5 hours
-    
+
 [4] Add error handling & retries
     - Detect common failure scenarios
     - Implement fallback time selection
@@ -275,6 +304,7 @@ async function tryBookTime(page, time) {
 ```
 
 ### Phase 2: Sniper Mode Scheduling (2-3 hours)
+
 **Priority: HIGH (after normal mode works)**
 
 ```
@@ -283,13 +313,13 @@ async function tryBookTime(page, time) {
     - Poll Firestore for active sniper jobs
     - Calculate next fire time correctly
     - Estimated time: 1.5 hours
-    
+
 [2] Test scheduled booking execution
     - Create test sniper job
     - Verify it fires at correct time
     - Check FCM notifications
     - Estimated time: 1 hour
-    
+
 [3] Add job status tracking
     - Mark as "waiting", "executing", "completed"
     - Emit real-time updates to Flutter dashboard
@@ -297,6 +327,7 @@ async function tryBookTime(page, time) {
 ```
 
 ### Phase 3: Polish & Testing (2-3 hours)
+
 **Priority: MEDIUM**
 
 ```
@@ -304,13 +335,13 @@ async function tryBookTime(page, time) {
     - Test on Android/iOS
     - Fix layout issues
     - Estimated time: 1.5 hours
-    
+
 [2] Error scenarios & edge cases
     - Network timeouts
     - BRS downtime/rate limiting
     - Form validation errors
     - Estimated time: 1 hour
-    
+
 [3] User feedback & instrumentation
     - Better error messages
     - Booking confirmation flow
@@ -319,6 +350,7 @@ async function tryBookTime(page, time) {
 ```
 
 ### Phase 4: Production Deployment (1-2 hours)
+
 **Priority: FINAL**
 
 ```
@@ -333,18 +365,21 @@ async function tryBookTime(page, time) {
 ## 5. COMPLETION ESTIMATES
 
 ### Normal Mode (Book Immediately)
+
 - **Current Status:** 90% ready
 - **Remaining Work:** Complete & test `tryBookTime()` + player form filling
 - **Estimated Time:** 3-4 hours
 - **Critical Path Blocker:** Must test on real BRS booking
 
 ### Sniper Mode (Scheduled Booking)
+
 - **Current Status:** 50% ready (logic exists, no scheduler)
 - **Remaining Work:** Background job runner + scheduling daemon
 - **Estimated Time:** 2-3 hours
 - **Dependencies:** Normal mode must work first
 
 ### Full Production Ready
+
 - **Current Status:** 85% complete overall
 - **Remaining Work:** Above + polish + mobile testing
 - **Estimated Time:** 7-10 hours of focused development
@@ -355,7 +390,9 @@ async function tryBookTime(page, time) {
 ## 6. CRITICAL RECOMMENDATIONS
 
 ### Immediate Actions (Do First)
+
 1. **Inspect Real BRS Booking Form** (30 mins)
+
    - Log into BRS as test user
    - Click a tee time slot
    - Use browser DevTools to inspect form HTML
@@ -363,6 +400,7 @@ async function tryBookTime(page, time) {
    - Compare with code assumptions
 
 2. **Execute Test Booking** (1.5 hours)
+
    - Create simple test script using current agent code
    - Manually run against real BRS with test credentials
    - Capture all form interactions
@@ -375,12 +413,14 @@ async function tryBookTime(page, time) {
    - Verify each player input before clicking confirm
 
 ### Code Quality Improvements
+
 - **Error Messages:** Currently generic; add specific failure detection
 - **Logging:** Excellent logging in place; add screenshots on failure
 - **Retry Logic:** Missing; add exponential backoff for transient failures
 - **Timeout Values:** Currently hardcoded; make configurable
 
 ### Architecture Improvements
+
 - **Job Scheduling:** Consider Firebase Cloud Functions for sniper mode instead of Node daemon
 - **Session Reuse:** Currently deletes sessions each run; could cache for speed
 - **Rate Limiting:** No detection of BRS rate limits; add backoff
@@ -391,6 +431,7 @@ async function tryBookTime(page, time) {
 ## 7. SUCCESS CRITERIA & VALIDATION
 
 ### Normal Mode Success = ✅
+
 - [ ] User selects tee time + players in Flutter
 - [ ] Clicks "Book Now" button
 - [ ] Agent receives `/api/book-now` request
@@ -404,6 +445,7 @@ async function tryBookTime(page, time) {
 - [ ] Dashboard shows "Booking Confirmed" with BRS link
 
 ### Sniper Mode Success = ✅
+
 - [ ] User creates sniper job with release time
 - [ ] Job appears on dashboard with "Waiting for Release" badge
 - [ ] At exact release time, agent executes booking
@@ -417,6 +459,7 @@ async function tryBookTime(page, time) {
 ## 8. TESTING STRATEGY
 
 ### Phase 1: Manual Testing (Current)
+
 ```
 1. Agent endpoint health checks ✅
 2. Player directory scraping ✅
@@ -425,6 +468,7 @@ async function tryBookTime(page, time) {
 ```
 
 ### Phase 2: Live Integration Testing
+
 ```
 1. Create test booking via Flutter
 2. Observe agent logs in real-time
@@ -435,6 +479,7 @@ async function tryBookTime(page, time) {
 ```
 
 ### Phase 3: Automation Testing
+
 ```
 1. Playwright specs for each flow
 2. CI/CD pipeline (GitHub Actions)
@@ -449,6 +494,7 @@ async function tryBookTime(page, time) {
 Before launching to real users:
 
 ### Backend
+
 - [ ] Firebase project in production mode
 - [ ] Security rules tested for each collection
 - [ ] FCM server key configured
@@ -457,6 +503,7 @@ Before launching to real users:
 - [ ] Error logging/Sentry configured
 
 ### Frontend
+
 - [ ] Build optimized release APK/IPA
 - [ ] iOS TestFlight beta setup
 - [ ] Android Google Play beta track
@@ -464,6 +511,7 @@ Before launching to real users:
 - [ ] Analytics implemented
 
 ### Operational
+
 - [ ] Support runbook created
 - [ ] On-call rotation established
 - [ ] Monitoring dashboard (Datadog/CloudWatch)
@@ -474,17 +522,17 @@ Before launching to real users:
 
 ## 10. SUMMARY TABLE
 
-| Component | Status | Blocker | Est. Work |
-|-----------|--------|---------|-----------|
-| Flutter UI | 95% ✅ | No | < 1 hour |
-| Agent Scraping | 95% ✅ | No | < 1 hour |
-| Normal Booking Logic | 50% ⚠️ | **YES** | 3-4 hours |
-| Sniper Scheduling | 40% ⚠️ | YES* | 2-3 hours |
-| Firebase Backend | 95% ✅ | No | < 1 hour |
-| Mobile Testing | 20% ⚠️ | No | 1.5 hours |
-| Production Ready | 85% | YES | 7-10 hours |
+| Component            | Status | Blocker | Est. Work  |
+| -------------------- | ------ | ------- | ---------- |
+| Flutter UI           | 95% ✅ | No      | < 1 hour   |
+| Agent Scraping       | 95% ✅ | No      | < 1 hour   |
+| Normal Booking Logic | 50% ⚠️ | **YES** | 3-4 hours  |
+| Sniper Scheduling    | 40% ⚠️ | YES\*   | 2-3 hours  |
+| Firebase Backend     | 95% ✅ | No      | < 1 hour   |
+| Mobile Testing       | 20% ⚠️ | No      | 1.5 hours  |
+| Production Ready     | 85%    | YES     | 7-10 hours |
 
-*YES if Normal blocking, otherwise can be worked in parallel
+\*YES if Normal blocking, otherwise can be worked in parallel
 
 ---
 
@@ -493,6 +541,7 @@ Before launching to real users:
 **You have built something genuinely sophisticated.** The architecture is sound, the UX is well-designed, and 85% of the work is done. The app is NOT production-ready because you haven't successfully executed a real booking yet, but you are **very close** to a working product.
 
 **The next 15% is do-or-die.** Once you:
+
 1. Get booking form filling working
 2. Verify one successful booking end-to-end
 3. Add error handling for edge cases
@@ -505,5 +554,5 @@ Before launching to real users:
 
 ---
 
-*Report Generated: December 8, 2025*  
-*Next Review: After first successful live booking test*
+_Report Generated: December 8, 2025_  
+_Next Review: After first successful live booking test_

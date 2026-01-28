@@ -1,0 +1,87 @@
+{
+  "cookies": [
+    {
+      "name": "rmm_sid",
+      "value": "39e0b02e0fb1f0a1e22a9811d1bfc04f",
+      "domain": "members.brsgolf.com",
+      "path": "/galgorm",
+      "expires": -1,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "consented",
+      "value": "1",
+      "domain": "members.brsgolf.com",
+      "path": "/galgorm",
+      "expires": 1796443453.226063,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None"
+    },
+    {
+      "name": "auth",
+      "value": "eyJpdiI6IlhmZnA1ZVJxbVRqZTRQY2lnRkJLNHc9PSIsInZhbHVlIjoidWk0WExZK3l2YnFLa29MK1JDRDljd3NvRFVjTXdlVkVBOGpJdUJyd2MxT20yWURmdENJY1FQU3ZDTCsxeWlENXVwelBnc3pMYXUzdGpWVWFTd2gySncrOXZKdnZ2WnlySDVXenI2SlkzRlV0RHprR0ZQNWM4M0RzaUtySHQ3ZHVNUTNndXFlL3NmcWZYODl0SVJ2TmdoTzlldGRUYzhHcjQ5RXAzYVg5enk0bTVVeWtYU1JiZnFzeTRnRXRXQ2ZwZThTMTJWVXlhRTJldi92M2dhdTc1UG94ZUFTMjBJZWNXUFJEYXpnY3JpOHNtc3U4VWwwSHZwNWVIZVF3SktqNTVkT3pxTFIrMTgvY1I4OG5RbXNTVVdacHhkNmh5SUVyb1N5Ykpkam1LUDhyTjNWMHFNL0dnN3cwNEFSTjdJQ25ESjg0VmxpeENIdUNLa3RBZ1VDWVptYWg3aVJQYnZyOXNiRlBJNHJ5MUU3OXUydUdmcGd2R3Q3WmhtaWpSMDZkbG5naDdVTTBoc2Y2dGNXbGhmYk8rd1JWR2dKTlNLSnp2ODBLQ1hSeVU3STB0WUJDN0l5VFA2L2pYaVhTRHBWd1JWRENyelhxSkdqZ09YYlM2VmJ3eG5URlJwVjdGYU95YjNrSWhtQ21xS3dOSmhVS3BwMkk5NnVmSXg0emt3Ui9RS24rVkF1UjJGSERUeGtidjFZZHNRR3piekhPWVlKQWVsZHVRMVBRSTM3UkNJWUFVZXBHMTgvRmJ6eEZ4RCswakxLVWV4RzAvWlpDYkVsNzErc0tNWEtsMHBRVXNPOC9zbUpScGxTS2czUUZFT2FoRStkMUFJNmQyOC8xaS8vbiIsIm1hYyI6ImQ4M2Q5ZGE2YzVkODYzMjMyZmM1NjU0ZWJiZTJhMmZiNjRmOTQ5MWVjMTYxMTQxMGM4Yzg4OTg1N2M4MzMxODQiLCJ0YWciOiIifQ%3D%3D",
+      "domain": "members.brsgolf.com",
+      "path": "/galgorm",
+      "expires": 1796443453.226129,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None"
+    },
+    {
+      "name": "_ga",
+      "value": "GA1.2.663020681.1764907452",
+      "domain": ".brsgolf.com",
+      "path": "/",
+      "expires": 1799467454.898743,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "_gid",
+      "value": "GA1.2.354339087.1764907452",
+      "domain": ".brsgolf.com",
+      "path": "/",
+      "expires": 1764993854,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "_gat_gtag_UA_62425613_8",
+      "value": "1",
+      "domain": ".brsgolf.com",
+      "path": "/",
+      "expires": 1764907511,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "cf_clearance",
+      "value": "QrEHbXKu7Go2RxU3OwUOPwGwbyR0B_tvGy1lqmlA0Tc-1764907454-1.2.1.1-DW8aQMjmhRrssDDxZhq8IxY4TbwscrNjiB_UiFz7RjfIzLvNdnvfSkMPQqbw61AHcxCTV18HpQlHC8vNm5pqz.rh6bkroDyvSsePK.4WaGjhn09zYowmQEqXqQzd.IGnP9biXSoCbVl21EblR.DejnxnTIgeBEHhqT5EdGOoin3EYlgyB0AjhBBhL5j1EYS84GYjm.i0EzinjkJRRpsZlF1kCGpx6NJQFac7a582cMo",
+      "domain": ".brsgolf.com",
+      "path": "/",
+      "expires": 1796443451.67645,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None",
+      "partitionKey": "https://brsgolf.com",
+      "_crHasCrossSiteAncestor": false
+    },
+    {
+      "name": "_gat_UA-62425613-8",
+      "value": "1",
+      "domain": ".brsgolf.com",
+      "path": "/",
+      "expires": 1764907512,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": []
+}

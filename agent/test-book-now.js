@@ -2,11 +2,11 @@
 
 /**
  * TEST SCRIPT: Normal Mode Immediate Booking
- * 
+ *
  * This script tests the /api/book-now endpoint with player selection
- * 
+ *
  * Usage: node test-book-now.js [username] [password] [targetDate]
- * 
+ *
  * Example:
  *   node test-book-now.js 12390624 cantona7777 2025-12-10
  */
@@ -123,10 +123,10 @@ async function testWithMultiplePlayers() {
 
 async function main() {
   await testBooking();
-  
+
   console.log('─'.repeat(60));
   console.log();
-  
+
   // Optionally test with multiple players
   // await testWithMultiplePlayers();
 }

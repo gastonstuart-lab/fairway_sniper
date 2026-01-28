@@ -20,18 +20,21 @@
 ## ⚠️ What's NOT Ready Yet (Don't Do This Now)
 
 ❌ **Do NOT try to make a real booking yet**
+
 - Agent code is written but untested
 - Player form filling not implemented
 - Will fail if you test it now
 - Need to inspect real BRS form first
 
 ❌ **Do NOT deploy to production**
+
 - Booking logic untested
 - Mobile not tested
 - Sniper scheduler not running
 - Error handling incomplete
 
 ❌ **Do NOT modify booking code without a plan**
+
 - Too risky right now
 - Need methodical approach
 - Could introduce bugs
@@ -41,6 +44,7 @@
 ## ✅ What You Should Do Next (Recommended Sequence)
 
 ### Session 1: Inspection & Planning (1 hour)
+
 This session - just read and plan:
 
 - [ ] Read `NEXT_STEPS.md` (quick reference)
@@ -50,6 +54,7 @@ This session - just read and plan:
 **Result:** You understand what needs to happen
 
 ### Session 2: Inspect Real BRS Form (30 minutes)
+
 Tomorrow - hands-on inspection:
 
 ```
@@ -68,6 +73,7 @@ Tomorrow - hands-on inspection:
 **Result:** You have exact form structure
 
 ### Session 3: Update Agent Code (1.5 hours)
+
 Based on what you found:
 
 ```
@@ -81,6 +87,7 @@ Based on what you found:
 **Result:** Manual test succeeds
 
 ### Session 4: Integrate & Test (1 hour)
+
 Full integration:
 
 ```
@@ -93,6 +100,7 @@ Full integration:
 **Result:** API endpoint works end-to-end
 
 ### Session 5: Test Via Flutter (1 hour)
+
 Full application test:
 
 ```
@@ -113,6 +121,7 @@ Full application test:
 The order matters. If you try to test before inspecting the form, you'll waste time debugging why the selectors don't work.
 
 The process is:
+
 1. **Inspect** (know what you're targeting)
 2. **Update code** (implement based on what you found)
 3. **Test manually** (debug in isolation)
@@ -124,6 +133,7 @@ The process is:
 ## 📋 Recommended Daily Schedule
 
 ### Tomorrow (Session 2 + 3)
+
 ```
 Morning (1 hour):
   - Inspect BRS form
@@ -140,6 +150,7 @@ Afternoon (1.5 hours):
 **Goal:** Have manual test working by end of day
 
 ### Day After (Session 4 + 5)
+
 ```
 Morning (1 hour):
   - Test API endpoint
@@ -153,6 +164,7 @@ Afternoon (1 hour):
 **Goal:** Full end-to-end working
 
 ### Day 3 (Polish)
+
 ```
 - Sniper scheduler (2-3 hours)
 - Mobile testing (1-2 hours)
@@ -164,6 +176,7 @@ Afternoon (1 hour):
 ## 📁 Files You'll Be Working With
 
 ### Agent (Backend)
+
 ```
 agent/index.js
   └─ Line 289: tryBookTime() function ← WILL NEED UPDATES
@@ -172,6 +185,7 @@ agent/index.js
 ```
 
 ### Flutter (Frontend)
+
 ```
 lib/screens/new_job_wizard.dart
   └─ _executeImmediateBooking() ← CALLS AGENT
@@ -179,6 +193,7 @@ lib/screens/new_job_wizard.dart
 ```
 
 ### Documentation
+
 ```
 ACTION_PLAN_FIRST_BOOKING.md ← READ THIS FIRST
 BUILD_STATUS_COMPREHENSIVE.md ← REFERENCE
@@ -192,16 +207,19 @@ NEXT_STEPS.md ← QUICK REFERENCE
 ### Before You Start Modifying Code
 
 1. **Make sure you have backup**
+
    ```powershell
    git branch backup-before-booking
    ```
 
 2. **Don't commit until you test**
+
    ```
    Make changes → Test locally → THEN commit
    ```
 
 3. **If something breaks:**
+
    ```powershell
    git checkout -- .  # Revert all changes
    git checkout v1.1-immediate-booking  # Back to stable
@@ -217,18 +235,21 @@ NEXT_STEPS.md ← QUICK REFERENCE
 ## ✅ Checklist Before You Start Each Session
 
 ### Before Coding
+
 - [ ] Read the ACTION_PLAN section you're about to do
 - [ ] Understand what you're trying to accomplish
 - [ ] Have reference documents open
 - [ ] Know what success looks like
 
 ### During Coding
+
 - [ ] Make small changes (one function at a time)
 - [ ] Test after each change
 - [ ] Keep agent/Flutter running for quick testing
 - [ ] Save screenshots of successes
 
 ### After Coding
+
 - [ ] Verify it works (test or screenshot)
 - [ ] Commit if successful
 - [ ] Document what changed
@@ -239,20 +260,24 @@ NEXT_STEPS.md ← QUICK REFERENCE
 ## 🎯 Success Criteria for Each Phase
 
 ### Phase 1: Inspection ✅ Complete
+
 - [x] Understand form structure
 - [x] Have exact selectors
 
 ### Phase 2: Agent Code Update ⏳ Next
+
 - [ ] tryBookTime() fills player dropdowns
 - [ ] Manual test script runs successfully
 - [ ] Booking appears in BRS account
 
 ### Phase 3: API Integration ⏳ After that
+
 - [ ] /api/book-now endpoint works
 - [ ] Can test via curl/PowerShell
 - [ ] Booking succeeds from API
 
 ### Phase 4: Flutter E2E ⏳ Final
+
 - [ ] Full flow works through UI
 - [ ] User sees success message
 - [ ] FCM notification sent
@@ -263,24 +288,28 @@ NEXT_STEPS.md ← QUICK REFERENCE
 ## 💡 Pro Tips
 
 1. **Keep Agent Logs Open**
+
    ```
    When testing, watch agent logs in real-time
    They tell you exactly what's happening
    ```
 
 2. **Use Browser DevTools**
+
    ```
    When stuck, inspect the actual form
    Copy selectors directly from DevTools
    ```
 
 3. **Test Incrementally**
+
    ```
    Don't write all code then test
    Write → Test → Write → Test
    ```
 
 4. **Save Artifacts**
+
    ```
    Screenshots of forms and results
    Logs from successful tests
@@ -300,14 +329,15 @@ NEXT_STEPS.md ← QUICK REFERENCE
 
 **Common Issues:**
 
-| Problem | Solution |
-|---------|----------|
-| Form doesn't appear | Check timeouts, add logging |
-| Can't find dropdown | Inspect element, get exact selector |
-| Booking fails silently | Check browser console, agent logs |
+| Problem                      | Solution                                        |
+| ---------------------------- | ----------------------------------------------- |
+| Form doesn't appear          | Check timeouts, add logging                     |
+| Can't find dropdown          | Inspect element, get exact selector             |
+| Booking fails silently       | Check browser console, agent logs               |
 | Select.option() doesn't work | BRS uses Select2, might need different approach |
 
 **Debug Process:**
+
 1. Check agent logs first (most info there)
 2. Check browser console (JavaScript errors)
 3. Take screenshot of form
@@ -350,6 +380,7 @@ If you can't answer yes to these, read more documentation first.
 ## Final Thoughts
 
 You're in a **great position**:
+
 - Code is solid
 - Architecture is sound
 - Documentation is comprehensive
@@ -365,4 +396,3 @@ Take it one step at a time, test incrementally, and you'll have a working bookin
 ---
 
 **Next Action:** Read `ACTION_PLAN_FIRST_BOOKING.md` Step 1
-

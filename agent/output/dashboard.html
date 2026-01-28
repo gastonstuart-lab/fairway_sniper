@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fairway Sniper Dashboard</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        padding: 20px;
+        background: #f0f2f5;
+      }
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .card {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+      h1,
+      h2 {
+        color: #1a1a1a;
+      }
+      .status {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 0.9em;
+        font-weight: bold;
+      }
+      .status.fresh {
+        background: #d1fae5;
+        color: #065f46;
+      }
+      .status.stale {
+        background: #fee2e2;
+        color: #991b1b;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 12px;
+        border-bottom: 1px solid #e5e7eb;
+      }
+      th {
+        background: #f9fafb;
+      }
+      .refresh-btn {
+        background: #2563eb;
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .refresh-btn:hover {
+        background: #1d4ed8;
+      }
+      pre {
+        background: #f3f4f6;
+        padding: 10px;
+        border-radius: 4px;
+        overflow-x: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div
+        style="
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        "
+      >
+        <h1>Fairway Sniper Dashboard</h1>
+        <button class="refresh-btn" onclick="loadData()">Refresh Data</button>
+      </div>
+
+      <div class="card">
+        <h2>System Status</h2>
+        <div id="health-status">Loading...</div>
+      </div>
+
+      <div class="card">
+        <h2>Available Tee Times (Single Day)</h2>
+        <div id="times-container">Loading...</div>
+      </div>
+
+      <div class="card">
+        <h2>Range Availability (Next 14 Days)</h2>
+        <div id="range-container">Loading...</div>
+      </div>
+    </div>
+
+    <script>
+      async function loadData() {
+        try {
+          // Health
+          const healthRes = await fetch('/api/health');
+          const health = await healthRes.json();
+          document.getElementById('health-status').innerHTML = `
+                    <p><strong>Auth Status:</strong> <span class="status ${
+                      health.auth_status === 'fresh' ? 'fresh' : 'stale'
+                    }">${health.auth_status}</span></p>
+                    <p><strong>Auth Age:</strong> ${
+                      health.auth_age_hours
+                    } hours</p>
+                `;
+
+          // Single Day Times
+          const timesRes = await fetch('/api/firestore/available-times');
+          const timesData = await timesRes.json();
+          let timesHtml = '';
+          if (timesData.times && Object.keys(timesData.times).length > 0) {
+            timesHtml =
+              '<table><thead><tr><th>Club</th><th>Times</th></tr></thead><tbody>';
+            for (const [club, times] of Object.entries(timesData.times)) {
+              if (club === 'last_synced_utc' || club === 'source') continue;
+              timesHtml += `<tr><td>${club}</td><td>${
+                Array.isArray(times) ? times.join(', ') : times
+              }</td></tr>`;
+            }
+            timesHtml += '</tbody></table>';
+            timesHtml += `<p><small>Source: ${
+              timesData.source
+            } | Last Synced: ${
+              timesData.times.last_synced_utc || 'N/A'
+            }</small></p>`;
+          } else {
+            timesHtml = '<p>No times found.</p>';
+          }
+          document.getElementById('times-container').innerHTML = timesHtml;
+
+          // Range
+          const rangeRes = await fetch('/api/firestore/available-range');
+          const rangeData = await rangeRes.json();
+          let rangeHtml = '';
+          if (rangeData.range && rangeData.range.range) {
+            rangeHtml =
+              '<table><thead><tr><th>Date</th><th>Available Slots</th></tr></thead><tbody>';
+            const range = rangeData.range.range;
+            const dates = Object.keys(range).sort();
+            for (const date of dates) {
+              const slots = range[date];
+              if (slots && slots.length > 0) {
+                rangeHtml += `<tr><td>${date}</td><td>${slots.join(
+                  ', ',
+                )}</td></tr>`;
+              }
+            }
+            rangeHtml += '</tbody></table>';
+            rangeHtml += `<p><small>Source: ${
+              rangeData.source
+            } | Last Synced: ${
+              rangeData.range.last_synced_utc || 'N/A'
+            }</small></p>`;
+          } else {
+            rangeHtml = '<p>No range data found.</p>';
+          }
+          document.getElementById('range-container').innerHTML = rangeHtml;
+        } catch (e) {
+          console.error(e);
+          alert('Error loading data: ' + e.message);
+        }
+      }
+
+      loadData();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,2 @@
+C:/Users/stuar/Projects/fairway_sniper/build/.cxx/RelWithDebInfo/2h1a3b3r/armeabi-v7a/CMakeFiles/edit_cache.dir
+C:/Users/stuar/Projects/fairway_sniper/build/.cxx/RelWithDebInfo/2h1a3b3r/armeabi-v7a/CMakeFiles/rebuild_cache.dir
