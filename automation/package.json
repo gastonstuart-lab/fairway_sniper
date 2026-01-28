@@ -6,6 +6,9 @@
   "main": "index.js",
   "scripts": {
     "test": "node -r dotenv/config ./node_modules/@playwright/test/cli.js",
+    "book": "node -r dotenv/config ./node_modules/@playwright/test/cli.js test tests/book_production.spec.ts --workers=1 --reporter=list",
+    "book:live": "node -r dotenv/config -e \"process.env.FS_DRY_RUN='false'\" ./node_modules/@playwright/test/cli.js test tests/book_production.spec.ts --workers=1 --reporter=list",
+    "snipe": "node -r dotenv/config ./node_modules/@playwright/test/cli.js test tests/book_production.spec.ts --workers=1 --trace on",
     "codegen": "npx playwright codegen"
   },
   "keywords": [],

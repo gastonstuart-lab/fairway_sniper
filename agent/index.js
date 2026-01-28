@@ -1369,6 +1369,98 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
   }
 });
 
+// SNIPER UNIFIED ENDPOINT - Check availability AND book
+// Request body: { username, password, targetDate, preferredTimes, players, checkOnly }
+app.post('/api/snipe', async (req, res) => {
+  try {
+    const {
+      username,
+      password,
+      targetDate,
+      preferredTimes,
+      players,
+      checkOnly,
+    } = req.body;
+
+    // Validate required fields
+    if (!username || !password) {
+      return res.status(400).json({ error: 'BRS credentials required' });
+    }
+
+    if (!targetDate) {
+      return res.status(400).json({ error: 'Target date required' });
+    }
+
+    console.log('\n🎯 SNIPER API CALL');
+    console.log(`   Mode: ${checkOnly ? 'CHECK AVAILABILITY' : 'SNIPE & BOOK'}`);
+    console.log(`   Target Date: ${targetDate}`);
+    console.log(`   Preferred Times: ${(preferredTimes || []).join(', ')}`);
+    console.log(`   Players: ${(players || []).join(', ')}`);
+
+    // Phase 1: Check availability
+    const { times, slots } = await fetchAvailableTeeTimesFromBRS(
+      new Date(targetDate),
+      username,
+      password,
+    );
+
+    console.log(`   ✅ Found ${slots} available slots on ${targetDate}`);
+
+    // If checkOnly mode, just return availability
+    if (checkOnly) {
+      return res.json({
+        success: true,
+        available: slots > 0,
+        slots,
+        times: times || [],
+        date: targetDate,
+      });
+    }
+
+    // Phase 2: If slots available and NOT checkOnly, execute booking
+    if (slots === 0) {
+      return res.json({
+        success: false,
+        available: false,
+        slots: 0,
+        times: [],
+        error: 'No available slots on this date',
+        date: targetDate,
+      });
+    }
+
+    // Execute booking
+    const result = await runBooking({
+      jobId: 'snipe-' + Date.now(),
+      ownerUid: 'app-user',
+      loginUrl: 'https://members.brsgolf.com/galgorm/login',
+      username,
+      password,
+      preferredTimes: preferredTimes || [],
+      targetFireTime: new Date(),
+      pushToken: null,
+      targetPlayDate: targetDate,
+      players: players || [],
+    });
+
+    res.json({
+      success: result.success,
+      booked: result.success,
+      result: result.result || null,
+      error: result.error || null,
+      slots: slots,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('🎯 Sniper error:', error);
+    res.status(500).json({
+      success: false,
+      available: false,
+      error: error.message || 'Sniper failed',
+    });
+  }
+});
+
 // Immediate booking endpoint for Normal mode
 // Request body: { username, password, targetDate, preferredTimes: [time1, time2], players: [name1, name2, ...], pushToken }
 app.post('/api/book-now', async (req, res) => {
@@ -1439,6 +1531,9 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Fairway Sniper Agent HTTP server running on port ${PORT}`);
   console.log(`   - Health: http://localhost:${PORT}/api/health`);
+  console.log(
+    `   - Sniper (unified): POST http://localhost:${PORT}/api/snipe`,
+  );
   console.log(
     `   - Fetch Tee Times: POST http://localhost:${PORT}/api/fetch-tee-times`,
   );
