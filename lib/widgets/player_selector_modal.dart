@@ -7,6 +7,9 @@ import 'package:fairway_sniper/services/player_directory_service.dart';
 class PlayerSelectorModal extends StatefulWidget {
   final PlayerDirectoryService directoryService;
   final List<String> initialSelectedNames;
+  final List<String> initialSelectedIds;
+  final bool returnIds;
+  final List<String> allowedCategories;
   final int maxPlayers;
   final String? username;
   final String? password;
@@ -15,6 +18,9 @@ class PlayerSelectorModal extends StatefulWidget {
     super.key,
     required this.directoryService,
     this.initialSelectedNames = const [],
+    this.initialSelectedIds = const [],
+    this.returnIds = false,
+    this.allowedCategories = const [],
     this.maxPlayers = 4,
     this.username,
     this.password,
@@ -25,6 +31,9 @@ class PlayerSelectorModal extends StatefulWidget {
     required BuildContext context,
     required PlayerDirectoryService directoryService,
     List<String> initialSelectedNames = const [],
+    List<String> initialSelectedIds = const [],
+    bool returnIds = false,
+    List<String> allowedCategories = const [],
     int maxPlayers = 4,
     String? username,
     String? password,
@@ -35,6 +44,9 @@ class PlayerSelectorModal extends StatefulWidget {
       builder: (context) => PlayerSelectorModal(
         directoryService: directoryService,
         initialSelectedNames: initialSelectedNames,
+        initialSelectedIds: initialSelectedIds,
+        returnIds: returnIds,
+        allowedCategories: allowedCategories,
         maxPlayers: maxPlayers,
         username: username,
         password: password,
@@ -52,14 +64,19 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
   bool _loading = true;
   String? _error;
   String _searchQuery = '';
-  final Set<String> _selectedNames = {};
+  final Set<String> _selectedIds = {};
+  final Set<String> _pendingSelectedNames = {};
   late TabController _tabController;
   final TextEditingController _searchController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _selectedNames.addAll(widget.initialSelectedNames);
+    if (widget.returnIds) {
+      _selectedIds.addAll(widget.initialSelectedIds);
+    } else {
+      _pendingSelectedNames.addAll(widget.initialSelectedNames);
+    }
     _loadDirectory();
   }
 
@@ -89,10 +106,25 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
         return;
       }
 
+      final displayCategories = _filterCategories(directory);
+      if (_pendingSelectedNames.isNotEmpty) {
+        final byName = <String, String>{};
+        for (final player in directory.getAllPlayers()) {
+          byName[player.name] = player.id;
+        }
+        for (final name in _pendingSelectedNames) {
+          final id = byName[name];
+          if (id != null) {
+            _selectedIds.add(id);
+          }
+        }
+        _pendingSelectedNames.clear();
+      }
+
       setState(() {
         _directory = directory;
         _tabController = TabController(
-          length: directory.categories.length + 1, // +1 for "All" tab
+          length: displayCategories.length + 1, // +1 for "All" tab
           vsync: this,
         );
         _loading = false;
@@ -142,32 +174,55 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
     }
   }
 
+  List<PlayerCategory> _filterCategories(PlayerDirectory directory) {
+    if (widget.allowedCategories.isEmpty) {
+      return directory.categories;
+    }
+    final allowed = widget.allowedCategories
+        .map((c) => c.toLowerCase())
+        .toSet();
+    final filtered = directory.categories
+        .where((c) => allowed.contains(c.name.toLowerCase()))
+        .toList();
+    if (filtered.isEmpty) {
+      return directory.categories;
+    }
+    return filtered;
+  }
+
   List<Player> _getFilteredPlayers() {
     if (_directory == null) return [];
 
+    final displayCategories = _filterCategories(_directory!);
     if (_searchQuery.isEmpty) {
       // Show players from current tab
       if (_tabController.index == 0) {
         // "All" tab
-        return _directory!.getAllPlayers();
+        return displayCategories
+            .expand((category) => category.players)
+            .toList();
       } else {
         // Specific category tab
-        final category = _directory!.categories[_tabController.index - 1];
+        final category = displayCategories[_tabController.index - 1];
         return category.players;
       }
     } else {
-      // Search across all players
-      return _directory!.searchPlayers(_searchQuery);
+      // Search across displayed categories only
+      final lowerQuery = _searchQuery.toLowerCase();
+      return displayCategories
+          .expand((category) => category.players)
+          .where((player) => player.name.toLowerCase().contains(lowerQuery))
+          .toList();
     }
   }
 
-  void _togglePlayer(String playerName) {
+  void _togglePlayer(Player player) {
     setState(() {
-      if (_selectedNames.contains(playerName)) {
-        _selectedNames.remove(playerName);
+      if (_selectedIds.contains(player.id)) {
+        _selectedIds.remove(player.id);
       } else {
-        if (_selectedNames.length < widget.maxPlayers) {
-          _selectedNames.add(playerName);
+        if (_selectedIds.length < widget.maxPlayers) {
+          _selectedIds.add(player.id);
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -218,9 +273,9 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
 
             // Selected count
             Text(
-              '${_selectedNames.length} of ${widget.maxPlayers} selected',
+              '${_selectedIds.length} of ${widget.maxPlayers} selected',
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: _selectedNames.length >= widget.maxPlayers
+                    color: _selectedIds.length >= widget.maxPlayers
                         ? Colors.orange
                         : Colors.grey[600],
                   ),
@@ -289,7 +344,8 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
                   isScrollable: true,
                   tabs: [
                     const Tab(text: 'All'),
-                    ..._directory!.categories.map((cat) => Tab(text: cat.name)),
+                    ..._filterCategories(_directory!)
+                        .map((cat) => Tab(text: cat.name)),
                   ],
                   onTap: (_) => setState(() {}),
                 ),
@@ -313,11 +369,24 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton(
-                  onPressed: _selectedNames.isEmpty
+                  onPressed: _selectedIds.isEmpty
                       ? null
-                      : () =>
-                          Navigator.of(context).pop(_selectedNames.toList()),
-                  child: Text('Select ${_selectedNames.length}'),
+                      : () {
+                          if (widget.returnIds) {
+                            Navigator.of(context)
+                                .pop(_selectedIds.toList());
+                            return;
+                          }
+                          final map = <String, String>{};
+                          for (final player in _directory!.getAllPlayers()) {
+                            map[player.id] = player.name;
+                          }
+                          final names = _selectedIds
+                              .map((id) => map[id] ?? id)
+                              .toList();
+                          Navigator.of(context).pop(names);
+                        },
+                  child: Text('Select ${_selectedIds.length}'),
                 ),
               ],
             ),
@@ -345,9 +414,9 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
       itemCount: players.length,
       itemBuilder: (context, index) {
         final player = players[index];
-        final isSelected = _selectedNames.contains(player.name);
+        final isSelected = _selectedIds.contains(player.id);
         final isDisabled =
-            !isSelected && _selectedNames.length >= widget.maxPlayers;
+            !isSelected && _selectedIds.length >= widget.maxPlayers;
 
         return ListTile(
           leading: Checkbox(
@@ -355,7 +424,7 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
             onChanged: isDisabled
                 ? null
                 : (bool? value) {
-                    _togglePlayer(player.name);
+                    _togglePlayer(player);
                   },
           ),
           title: Text(
@@ -372,7 +441,7 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
             ),
           ),
           enabled: !isDisabled,
-          onTap: isDisabled ? null : () => _togglePlayer(player.name),
+          onTap: isDisabled ? null : () => _togglePlayer(player),
         );
       },
     );

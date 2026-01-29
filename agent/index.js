@@ -269,51 +269,69 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
     try {
       console.log(`    🔍 Player ${playerNum}: "${playerName}"...`);
 
-      // Strategy A: Try getByRole('combobox')
-      let combobox = null;
-      try {
-        combobox = page.getByRole('combobox', {
-          name: new RegExp(`player\\s*${playerNum}`, 'i'),
-        }).first();
-
-        const isVisible = await combobox.isVisible({ timeout: 2000 }).catch(() => false);
-        if (isVisible) {
-          await combobox.click();
-          await page.waitForTimeout(300);
-
-          // Try to select by option role
-          const option = page.getByRole('option', {
-            name: new RegExp(escapeRegex(playerName), 'i'),
-          }).first();
-
-          if ((await option.count()) > 0) {
-            await option.click();
-            console.log(`    ✅ Player ${playerNum}: ${playerName} (combobox role)`);
+      // Strategy 0: Select by ID (preferred for sniper jobs)
+      if (/^\d+$/.test(playerName)) {
+        const selectId = `#member_booking_form_player_${playerNum}`;
+        const selectElem = page.locator(selectId).first();
+        if (await selectElem.count()) {
+          try {
+            await selectElem.selectOption({ value: playerName });
+            console.log(`    ✅ Player ${playerNum}: ${playerName} (select by id)`);
             result.filled.push(playerName);
             filled = true;
-          } else {
-            // Try typing into the combobox to search
-            console.log(`    💬 Typing "${playerName}" into search...`);
-            await page.keyboard.type(playerName, { delay: 30 });
-            await page.waitForTimeout(400);
+          } catch (e) {
+            console.log(`    ℹ️ Strategy 0 (select by id) failed: ${e.message.substring(0, 50)}`);
+          }
+        }
+      }
 
-            const searchResult = page.getByRole('option', {
+      // Strategy A: Try getByRole('combobox')
+      if (!filled) {
+        let combobox = null;
+        try {
+          combobox = page.getByRole('combobox', {
+            name: new RegExp(`player\\s*${playerNum}`, 'i'),
+          }).first();
+
+          const isVisible = await combobox.isVisible({ timeout: 2000 }).catch(() => false);
+          if (isVisible) {
+            await combobox.click();
+            await page.waitForTimeout(300);
+
+            // Try to select by option role
+            const option = page.getByRole('option', {
               name: new RegExp(escapeRegex(playerName), 'i'),
             }).first();
 
-            if ((await searchResult.count()) > 0) {
-              await searchResult.click();
-              console.log(`    ✅ Player ${playerNum}: ${playerName} (typed search)`);
+            if ((await option.count()) > 0) {
+              await option.click();
+              console.log(`    ✅ Player ${playerNum}: ${playerName} (combobox role)`);
               result.filled.push(playerName);
               filled = true;
             } else {
-              console.log(`    ⚠️ Player ${playerNum}: No match for "${playerName}"`);
+              // Try typing into the combobox to search
+              console.log(`    💬 Typing "${playerName}" into search...`);
+              await page.keyboard.type(playerName, { delay: 30 });
+              await page.waitForTimeout(400);
+
+              const searchResult = page.getByRole('option', {
+                name: new RegExp(escapeRegex(playerName), 'i'),
+              }).first();
+
+              if ((await searchResult.count()) > 0) {
+                await searchResult.click();
+                console.log(`    ✅ Player ${playerNum}: ${playerName} (typed search)`);
+                result.filled.push(playerName);
+                filled = true;
+              } else {
+                console.log(`    ⚠️ Player ${playerNum}: No match for "${playerName}"`);
+              }
             }
           }
+        } catch (e) {
+          // Strategy A failed, try next
+          console.log(`    ℹ️ Strategy A (getByRole combobox) failed: ${e.message.substring(0, 50)}`);
         }
-      } catch (e) {
-        // Strategy A failed, try next
-        console.log(`    ℹ️ Strategy A (getByRole combobox) failed: ${e.message.substring(0, 50)}`);
       }
 
       // Strategy B: Try getByLabel
@@ -585,6 +603,7 @@ async function runBooking(config) {
     pushToken,
     targetPlayDate,
     players = [],
+    partySize,
     slotsData = [],  // Array of {time, openSlots, status}
   } = config;
 
@@ -652,6 +671,11 @@ async function runBooking(config) {
     let bookedTime = null;
     let fallbackLevel = 0;
 
+    // Only fill additional players (Player 1 is the logged-in user)
+    const desiredAdditionalCount =
+      typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
+    const additionalPlayers = players.slice(0, desiredAdditionalCount);
+
     // Try each preferred time in order
     for (const [index, time] of preferredTimes.entries()) {
       try {
@@ -661,7 +685,12 @@ async function runBooking(config) {
         const slotInfo = slotsData.find(s => s.time === time);
         const openSlots = slotInfo ? slotInfo.openSlots : 3; // default to 3 if not found
         
-        const bookingResult = await tryBookTime(page, time, players, openSlots);
+        const bookingResult = await tryBookTime(
+          page,
+          time,
+          additionalPlayers,
+          openSlots,
+        );
         if (bookingResult && bookingResult.booked) {
           bookedTime = time;
           fallbackLevel = index;
@@ -732,7 +761,7 @@ async function runBooking(config) {
       fallbackLevel,
       latencyMs,
       notes: notes.join(' | '),
-      playersRequested: players,
+      playersRequested: additionalPlayers,
     };
   } catch (error) {
     console.error('\n❌ ERROR:', error);
@@ -787,144 +816,10 @@ async function fetchAvailableTeeTimesFromBRS(date, username, password) {
 
     const page = await context.newPage();
 
-    // Navigate to tee sheet for target date
-    const [y, m, d] = dateStr.split('-');
-    const teeSheetUrl = `https://members.brsgolf.com/galgorm/tee-sheet/1/${y}/${m}/${d}`;
-    await page.goto(teeSheetUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 45000,
-    });
+    await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+    await navigateToTeeSheet(page, date);
 
-    // Accept cookies if shown
-    const cookieBtn = page
-      .locator('button:has-text("Accept"), button:has-text("I Agree")')
-      .first();
-    if (await cookieBtn.isVisible().catch(() => false)) {
-      await cookieBtn.click().catch(() => {});
-    }
-
-    // If login required, perform login
-    const loginIndicator = page
-      .locator('text=/Member Login|Enter your 8 digit GUI|Username/i')
-      .first();
-    if (await loginIndicator.isVisible().catch(() => false)) {
-      console.log('  🔐 Logging in for tee sheet...');
-      await page
-        .getByPlaceholder(/8 digit GUI|ILGU|username/i)
-        .first()
-        .fill(username);
-      await page
-        .getByPlaceholder(/password/i)
-        .first()
-        .fill(password);
-      await page.getByRole('button', { name: /login/i }).first().click();
-      await page.waitForTimeout(3000);
-      await page.goto(teeSheetUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 45000,
-      });
-      const cookie2 = page
-        .locator('button:has-text("Accept"), button:has-text("I Agree")')
-        .first();
-      if (await cookie2.isVisible().catch(() => false)) {
-        await cookie2.click().catch(() => {});
-      }
-    }
-
-    // Wait for booking links to appear
-    const start = Date.now();
-    const pollTimeout = 20000;
-    let count = 0;
-    while (Date.now() - start < pollTimeout) {
-      count = await page.locator('a[href*="/bookings/book/"]').count();
-      if (count > 0) break;
-      await page.waitForTimeout(300);
-    }
-    console.log(`  ✅ Found ${count} booking links`);
-
-    // --- Improved player name scraping with async, iframe, and diagnostics ---
-    // Wait for the main container or iframe
-    let mainFrame = page;
-    let triedSelectors = [];
-    let foundNames = [];
-    let container = null;
-    let containerSelector = 'table, .tee-sheet, .booking-table';
-    let containerHandle = null;
-    try {
-      // If content is in an iframe, switch to it
-      const iframes = await page.frames();
-      if (iframes.length > 1) {
-        for (const f of iframes) {
-          if (await f.locator(containerSelector).count().catch(() => 0)) {
-            mainFrame = f;
-            break;
-          }
-        }
-      }
-      // Wait for container
-      await mainFrame.waitForSelector(containerSelector, { timeout: 15000 });
-      containerHandle = await mainFrame.locator(containerSelector).first();
-      container = containerHandle;
-    } catch (e) {
-      console.warn('Could not find main container:', e);
-    }
-
-    // Use robust selector for player names (Select2 rendered spans)
-    const nameSelectors = [
-      'span.select2-selection__rendered[id^="select2-member_booking_form_player_"]'
-    ];
-    for (const sel of nameSelectors) {
-      triedSelectors.push(sel);
-      try {
-        const loc = mainFrame.locator(sel);
-        const texts = (await loc.allInnerTexts()).map(t => t.trim()).filter(Boolean);
-        // Filter out placeholders like 'Start typing to find player...'
-        const filtered = texts.filter(t => !/^Start typing/i.test(t));
-        if (filtered.length > 0) {
-          foundNames = filtered;
-          break;
-        }
-      } catch {}
-    }
-    console.log(`[SCRAPE] Tried selectors:`, triedSelectors, 'Found:', foundNames.length);
-
-    // Failure diagnostics
-    if (foundNames.length === 0) {
-      const screenshotPath = `output/scrape_names_fail_${Date.now()}.png`;
-      const htmlPath = `output/scrape_names_fail_${Date.now()}.html`;
-      try {
-        await mainFrame.screenshot({ path: screenshotPath, fullPage: true });
-        const html = container ? await container.innerHTML() : await mainFrame.content();
-        const shortHtml = html.slice(0, 10000);
-        require('fs').writeFileSync(htmlPath, shortHtml, 'utf8');
-        console.warn(`[SCRAPE] No names found. Screenshot: ${screenshotPath}, HTML: ${htmlPath}`);
-      } catch (e) {
-        console.warn('Failed to save diagnostics:', e);
-      }
-    }
-
-    // Clean names
-    const cleanedNames = foundNames
-      .map(t => t.replace(/[^a-zA-Z'\-\s]/g, '').trim())
-      .filter(t => t.length > 1 && /[a-zA-Z]{2}/.test(t));
-
-    // Compose slots output (minimal, for demo)
-    const slots = cleanedNames.map((name, idx) => ({
-      time: `slot${idx + 1}`,
-      status: 'bookable',
-      openSlots: 1,
-      totalSlots: 1,
-      name,
-    }));
-
-    await browser.close();
-
-    console.log(`  ✅ Found ${cleanedNames.length} player names`);
-    return {
-      times: slots.map(s => s.time),
-      slots,
-      names: cleanedNames,
-    };
+    const slots = await scrapeTeeTimesFromPage(page);
 
     await browser.close();
 
@@ -941,6 +836,101 @@ async function fetchAvailableTeeTimesFromBRS(date, username, password) {
     if (browser) await browser.close();
     throw error;
   }
+}
+
+async function scrapeTeeTimesFromPage(page) {
+  // Wait for booking links to appear
+  const start = Date.now();
+  const pollTimeout = 20000;
+  let count = 0;
+  while (Date.now() - start < pollTimeout) {
+    count = await page.locator('a[href*="/bookings/book/"]').count();
+    if (count > 0) break;
+    await page.waitForTimeout(300);
+  }
+  console.log(`  ✅ Found ${count} booking links`);
+
+  const slots = await page.$$eval('a[href*="/bookings/book/"]', (anchors) => {
+    const seen = new Set();
+    const out = [];
+
+    const guessBookedCount = (row) => {
+      if (!row) return 0;
+      const cells = Array.from(row.querySelectorAll('td'));
+      const playerCells = cells.filter((td) => {
+        const text = (td.innerText || '').trim();
+        if (!text || text.length < 3) return false;
+        if (/^\d{1,2}:\d{2}/.test(text)) return false;
+        if (/book now|add|waiting|view/i.test(text)) return false;
+        return true;
+      });
+
+      const allText = playerCells.map((td) => td.innerText || '').join('\n');
+      const tokens = allText
+        .split(/\n+/)
+        .map((t) => t.trim())
+        .filter(Boolean);
+
+      const seenNames = new Set();
+      const nameTokens = tokens.filter((t) => {
+        const lower = t.toLowerCase();
+        if (!/[a-z]/i.test(t)) return false;
+        if (/\d{1,2}:\d{2}/.test(lower)) return false;
+        if (
+          /book|booking|available|waiting|waitlist|wait list|open|holes|format|course|tee|sheet|buggy|buggies|price|rate|member|login|book now|member booked/i.test(
+            lower,
+          )
+        )
+          return false;
+        if (/£|€|\$/.test(t)) return false;
+        if (/^\d+$/.test(t)) return false;
+
+        const cleaned = t.replace(/[^a-zA-Z'\-\s]/g, '').trim();
+        if (cleaned.length < 2) return false;
+        if (!/[a-zA-Z]{2}/.test(cleaned)) return false;
+
+        const key = cleaned.toLowerCase();
+        if (seenNames.has(key)) return false;
+        seenNames.add(key);
+        return true;
+      });
+
+      return Math.min(4, Math.max(0, nameTokens.length));
+    };
+
+    anchors.forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      const match = href.match(/\/(\d{4})(?:[^\d]|$)/);
+      if (!match) return;
+
+      const hhmm = match[1];
+      const hh = hhmm.slice(0, 2);
+      const mm = hhmm.slice(2, 4);
+      const time = `${hh}:${mm}`;
+      if (seen.has(time)) return;
+
+      let row = a.closest('tr');
+      if (!row) row = a.closest('td')?.parentElement;
+      if (!row) row = a.parentElement;
+
+      const totalSlots = 4;
+      const bookedCount = guessBookedCount(row);
+      const openSlots = Math.max(0, totalSlots - bookedCount);
+
+      out.push({
+        time,
+        status: openSlots > 0 ? 'bookable' : 'full',
+        openSlots,
+        totalSlots,
+      });
+
+      seen.add(time);
+    });
+
+    return out;
+  });
+
+  return slots;
 }
 
 // HTTP endpoint to fetch tee times
@@ -977,7 +967,7 @@ app.post('/api/fetch-tee-times', async (req, res) => {
 // Request body: { startDate: ISO string, days: number, username, password }
 app.post('/api/fetch-tee-times-range', async (req, res) => {
   try {
-    const { startDate, days, username, password } = req.body;
+    const { startDate, days, username, password, reuseBrowser } = req.body;
     if (!startDate || !days || !username || !password) {
       return res.status(400).json({
         success: false,
@@ -993,16 +983,48 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
     }
 
     const results = [];
-    for (let i = 0; i < Number(days); i++) {
-      const targetDate = new Date(start);
-      targetDate.setDate(start.getDate() + i);
-      const dayStr = targetDate.toISOString().slice(0, 10);
-      const { times, slots } = await fetchAvailableTeeTimesFromBRS(
-        targetDate,
-        username,
-        password,
-      );
-      results.push({ date: dayStr, times, slots });
+    if (reuseBrowser === true) {
+      const browser = await chromium.launch({
+        headless: true,
+        args: ['--disable-blink-features=AutomationControlled'],
+      });
+      try {
+        const context = await browser.newContext({
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          viewport: { width: 1280, height: 720 },
+        });
+        const page = await context.newPage();
+        await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+
+        for (let i = 0; i < Number(days); i++) {
+          const targetDate = new Date(start);
+          targetDate.setDate(start.getDate() + i);
+          const dayStr = targetDate.toISOString().slice(0, 10);
+          await navigateToTeeSheet(page, targetDate);
+          const slots = await scrapeTeeTimesFromPage(page);
+          const sorted = slots.sort((a, b) => a.time.localeCompare(b.time));
+          results.push({
+            date: dayStr,
+            times: sorted.map((s) => s.time),
+            slots: sorted,
+          });
+        }
+      } finally {
+        await browser.close();
+      }
+    } else {
+      for (let i = 0; i < Number(days); i++) {
+        const targetDate = new Date(start);
+        targetDate.setDate(start.getDate() + i);
+        const dayStr = targetDate.toISOString().slice(0, 10);
+        const { times, slots } = await fetchAvailableTeeTimesFromBRS(
+          targetDate,
+          username,
+          password,
+        );
+        results.push({ date: dayStr, times, slots });
+      }
     }
 
     res.json({
@@ -1020,6 +1042,245 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
   }
 });
 
+async function fetchPlayerDirectoryFromBRS({ userId, username, password }) {
+  console.log(`\n🔍 Fetching player directory for user ${userId}...`);
+
+  const browser = await chromium.launch({ headless: true });
+
+  // DON'T use stored session for player directory - need fresh login to get correct Player 1 name
+  let contextOptions = {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    viewport: { width: 1920, height: 1080 },
+  };
+
+  const context = await browser.newContext(contextOptions);
+  const page = await context.newPage();
+
+  // Reuse proven login + tee sheet navigation (same as /api/snipe -> runBooking)
+  await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+  const today = new Date();
+  await navigateToTeeSheet(page, today);
+
+  // Evidence capture before selecting a booking link (tee sheet state)
+  const fs = await import('fs');
+  const path = await import('path');
+  const outputDir = path.join(process.cwd(), 'output');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  await fs.promises.mkdir(outputDir, { recursive: true }).catch(() => {});
+  const prebookScreenshot = path.join(outputDir, `player_dir_prebook_${timestamp}.png`);
+  const prebookHtml = path.join(outputDir, `player_dir_prebook_${timestamp}.html`);
+  await page.screenshot({ path: prebookScreenshot, fullPage: true }).catch(() => {});
+  const prebookDump = await page.content();
+  await fs.promises.writeFile(prebookHtml, prebookDump.slice(0, 120000), 'utf8').catch(() => {});
+  console.log(`  🌐 Prebook URL: ${page.url()} frames=${page.frames().length}`);
+  console.log(`  💾 Prebook snapshot: ${prebookScreenshot}, ${prebookHtml}`);
+
+  // Ensure tee sheet rows/book links are loaded (same page state /api/snipe relies on)
+  const detailBtn = page.locator('button#detail, button:has-text("Detail")').first();
+  if (await detailBtn.isVisible().catch(() => false)) {
+    await detailBtn.click().catch(() => {});
+  }
+  const start = Date.now();
+  const pollTimeout = 20000;
+  let bookingLinkCount = 0;
+  while (Date.now() - start < pollTimeout) {
+    bookingLinkCount = await page.locator('a[href*="/bookings/book/"]').count();
+    if (bookingLinkCount > 0) break;
+    await page.waitForTimeout(300);
+  }
+
+  // Pick first booking link that leads to a form with Player 2 enabled
+  let bookingLinks = [];
+  if (bookingLinkCount > 0) {
+    bookingLinks = await page.$$eval('a[href*="/bookings/book/"]', (anchors) => {
+      const hrefs = anchors.map((a) => a.getAttribute('href')).filter(Boolean);
+      return Array.from(new Set(hrefs));
+    });
+  } else {
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      const count = await frame.locator('a[href*="/bookings/book/"]').count().catch(() => 0);
+      if (count > 0) {
+        bookingLinks = await frame.$$eval('a[href*="/bookings/book/"]', (anchors) => {
+          const hrefs = anchors.map((a) => a.getAttribute('href')).filter(Boolean);
+          return Array.from(new Set(hrefs));
+        });
+        break;
+      }
+    }
+  }
+  if (!bookingLinks.length) {
+    throw new Error('No booking links found on tee sheet');
+  }
+
+  let chosenHref = null;
+  for (const href of bookingLinks) {
+    const bookingUrl = new URL(href, 'https://members.brsgolf.com/galgorm');
+    await page.goto(bookingUrl.href, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(1500);
+    await page.locator('text=Player 1').first().waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+
+    const player2 = await page.$('select#member_booking_form_player_2');
+    const disabled = player2 ? await player2.getAttribute('disabled') : 'true';
+    const p2Select2 = page.locator('select#member_booking_form_player_2 + span.select2 .select2-selection').first();
+    const p2AriaDisabled = (await p2Select2.getAttribute('aria-disabled').catch(() => 'true')) || 'true';
+    if (!disabled && p2AriaDisabled !== 'true') {
+      chosenHref = href;
+      break;
+    }
+
+    // Not enough open slots; return to tee sheet and try next
+    await navigateToTeeSheet(page, today);
+  }
+
+  if (!chosenHref) {
+    throw new Error('No bookable tee time with >=2 open slots found');
+  }
+
+  // Minimal, proven Select2 scraping: open dropdown, scrape all visible names, return flat list
+  // --- HUMAN-ACCURATE SELECT2 SCRAPING LOGIC ---
+  // (A) Ensure booking details page is open
+  let onBookingPage = page.url().includes('/bookings/book/') || (await page.locator('text=Player 1').isVisible().catch(() => false));
+  if (!onBookingPage) {
+    // Click first available tee time row
+    const bookBtn = page.locator('a[href*="/bookings/book/"]').first();
+    if (!(await bookBtn.isVisible().catch(() => false))) {
+      throw new Error('No Book button found on tee sheet');
+    }
+    await bookBtn.click();
+    await page.waitForTimeout(2000);
+    onBookingPage = true;
+  }
+  // (B) Open Select2 for first enabled player slot
+  let foundDropdownNum = null;
+  for (const num of [2, 3, 4]) {
+    const selectSel = `select#member_booking_form_player_${num}`;
+    const selectElem = await page.$(selectSel);
+    if (!selectElem) continue;
+    const isDisabled = await selectElem.getAttribute('disabled');
+    if (isDisabled) continue;
+
+    const selectorsToTry = [
+      `${selectSel} + span.select2 .select2-selection`,
+      `.select2-container[aria-owns*="player_${num}"] .select2-selection`,
+      `.select2-selection[aria-labelledby="select2-member_booking_form_player_${num}-container"]`,
+    ];
+    let clicked = false;
+    for (const sel of selectorsToTry) {
+      const box = page.locator(sel).first();
+      const ariaDisabled = await box.getAttribute('aria-disabled').catch(() => 'true');
+      if (await box.isVisible().catch(() => false) && ariaDisabled !== 'true') {
+        foundDropdownNum = num;
+        await box.click();
+        clicked = true;
+        break;
+      }
+    }
+    if (clicked) break;
+  }
+  if (!foundDropdownNum) throw new Error('No enabled Select2 player field found');
+  // (C) Wait for open Select2 results container (try selectors in order, page then frames)
+  const selectors = [
+    'body .select2-container--open .select2-results',
+    'body .select2-dropdown .select2-results',
+    'body .select2-results',
+  ];
+  let resultsHandle = null, matchedSelector = null, matchedFrame = null;
+  for (const sel of selectors) {
+    const h = await page.$(sel);
+    if (h) { resultsHandle = h; matchedSelector = sel; matchedFrame = null; break; }
+  }
+  if (!resultsHandle) {
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      for (const sel of selectors) {
+        const h = await frame.$(sel);
+        if (h) { resultsHandle = h; matchedSelector = sel; matchedFrame = frame; break; }
+      }
+      if (resultsHandle) break;
+    }
+  }
+  // (E) Diagnostics: screenshot and HTML dump
+  const screenshotFile = path.join(outputDir, `player_dir_open_${timestamp}.png`);
+  await page.screenshot({ path: screenshotFile, fullPage: true }).catch(() => {});
+  let htmlDump = '';
+  if (resultsHandle) {
+    if (matchedFrame) {
+      htmlDump = await matchedFrame.evaluate(el => el.outerHTML, resultsHandle);
+    } else {
+      htmlDump = await page.evaluate(el => el.outerHTML, resultsHandle);
+    }
+    const htmlFile = path.join(outputDir, `player_dir_open_${timestamp}.html`);
+    await fs.promises.writeFile(htmlFile, htmlDump.slice(0, 120000), 'utf8').catch(() => {});
+  }
+  // (C, cont) If still not found, error
+  if (!resultsHandle) {
+    const failHtml = await page.content();
+    await fs.promises.writeFile(path.join(outputDir, `player_dir_fail_${timestamp}.html`), failHtml.slice(0, 120000), 'utf8').catch(() => {});
+    throw new Error('Could not find open Select2 results container in any frame');
+  }
+  // (D) Scrape all categories + names from open results
+  const categorizedPlayers = await (matchedFrame || page).evaluate((sel) => {
+    const root = document.querySelector(sel);
+    if (!root) return { categories: [], playerCount: 0 };
+    const categories = [];
+    let currentCategory = null, catObj = null;
+    const idSet = new Set();
+    let groupCount = 0, optionCount = 0;
+    const items = Array.from(
+      root.querySelectorAll('.select2-results__group, .select2-results__option')
+    );
+    for (const el of items) {
+      if (el.classList.contains('select2-results__group')) {
+        if (catObj && catObj.players.length) categories.push(catObj);
+        currentCategory = el.innerText.trim();
+        catObj = { name: currentCategory, players: [] };
+        groupCount++;
+        } else if (
+          el.classList.contains('select2-results__option') &&
+          !el.classList.contains('select2-results__option--disabled') &&
+          el.getAttribute('aria-disabled') !== 'true'
+        ) {
+          if (el.getAttribute('role') === 'group') continue;
+          let name = el.innerText
+            .trim()
+            .replace(/^Member\s*/i, '')
+            .replace(/\s+Holes.*/i, '')
+            .replace(/\s+/g, ' ');
+          if (!name || /Start typing|Searching/i.test(name)) continue;
+          const rawId =
+            el.getAttribute('data-select2-id') ||
+            el.id ||
+            el.getAttribute('value') ||
+            btoa(unescape(encodeURIComponent(name))).slice(0, 16);
+          let id = rawId;
+          const match = String(rawId).match(/-(\d+)$/);
+          if (match) id = match[1];
+          if (idSet.has(id)) continue;
+          idSet.add(id);
+        const type = /guest/i.test(name) ? 'guest' : 'member';
+        if (!catObj) catObj = { name: 'Players', players: [] };
+        catObj.players.push({ id, name, type });
+        optionCount++;
+      }
+    }
+    if (catObj && catObj.players.length) categories.push(catObj);
+    const playerCount = categories.reduce((sum, c) => sum + c.players.length, 0);
+    return { categories, playerCount, groupCount, optionCount };
+  }, matchedSelector);
+  // (E) Log selector/frame info and counts
+  console.log(`  🟢 Select2 scrape: selector=${matchedSelector} frame=${matchedFrame ? page.frames().indexOf(matchedFrame) : 'main'} groups=${categorizedPlayers.groupCount} options=${categorizedPlayers.optionCount} uniquePlayers=${categorizedPlayers.playerCount}`);
+  // (F) Return unchanged schema
+  await browser.close();
+  return {
+    categories: categorizedPlayers.categories,
+    currentMemberId: null,
+    currentUserName: null,
+    count: categorizedPlayers.playerCount,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
 // Fetch player directory endpoint (scrapes player names from booking form)
 app.post('/api/brs/fetch-player-directory', async (req, res) => {
   try {
@@ -1029,241 +1290,34 @@ app.post('/api/brs/fetch-player-directory', async (req, res) => {
       return res.status(400).json({ error: 'BRS credentials are required' });
     }
 
-    console.log(`\n🔍 Fetching player directory for user ${userId}...`);
-
-    const browser = await chromium.launch({ headless: true });
-
-    // DON'T use stored session for player directory - need fresh login to get correct Player 1 name
-    let contextOptions = {
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      viewport: { width: 1920, height: 1080 },
-    };
-
-    const context = await browser.newContext(contextOptions);
-    const page = await context.newPage();
-
-    // Reuse proven login + tee sheet navigation (same as /api/snipe -> runBooking)
-    await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
-    const today = new Date();
-    await navigateToTeeSheet(page, today);
-
-    // Evidence capture before selecting a booking link (tee sheet state)
-    const fs = await import('fs');
-    const path = await import('path');
-    const outputDir = path.join(process.cwd(), 'output');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-    await fs.promises.mkdir(outputDir, { recursive: true }).catch(() => {});
-    const prebookScreenshot = path.join(outputDir, `player_dir_prebook_${timestamp}.png`);
-    const prebookHtml = path.join(outputDir, `player_dir_prebook_${timestamp}.html`);
-    await page.screenshot({ path: prebookScreenshot, fullPage: true }).catch(() => {});
-    const prebookDump = await page.content();
-    await fs.promises.writeFile(prebookHtml, prebookDump.slice(0, 120000), 'utf8').catch(() => {});
-    console.log(`  🌐 Prebook URL: ${page.url()} frames=${page.frames().length}`);
-    console.log(`  💾 Prebook snapshot: ${prebookScreenshot}, ${prebookHtml}`);
-
-    // Ensure tee sheet rows/book links are loaded (same page state /api/snipe relies on)
-    const detailBtn = page.locator('button#detail, button:has-text("Detail")').first();
-    if (await detailBtn.isVisible().catch(() => false)) {
-      await detailBtn.click().catch(() => {});
-    }
-    const start = Date.now();
-    const pollTimeout = 20000;
-    let bookingLinkCount = 0;
-    while (Date.now() - start < pollTimeout) {
-      bookingLinkCount = await page.locator('a[href*="/bookings/book/"]').count();
-      if (bookingLinkCount > 0) break;
-      await page.waitForTimeout(300);
-    }
-
-    // Pick first booking link that leads to a form with Player 2 enabled
-    let bookingLinks = [];
-    if (bookingLinkCount > 0) {
-      bookingLinks = await page.$$eval('a[href*="/bookings/book/"]', (anchors) => {
-        const hrefs = anchors.map((a) => a.getAttribute('href')).filter(Boolean);
-        return Array.from(new Set(hrefs));
-      });
-    } else {
-      for (const frame of page.frames()) {
-        if (frame === page.mainFrame()) continue;
-        const count = await frame.locator('a[href*="/bookings/book/"]').count().catch(() => 0);
-        if (count > 0) {
-          bookingLinks = await frame.$$eval('a[href*="/bookings/book/"]', (anchors) => {
-            const hrefs = anchors.map((a) => a.getAttribute('href')).filter(Boolean);
-            return Array.from(new Set(hrefs));
-          });
-          break;
-        }
-      }
-    }
-    if (!bookingLinks.length) {
-      throw new Error('No booking links found on tee sheet');
-    }
-
-    let chosenHref = null;
-    for (const href of bookingLinks) {
-      const bookingUrl = new URL(href, 'https://members.brsgolf.com/galgorm');
-      await page.goto(bookingUrl.href, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page.waitForTimeout(1500);
-      await page.locator('text=Player 1').first().waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
-
-      const player2 = await page.$('select#member_booking_form_player_2');
-      const disabled = player2 ? await player2.getAttribute('disabled') : 'true';
-      const p2Select2 = page.locator('select#member_booking_form_player_2 + span.select2 .select2-selection').first();
-      const p2AriaDisabled = (await p2Select2.getAttribute('aria-disabled').catch(() => 'true')) || 'true';
-      if (!disabled && p2AriaDisabled !== 'true') {
-        chosenHref = href;
-        break;
-      }
-
-      // Not enough open slots; return to tee sheet and try next
-      await navigateToTeeSheet(page, today);
-    }
-
-    if (!chosenHref) {
-      throw new Error('No bookable tee time with >=2 open slots found');
-    }
-
-    // Minimal, proven Select2 scraping: open dropdown, scrape all visible names, return flat list
-    // --- HUMAN-ACCURATE SELECT2 SCRAPING LOGIC ---
-    // (A) Ensure booking details page is open
-    let onBookingPage = page.url().includes('/bookings/book/') || (await page.locator('text=Player 1').isVisible().catch(() => false));
-    if (!onBookingPage) {
-      // Click first available tee time row
-      const bookBtn = page.locator('a[href*="/bookings/book/"]').first();
-      if (!(await bookBtn.isVisible().catch(() => false))) {
-        throw new Error('No Book button found on tee sheet');
-      }
-      await bookBtn.click();
-      await page.waitForTimeout(2000);
-      onBookingPage = true;
-    }
-    // (B) Open Select2 for first enabled player slot
-    let foundDropdownNum = null;
-    for (const num of [2, 3, 4]) {
-      const selectSel = `select#member_booking_form_player_${num}`;
-      const selectElem = await page.$(selectSel);
-      if (!selectElem) continue;
-      const isDisabled = await selectElem.getAttribute('disabled');
-      if (isDisabled) continue;
-
-      const selectorsToTry = [
-        `${selectSel} + span.select2 .select2-selection`,
-        `.select2-container[aria-owns*="player_${num}"] .select2-selection`,
-        `.select2-selection[aria-labelledby="select2-member_booking_form_player_${num}-container"]`,
-      ];
-      let clicked = false;
-      for (const sel of selectorsToTry) {
-        const box = page.locator(sel).first();
-        const ariaDisabled = await box.getAttribute('aria-disabled').catch(() => 'true');
-        if (await box.isVisible().catch(() => false) && ariaDisabled !== 'true') {
-          foundDropdownNum = num;
-          await box.click();
-          clicked = true;
-          break;
-        }
-      }
-      if (clicked) break;
-    }
-    if (!foundDropdownNum) throw new Error('No enabled Select2 player field found');
-    // (C) Wait for open Select2 results container (try selectors in order, page then frames)
-    const selectors = [
-      'body .select2-container--open .select2-results',
-      'body .select2-dropdown .select2-results',
-      'body .select2-results',
-    ];
-    let resultsHandle = null, matchedSelector = null, matchedFrame = null;
-    for (const sel of selectors) {
-      const h = await page.$(sel);
-      if (h) { resultsHandle = h; matchedSelector = sel; matchedFrame = null; break; }
-    }
-    if (!resultsHandle) {
-      for (const frame of page.frames()) {
-        if (frame === page.mainFrame()) continue;
-        for (const sel of selectors) {
-          const h = await frame.$(sel);
-          if (h) { resultsHandle = h; matchedSelector = sel; matchedFrame = frame; break; }
-        }
-        if (resultsHandle) break;
-      }
-    }
-    // (E) Diagnostics: screenshot and HTML dump
-    const screenshotFile = path.join(outputDir, `player_dir_open_${timestamp}.png`);
-    await page.screenshot({ path: screenshotFile, fullPage: true }).catch(() => {});
-    let htmlDump = '';
-    if (resultsHandle) {
-      if (matchedFrame) {
-        htmlDump = await matchedFrame.evaluate(el => el.outerHTML, resultsHandle);
-      } else {
-        htmlDump = await page.evaluate(el => el.outerHTML, resultsHandle);
-      }
-      const htmlFile = path.join(outputDir, `player_dir_open_${timestamp}.html`);
-      await fs.promises.writeFile(htmlFile, htmlDump.slice(0, 120000), 'utf8').catch(() => {});
-    }
-    // (C, cont) If still not found, error
-    if (!resultsHandle) {
-      const failHtml = await page.content();
-      await fs.promises.writeFile(path.join(outputDir, `player_dir_fail_${timestamp}.html`), failHtml.slice(0, 120000), 'utf8').catch(() => {});
-      throw new Error('Could not find open Select2 results container in any frame');
-    }
-    // (D) Scrape all categories + names from open results
-    const categorizedPlayers = await (matchedFrame || page).evaluate((sel) => {
-      const root = document.querySelector(sel);
-      if (!root) return { categories: [], playerCount: 0 };
-      const categories = [];
-      let currentCategory = null, catObj = null;
-      const idSet = new Set();
-      let groupCount = 0, optionCount = 0;
-      const items = Array.from(
-        root.querySelectorAll('.select2-results__group, .select2-results__option')
-      );
-      for (const el of items) {
-        if (el.classList.contains('select2-results__group')) {
-          if (catObj && catObj.players.length) categories.push(catObj);
-          currentCategory = el.innerText.trim();
-          catObj = { name: currentCategory, players: [] };
-          groupCount++;
-        } else if (
-          el.classList.contains('select2-results__option') &&
-          !el.classList.contains('select2-results__option--disabled') &&
-          el.getAttribute('aria-disabled') !== 'true'
-        ) {
-          let name = el.innerText
-            .trim()
-            .replace(/^Member\s*/i, '')
-            .replace(/\s+Holes.*/i, '')
-            .replace(/\s+/g, ' ');
-          if (!name || /Start typing|Searching/i.test(name)) continue;
-          let id =
-            el.getAttribute('data-select2-id') ||
-            el.id ||
-            el.getAttribute('value') ||
-            btoa(unescape(encodeURIComponent(name))).slice(0, 16);
-          if (idSet.has(id)) continue;
-          idSet.add(id);
-          const type = /guest/i.test(name) ? 'guest' : 'member';
-          if (!catObj) catObj = { name: 'Players', players: [] };
-          catObj.players.push({ id, name, type });
-          optionCount++;
-        }
-      }
-      if (catObj && catObj.players.length) categories.push(catObj);
-      const playerCount = categories.reduce((sum, c) => sum + c.players.length, 0);
-      return { categories, playerCount, groupCount, optionCount };
-    }, matchedSelector);
-    // (E) Log selector/frame info and counts
-    console.log(`  🟢 Select2 scrape: selector=${matchedSelector} frame=${matchedFrame ? page.frames().indexOf(matchedFrame) : 'main'} groups=${categorizedPlayers.groupCount} options=${categorizedPlayers.optionCount} uniquePlayers=${categorizedPlayers.playerCount}`);
-    // (F) Return unchanged schema
-    await browser.close();
+    const payload = await fetchPlayerDirectoryFromBRS({ userId, username, password });
     return res.json({
       success: true,
-      categories: categorizedPlayers.categories,
-      currentMemberId: null,
-      currentUserName: null,
-      count: categorizedPlayers.playerCount,
-      fetchedAt: new Date().toISOString(),
+      ...payload,
     });
   } catch (error) {
     console.error('  ❌ Error fetching player directory:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch player directory',
+    });
+  }
+});
+
+// Wizard-friendly player directory endpoint
+app.post('/api/brs/player-directory', async (req, res) => {
+  try {
+    const { userId, username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'BRS credentials are required' });
+    }
+    const payload = await fetchPlayerDirectoryFromBRS({ userId, username, password });
+    return res.json({
+      success: true,
+      ...payload,
+    });
+  } catch (error) {
+    console.error('  ❌ Error fetching player directory (wizard):', error);
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch player directory',
@@ -1469,7 +1523,9 @@ app.post('/api/snipe', async (req, res) => {
       targetDate,
       preferredTimes,
       players,
+      partySize,
       checkOnly,
+      previewBooking,
     } = req.body;
 
     // Validate required fields
@@ -1494,21 +1550,236 @@ app.post('/api/snipe', async (req, res) => {
       password,
     );
 
-    console.log(`   ✅ Found ${slots} available slots on ${targetDate}`);
+    const slotsCount = Array.isArray(slots)
+      ? slots.reduce((sum, s) => sum + (s.openSlots || 0), 0)
+      : Number(slots) || 0;
+    console.log(`   ✅ Found ${slotsCount} available slots on ${targetDate}`);
 
     // If checkOnly mode, just return availability
     if (checkOnly) {
       return res.json({
         success: true,
-        available: slots > 0,
-        slots,
+        available: slotsCount > 0,
+        slots: slotsCount,
         times: times || [],
         date: targetDate,
       });
     }
 
+    // Preview booking mode: open booking details + select2, then exit safely
+    if (previewBooking === true) {
+      const browser = await chromium.launch({ headless: true });
+      try {
+        const context = await browser.newContext({
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          viewport: { width: 1920, height: 1080 },
+        });
+        const page = await context.newPage();
+
+        await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+        const today = new Date(targetDate);
+        await navigateToTeeSheet(page, today);
+
+        const detailBtn = page
+          .locator('button#detail, button:has-text("Detail")')
+          .first();
+        if (await detailBtn.isVisible().catch(() => false)) {
+          await detailBtn.click().catch(() => {});
+        }
+        const start = Date.now();
+        const pollTimeout = 20000;
+        let bookingLinkCount = 0;
+        while (Date.now() - start < pollTimeout) {
+          bookingLinkCount = await page
+            .locator('a[href*="/bookings/book/"]')
+            .count();
+          if (bookingLinkCount > 0) break;
+          await page.waitForTimeout(300);
+        }
+
+        let bookingLinks = [];
+        if (bookingLinkCount > 0) {
+          bookingLinks = await page.$$eval(
+            'a[href*="/bookings/book/"]',
+            (anchors) => {
+              const hrefs = anchors
+                .map((a) => a.getAttribute('href'))
+                .filter(Boolean);
+              return Array.from(new Set(hrefs));
+            },
+          );
+        } else {
+          for (const frame of page.frames()) {
+            if (frame === page.mainFrame()) continue;
+            const count = await frame
+              .locator('a[href*="/bookings/book/"]')
+              .count()
+              .catch(() => 0);
+            if (count > 0) {
+              bookingLinks = await frame.$$eval(
+                'a[href*="/bookings/book/"]',
+                (anchors) => {
+                  const hrefs = anchors
+                    .map((a) => a.getAttribute('href'))
+                    .filter(Boolean);
+                  return Array.from(new Set(hrefs));
+                },
+              );
+              break;
+            }
+          }
+        }
+        if (!bookingLinks.length) {
+          throw new Error('No booking links found on tee sheet');
+        }
+
+        let chosenHref = null;
+        for (const href of bookingLinks) {
+          const bookingUrl = new URL(
+            href,
+            'https://members.brsgolf.com/galgorm',
+          );
+          await page.goto(bookingUrl.href, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000,
+          });
+          await page.waitForTimeout(1500);
+          await page
+            .locator('text=Player 1')
+            .first()
+            .waitFor({ state: 'visible', timeout: 15000 })
+            .catch(() => {});
+
+          const player2 = await page.$('select#member_booking_form_player_2');
+          const disabled = player2
+            ? await player2.getAttribute('disabled')
+            : 'true';
+          const p2Select2 = page
+            .locator(
+              'select#member_booking_form_player_2 + span.select2 .select2-selection',
+            )
+            .first();
+          const p2AriaDisabled =
+            (await p2Select2
+              .getAttribute('aria-disabled')
+              .catch(() => 'true')) || 'true';
+          if (!disabled && p2AriaDisabled !== 'true') {
+            chosenHref = href;
+            break;
+          }
+
+          await navigateToTeeSheet(page, today);
+        }
+
+        if (!chosenHref) {
+          throw new Error('No bookable tee time with >=2 open slots found');
+        }
+
+        // Assert booking details + open Select2
+        await page
+          .locator('text=Player 1')
+          .first()
+          .waitFor({ state: 'visible', timeout: 15000 });
+        const player2Select = await page.$(
+          'select#member_booking_form_player_2',
+        );
+        if (!player2Select) {
+          throw new Error('Player 2 field not found on booking details');
+        }
+
+        const select2Box = page
+          .locator(
+            'select#member_booking_form_player_2 + span.select2 .select2-selection',
+          )
+          .first();
+        await select2Box.click();
+
+        const selectors = [
+          'body .select2-container--open .select2-results',
+          'body .select2-dropdown .select2-results',
+          'body .select2-results',
+        ];
+        let resultsHandle = null;
+        let matchedSelector = null;
+        let matchedFrame = null;
+        for (const sel of selectors) {
+          const h = await page.$(sel);
+          if (h) {
+            resultsHandle = h;
+            matchedSelector = sel;
+            matchedFrame = null;
+            break;
+          }
+        }
+        if (!resultsHandle) {
+          for (const frame of page.frames()) {
+            if (frame === page.mainFrame()) continue;
+            for (const sel of selectors) {
+              const h = await frame.$(sel);
+              if (h) {
+                resultsHandle = h;
+                matchedSelector = sel;
+                matchedFrame = frame;
+                break;
+              }
+            }
+            if (resultsHandle) break;
+          }
+        }
+        if (!resultsHandle) {
+          throw new Error('Could not find open Select2 results container');
+        }
+
+        const select2OptionsCount = await (matchedFrame || page).evaluate(
+          (sel) => {
+            const root = document.querySelector(sel);
+            if (!root) return 0;
+            const options = root.querySelectorAll(
+              '.select2-results__option:not(.select2-results__option--disabled)',
+            );
+            return options.length;
+          },
+          matchedSelector,
+        );
+
+        if (select2OptionsCount < 20) {
+          throw new Error(
+            `Select2 options count too low: ${select2OptionsCount}`,
+          );
+        }
+
+        const fs = await import('fs');
+        const path = await import('path');
+        const outputDir = path.join(process.cwd(), 'output');
+        const timestamp = new Date()
+          .toISOString()
+          .replace(/[:.]/g, '-')
+          .slice(0, -5);
+        await fs.promises.mkdir(outputDir, { recursive: true }).catch(() => {});
+        const screenshotFile = path.join(
+          outputDir,
+          `preview_booking_${timestamp}.png`,
+        );
+        await page.screenshot({ path: screenshotFile, fullPage: true }).catch(
+          () => {},
+        );
+
+        await browser.close();
+        return res.json({
+          success: true,
+          preview: true,
+          reachedBookingDetails: true,
+          select2OptionsCount,
+        });
+      } catch (error) {
+        await browser.close();
+        throw error;
+      }
+    }
+
     // Phase 2: If slots available and NOT checkOnly, execute booking
-    if (slots === 0) {
+    if (slotsCount === 0) {
       return res.json({
         success: false,
         available: false,
@@ -1531,7 +1802,8 @@ app.post('/api/snipe', async (req, res) => {
       pushToken: null,
       targetPlayDate: targetDate,
       players: players || [],
-      slotsData: times || [],  // Pass the full slots array with openSlots info
+      partySize,
+      slotsData: slots || [],  // Pass the full slots array with openSlots info
     });
 
     res.json({
@@ -1546,7 +1818,7 @@ app.post('/api/snipe', async (req, res) => {
         preferredTimes,
         playersRequested: result.playersRequested,
         openSlots: result.bookedTime
-          ? times.find(s => s.time === result.bookedTime)?.openSlots
+          ? slots.find(s => s.time === result.bookedTime)?.openSlots
           : null,
       },
       timing: {
@@ -1576,6 +1848,7 @@ app.post('/api/book-now', async (req, res) => {
       targetDate,
       preferredTimes,
       players,
+      partySize,
       pushToken,
     } = req.body;
 
@@ -1616,6 +1889,7 @@ app.post('/api/book-now', async (req, res) => {
       pushToken,
       targetPlayDate: targetDate,
       players: players || [],
+      partySize,
       slotsData: slotsData || [],  // Pass slots data for accurate player fill logic
     });
 

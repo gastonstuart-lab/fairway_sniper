@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 /// Shows players with remove buttons and allows reordering
 class PlayerListEditor extends StatefulWidget {
   final List<String> playerNames;
+  final Map<String, String>? playerLabels;
   final Function(List<String>) onPlayersChanged;
   final VoidCallback onAddPlayers;
   final int maxPlayers;
@@ -12,6 +13,7 @@ class PlayerListEditor extends StatefulWidget {
   const PlayerListEditor({
     super.key,
     required this.playerNames,
+    this.playerLabels,
     required this.onPlayersChanged,
     required this.onAddPlayers,
     this.maxPlayers = 4,
@@ -161,7 +163,8 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
               ),
             ),
             title: Text(
-              widget.playerNames[index],
+              widget.playerLabels?[widget.playerNames[index]] ??
+                  widget.playerNames[index],
               style: const TextStyle(
                 color: Colors.black87,
                 fontSize: 16,
@@ -200,6 +203,8 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
         },
         itemBuilder: (context, index) {
           final playerName = widget.playerNames[index];
+          final displayName =
+              widget.playerLabels?[playerName] ?? playerName;
 
           return Container(
             key: ValueKey(playerName),
@@ -228,7 +233,7 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
                 ],
               ),
               title: Text(
-                playerName,
+                displayName,
                 style: const TextStyle(
                   color: Colors.black87,
                   fontSize: 16,

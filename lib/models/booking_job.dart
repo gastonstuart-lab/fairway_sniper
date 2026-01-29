@@ -14,6 +14,7 @@ class BookingJob {
   final String targetDay;
   final List<String> preferredTimes;
   final List<String> players;
+  final int? partySize;
   final String status;
   final DateTime? nextFireTimeUtc;
   final String? pushToken;
@@ -39,6 +40,7 @@ class BookingJob {
     required this.targetDay,
     required this.preferredTimes,
     required this.players,
+    this.partySize,
     this.status = 'active',
     this.nextFireTimeUtc,
     this.pushToken,
@@ -62,6 +64,7 @@ class BookingJob {
         'target_day': targetDay,
         'preferred_times': preferredTimes,
         'players': players,
+        'party_size': partySize,
         'status': status,
         'next_fire_time_utc': nextFireTimeUtc != null
             ? Timestamp.fromDate(nextFireTimeUtc!)
@@ -91,6 +94,7 @@ class BookingJob {
         targetDay: json['target_day'] ?? '',
         preferredTimes: List<String>.from(json['preferred_times'] ?? []),
         players: List<String>.from(json['players'] ?? []),
+        partySize: json['party_size'] is int ? json['party_size'] as int : null,
         status: json['status'] ?? 'active',
         nextFireTimeUtc: json['next_fire_time_utc'] is Timestamp
             ? (json['next_fire_time_utc'] as Timestamp).toDate()
@@ -138,6 +142,7 @@ class BookingJob {
     String? targetDay,
     List<String>? preferredTimes,
     List<String>? players,
+    int? partySize,
     String? status,
     DateTime? nextFireTimeUtc,
     String? pushToken,
@@ -160,6 +165,7 @@ class BookingJob {
         targetDay: targetDay ?? this.targetDay,
         preferredTimes: preferredTimes ?? this.preferredTimes,
         players: players ?? this.players,
+        partySize: partySize ?? this.partySize,
         status: status ?? this.status,
         nextFireTimeUtc: nextFireTimeUtc ?? this.nextFireTimeUtc,
         pushToken: pushToken ?? this.pushToken,
