@@ -36,7 +36,10 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   DateTime? _targetPlayDate; // actual desired play date (6+ days future)
   DateTime? _computedReleaseDateTime; // computed from target
   final List<String> _preferredTimes = [];
-  List<String> _selectedPlayers = []; // Player names from directory
+  int _playerCount = 2; // total party size (includes Player 1 = user)
+  List<String> _selectedPlayerIds = [];
+  final Map<String, String> _playerLabelsById = {};
+  String? _currentUserName; // Player 1 (logged-in user)
   final List<TextEditingController> _playerControllers = [
     TextEditingController()
   ];
@@ -221,12 +224,19 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       }
     }
     if (_currentPage == 3) {
-      if (_selectedPlayers.isEmpty) {
+      if (_playerCount < 2 || _playerCount > 4) {
+        _showSnack('Select party size (2 to 4)');
+        return;
+      }
+      await _preloadPlayerDirectory();
+    }
+    if (_currentPage == 4) {
+      if (_selectedPlayerIds.isEmpty) {
         _showSnack('Select at least one player');
         return;
       }
     }
-    if (_currentPage < 3) {
+    if (_currentPage < 4) {
       _pageController.nextPage(
           duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
     }
@@ -248,7 +258,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     if (uid == null) return;
 
     // Use selected players from directory
-    final players = _selectedPlayers.isNotEmpty ? _selectedPlayers : ['Guest'];
+    final players = _selectedPlayerIds;
 
     final strategy = _buildStrategy();
     final releaseDateTime = _computeReleaseDateTime(_targetPlayDate!);
@@ -359,15 +369,16 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               controller: _pageController,
               physics: const NeverScrollableScrollPhysics(),
               onPageChanged: (p) => setState(() => _currentPage = p),
-              children: [
-                _buildCredentialsPage(),
-                _buildDatePage(),
-                _buildPreferredTimesPage(),
-                _buildPlayersPage(),
-              ],
-            ),
-          ),
-          _buildNavBar(),
+        children: [
+          _buildCredentialsPage(),
+          _buildDatePage(),
+          _buildPreferredTimesPage(),
+          _buildPartySizePage(),
+          _buildPlayersPage(),
+        ],
+      ),
+    ),
+    _buildNavBar(),
         ],
       ),
     );
@@ -411,8 +422,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           const SizedBox(width: 12),
           Expanded(
             child: ElevatedButton(
-              onPressed: _currentPage == 3 ? _saveJob : _nextPage,
-              child: Text(_currentPage == 3 ? 'Create Job' : 'Continue'),
+              onPressed: _currentPage == 4 ? _saveJob : _nextPage,
+              child: Text(_currentPage == 4 ? 'Create Job' : 'Continue'),
             ),
           ),
         ],
@@ -687,6 +698,55 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     );
   }
 
+  Widget _buildPartySizePage() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.group, size: 56, color: Colors.redAccent),
+          const SizedBox(height: 16),
+          Text('Party Size',
+              style: Theme.of(context)
+                  .textTheme
+                  .headlineSmall
+                  ?.copyWith(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Text('How many players are in the group? (Player 1 is you)',
+              style: Theme.of(context).textTheme.bodyMedium),
+          const SizedBox(height: 24),
+          Wrap(
+            spacing: 12,
+            children: [2, 3, 4]
+                .map((count) => ChoiceChip(
+                      label: Text('$count'),
+                      selected: _playerCount == count,
+                      onSelected: (_) {
+                        setState(() {
+                          _playerCount = count;
+                          final maxAdditional = _playerCount - 1;
+                          if (_selectedPlayerIds.length > maxAdditional) {
+                            _selectedPlayerIds =
+                                _selectedPlayerIds.sublist(0, maxAdditional);
+                          }
+                        });
+                      },
+                    ))
+                .toList(),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'You will select up to ${_playerCount - 1} additional player(s).',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: Colors.grey.shade600),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildPlayersPage() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -701,16 +761,26 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                   .headlineSmall
                   ?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
-          Text('Choose up to 4 players from your club directory',
+          Text(
+              'Choose up to ${_playerCount - 1} additional player(s) from your club directory',
               style: Theme.of(context).textTheme.bodyMedium),
+          const SizedBox(height: 12),
+          if (_currentUserName != null && _currentUserName!.isNotEmpty)
+            Text(
+              'Player 1: $_currentUserName',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
           const SizedBox(height: 24),
           PlayerListEditor(
-            playerNames: _selectedPlayers,
+            playerNames: _selectedPlayerIds,
+            playerLabels: _playerLabelsById,
             onPlayersChanged: (updated) {
-              setState(() => _selectedPlayers = updated);
+              setState(() => _selectedPlayerIds = updated);
             },
             onAddPlayers: _showPlayerSelector,
-            maxPlayers: 4,
+            maxPlayers: _playerCount - 1,
           ),
         ],
       ),
@@ -718,17 +788,69 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   }
 
   Future<void> _showPlayerSelector() async {
+    await _preloadPlayerDirectory();
     final selected = await PlayerSelectorModal.show(
       context: context,
       directoryService: _playerDirectoryService,
-      initialSelectedNames: _selectedPlayers,
-      maxPlayers: 4,
+      initialSelectedIds: _selectedPlayerIds,
+      returnIds: true,
+      allowedCategories: const ['You and your buddies', 'Other club members'],
+      maxPlayers: _playerCount - 1,
       username: _brsUsernameController.text.trim(),
       password: _brsPasswordController.text,
     );
 
     if (selected != null) {
-      setState(() => _selectedPlayers = selected);
+      final directory = await _playerDirectoryService.getDirectory(
+        username: _brsUsernameController.text.trim(),
+        password: _brsPasswordController.text,
+      );
+      final map = <String, String>{};
+      if (directory != null) {
+        for (final category in directory.categories) {
+          for (final player in category.players) {
+            map[player.id] = player.name;
+          }
+        }
+      }
+      setState(() {
+        _selectedPlayerIds = selected;
+        _playerLabelsById
+          ..clear()
+          ..addAll(map);
+      });
     }
+  }
+
+  Future<void> _preloadPlayerDirectory() async {
+    if (_brsUsernameController.text.trim().isEmpty ||
+        _brsPasswordController.text.isEmpty) {
+      _showSnack('Enter BRS credentials to load player directory');
+      return;
+    }
+
+    debugPrint('🧭 [SniperWizard] Base URL: ${_resolveAgentBaseUrl()}');
+    debugPrint('🧭 [SniperWizard] Loading player directory...');
+    final directory = await _playerDirectoryService.getDirectory(
+      username: _brsUsernameController.text.trim(),
+      password: _brsPasswordController.text,
+    );
+    if (directory == null) return;
+
+    debugPrint(
+        '✅ [SniperWizard] Player directory loaded: ${directory.getAllPlayers().length} players');
+
+    final map = <String, String>{};
+    for (final category in directory.categories) {
+      for (final player in category.players) {
+        map[player.id] = player.name;
+      }
+    }
+    setState(() {
+      _playerLabelsById
+        ..clear()
+        ..addAll(map);
+      _currentUserName = directory.currentUserName;
+    });
   }
 }

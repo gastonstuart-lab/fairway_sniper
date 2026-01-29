@@ -121,7 +121,9 @@ class PlayerDirectoryService {
       print('🔑 Using credentials: $finalUsername');
 
       // Make request to agent
-      final url = Uri.parse('$agentBaseUrl/api/brs/fetch-player-directory');
+      final url = Uri.parse('$agentBaseUrl/api/brs/player-directory');
+      print('🧭 [PlayerDirectory] Base URL: $agentBaseUrl');
+      print('🧭 [PlayerDirectory] POST: $url');
       final response = await http
           .post(
             url,
@@ -151,6 +153,9 @@ class PlayerDirectoryService {
         print('❌ Agent request failed: ${data['error'] ?? 'Unknown error'}');
         return null;
       }
+
+      final count = data['count'];
+      print('✅ [PlayerDirectory] Response count: $count');
 
       // Parse response into PlayerDirectory
       final categoriesData = data['categories'] as List<dynamic>;

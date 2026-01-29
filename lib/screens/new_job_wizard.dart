@@ -34,7 +34,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
   String? _selectedTime; // For Normal mode: single time selection
   DateTime? _selectedDate; // For Normal mode: which day the selected time is on
   int _playerCount = 2; // For Normal mode: how many slots needed
-  List<String> _selectedPlayers = []; // Player names from directory
+  List<String> _selectedPlayers = []; // Additional players (Player 2+)
+  String? _currentUserName; // Player 1 (logged-in user)
   final List<TextEditingController> _playerControllers = [
     TextEditingController()
   ];
@@ -125,10 +126,11 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     // Validate players on page 2
     if (_currentPage == 2) {
-      if (_selectedPlayers.length < _playerCount) {
+      final requiredAdditional = _playerCount > 1 ? _playerCount - 1 : 0;
+      if (_selectedPlayers.length < requiredAdditional) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Add $_playerCount player(s) to match party size'),
+            content: Text('Add $requiredAdditional additional player(s)'),
             backgroundColor: Colors.orange,
           ),
         );
@@ -182,7 +184,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
     }
 
     // Use selected players from directory
-    final players = _selectedPlayers.isNotEmpty ? _selectedPlayers : ['Guest'];
+    final players = _selectedPlayers;
     print('🔵 Players: $players');
 
     if (_selectedTime == null || _selectedDate == null) {
@@ -209,6 +211,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
       targetDay: DateFormat('EEEE').format(_selectedDate!),
       preferredTimes: [_selectedTime!], // Single time for Normal mode
       players: players,
+      partySize: _playerCount,
       pushToken: fcmToken,
       bookingMode: _mode,
       targetPlayDate:
@@ -234,6 +237,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
           targetDate: _selectedDate!,
           preferredTimes: [_selectedTime!],
           players: players,
+          partySize: _playerCount,
           pushToken: fcmToken,
         );
 
@@ -328,6 +332,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
     required DateTime targetDate,
     required List<String> preferredTimes,
     required List<String> players,
+    required int partySize,
     required String? pushToken,
   }) async {
     try {
@@ -342,6 +347,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
               'targetDate': targetDate.toIso8601String(),
               'preferredTimes': preferredTimes,
               'players': players,
+              'partySize': partySize,
               'pushToken': pushToken,
             }),
           )
@@ -1266,11 +1272,19 @@ class _NewJobWizardState extends State<NewJobWizard> {
           ),
           const SizedBox(height: 8),
           Text(
-            'Choose up to $_playerCount players from your club directory',
+            'Choose up to ${_playerCount - 1} additional players (Player 1 is you)',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: Colors.grey.shade600,
                 ),
           ),
+          const SizedBox(height: 12),
+          if (_currentUserName != null && _currentUserName!.isNotEmpty)
+            Text(
+              'Player 1: $_currentUserName',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
           const SizedBox(height: 32),
           PlayerListEditor(
             playerNames: _selectedPlayers,
@@ -1278,7 +1292,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
               setState(() => _selectedPlayers = updated);
             },
             onAddPlayers: _showPlayerSelector,
-            maxPlayers: _playerCount,
+            maxPlayers: _playerCount > 1 ? _playerCount - 1 : 0,
           ),
         ],
       ),
@@ -1290,7 +1304,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
       context: context,
       directoryService: _playerDirectoryService,
       initialSelectedNames: _selectedPlayers,
-      maxPlayers: _playerCount,
+      maxPlayers: _playerCount > 1 ? _playerCount - 1 : 0,
       username: _brsEmailController.text,
       password: _brsPasswordController.text,
     );
@@ -1298,22 +1312,16 @@ class _NewJobWizardState extends State<NewJobWizard> {
     if (selected != null) {
       print('🎯 Selected players from modal: $selected');
 
-      // Auto-prepend logged-in user if not already in list
       final directory = await _playerDirectoryService.getDirectory(
         username: _brsEmailController.text,
         password: _brsPasswordController.text,
       );
-
-      final List<String> finalPlayers = [];
-      if (directory?.currentUserName != null &&
-          !selected.contains(directory!.currentUserName)) {
-        print('👤 Auto-adding logged-in user: ${directory.currentUserName}');
-        finalPlayers.add(directory.currentUserName!);
-      }
-      finalPlayers.addAll(selected);
+      setState(() {
+        _currentUserName = directory?.currentUserName;
+      });
 
       setState(() {
-        _selectedPlayers = finalPlayers
+        _selectedPlayers = selected
             .map((name) => name.trim())
             .where((name) => name.isNotEmpty)
             .toList();
@@ -1357,8 +1365,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
           _buildReviewCard(
             'Players',
             _selectedPlayers.isNotEmpty
-                ? _selectedPlayers.join(', ')
-                : 'None selected',
+                ? 'You, ${_selectedPlayers.join(', ')}'
+                : 'You only',
             Icons.group,
           ),
         ],
