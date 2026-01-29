@@ -137,3 +137,17 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Fairway Sniper runtime artifacts
+agent/output/
+test-results/
+automation/test-results/
+build/
+.dart_tool/
+*.png
+*.html
+*.webm
+*.zip
+*.apk
+state.json
+.last-run.json
