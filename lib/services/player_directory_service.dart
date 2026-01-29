@@ -3,19 +3,18 @@ import 'dart:async';
 import 'package:http/http.dart' as http;
 import 'package:fairway_sniper/models/player_directory.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/services/agent_base_url.dart';
 
 /// Service for managing the player directory cache
 /// Handles fetching from agent and caching in Firestore
 class PlayerDirectoryService {
   final FirebaseService _firebaseService;
-  final String agentBaseUrl;
 
   // Cache duration - refresh if directory is older than this
   static const Duration cacheMaxAge = Duration(days: 7);
 
   PlayerDirectoryService({
     required FirebaseService firebaseService,
-    required this.agentBaseUrl,
   }) : _firebaseService = firebaseService;
 
   /// Get the player directory, using cache if available and fresh
@@ -119,6 +118,8 @@ class PlayerDirectoryService {
       }
 
       print('🔑 Using credentials: $finalUsername');
+
+      final agentBaseUrl = await getAgentBaseUrl();
 
       // Make request to agent
       final url = Uri.parse('$agentBaseUrl/api/brs/player-directory');

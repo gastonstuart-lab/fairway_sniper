@@ -5,12 +5,48 @@ import 'dotenv/config';
 import { chromium } from '@playwright/test';
 import express from 'express';
 import cors from 'cors';
+import admin from 'firebase-admin';
 console.log('=== [AGENT] index.js (no requires) ===');
 
 // ...existing code...
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ========================================
+// FIREBASE ADMIN INIT (optional)
+// ========================================
+
+let db = null;
+
+function initFirebaseAdmin() {
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+  if (!projectId || !clientEmail || !privateKey) {
+    console.log(
+      '⚠️ Firebase Admin not configured. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY to enable DB logging.',
+    );
+    return;
+  }
+
+  try {
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId,
+          clientEmail,
+          privateKey: privateKey.replace(/\\n/g, '\n'),
+        }),
+      });
+    }
+    db = admin.firestore();
+    console.log('✅ Firebase Admin initialized');
+  } catch (error) {
+    console.error('❌ Firebase Admin init failed:', error);
+  }
+}
 
 // ========================================
 // CONFIGURATION FROM ENVIRONMENT VARIABLES
@@ -25,6 +61,8 @@ const CONFIG = {
   CAPTCHA_API_KEY: process.env.CAPTCHA_API_KEY || '',
   DRY_RUN: process.argv.includes('--dry-run'),
 };
+
+initFirebaseAdmin();
 
 
 

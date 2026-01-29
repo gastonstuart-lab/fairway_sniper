@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:fairway_sniper/models/player_directory.dart';
 import 'package:fairway_sniper/services/player_directory_service.dart';
+import 'package:fairway_sniper/services/agent_base_url.dart';
 
 /// Modal dialog for selecting players from the directory
 /// Displays categories in tabs and allows multi-select with search
@@ -68,6 +69,11 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
   final Set<String> _pendingSelectedNames = {};
   late TabController _tabController;
   final TextEditingController _searchController = TextEditingController();
+  
+  String _agentHelpText() {
+    return 'If you are on Android emulator, use http://10.0.2.2:3000. '
+        'If you are on a physical phone, use your PC LAN IP (e.g. http://192.168.x.x:3000).';
+  }
 
   @override
   void initState() {
@@ -94,13 +100,15 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
     });
 
     try {
+      final baseUrl = await getAgentBaseUrl();
       final directory = await widget.directoryService.getDirectory(
         username: widget.username,
         password: widget.password,
       );
       if (directory == null) {
         setState(() {
-          _error = 'Could not load player directory';
+          _error =
+              'Could not load player directory from $baseUrl. ${_agentHelpText()}';
           _loading = false;
         });
         return;
@@ -130,8 +138,10 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
         _loading = false;
       });
     } catch (e) {
+      final baseUrl = await getAgentBaseUrl();
       setState(() {
-        _error = 'Error loading directory: $e';
+        _error =
+            'Error loading directory from $baseUrl: $e. ${_agentHelpText()}';
         _loading = false;
       });
     }
@@ -144,13 +154,15 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
     });
 
     try {
+      final baseUrl = await getAgentBaseUrl();
       final directory = await widget.directoryService.refresh(
         username: widget.username,
         password: widget.password,
       );
       if (directory == null) {
         setState(() {
-          _error = 'Could not refresh player directory';
+          _error =
+              'Could not refresh player directory from $baseUrl. ${_agentHelpText()}';
           _loading = false;
         });
         return;
@@ -167,8 +179,10 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
         );
       }
     } catch (e) {
+      final baseUrl = await getAgentBaseUrl();
       setState(() {
-        _error = 'Error refreshing directory: $e';
+        _error =
+            'Error refreshing directory from $baseUrl: $e. ${_agentHelpText()}';
         _loading = false;
       });
     }

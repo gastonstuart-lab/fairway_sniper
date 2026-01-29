@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:fairway_sniper/models/booking_job.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/player_directory_service.dart';
+import 'package:fairway_sniper/services/agent_base_url.dart';
 import 'package:fairway_sniper/widgets/player_selector_modal.dart';
 import 'package:fairway_sniper/widgets/player_list_editor.dart';
 import 'package:intl/intl.dart';
@@ -46,6 +47,12 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
 
   // Available times - will be fetched from agent when target date selected
   List<String> _availableTimes = [];
+  String _agentBaseUrl = defaultAgentBaseUrl();
+  bool _agentTesting = false;
+  String? _agentTestStatus;
+  bool _isRefreshingPlayers = false;
+  bool _agentHealthOk = true;
+  String? _agentHealthBaseUrl;
 
   final List<String> _fallbackTimes = [
     '08:00',
@@ -107,9 +114,10 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     super.initState();
     _playerDirectoryService = PlayerDirectoryService(
       firebaseService: _firebaseService,
-      agentBaseUrl: _resolveAgentBaseUrl(),
     );
     _loadCreds();
+    _loadAgentBaseUrl();
+    _runAgentDiagnostics();
     _availableTimes =
         _fallbackTimes; // Start with fallback until real times fetched
   }
@@ -128,6 +136,61 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         _brsPasswordController.text = creds['password'] ?? '';
       }
     });
+  }
+
+  Future<void> _loadAgentBaseUrl() async {
+    final url = await getAgentBaseUrl();
+    if (!mounted) return;
+    setState(() => _agentBaseUrl = url);
+  }
+
+  Future<void> _runAgentDiagnostics() async {
+    final baseUrl = await getAgentBaseUrl();
+    if (!mounted) return;
+    setState(() => _agentHealthBaseUrl = baseUrl);
+
+    final healthUrl = '$baseUrl/api/health';
+    print('🚨🚨 [AGENT-DIAG] HEALTH CHECK URL: $healthUrl');
+    try {
+      final response = await http
+          .get(Uri.parse(healthUrl))
+          .timeout(const Duration(seconds: 8));
+      print(
+          '🚨🚨 [AGENT-DIAG] HEALTH STATUS: ${response.statusCode} BODY: ${response.body}');
+      if (!mounted) return;
+      setState(() => _agentHealthOk = response.statusCode == 200);
+    } catch (e) {
+      print('🚨🚨 [AGENT-DIAG] HEALTH ERROR: $e');
+      if (!mounted) return;
+      setState(() => _agentHealthOk = false);
+    }
+
+    if (!_agentHealthOk) return;
+
+    final fetchUrl = '$baseUrl/api/fetch-tee-times-range';
+    final payload = {
+      'startDate': DateTime.now().toIso8601String(),
+      'days': 5,
+      'username': _brsUsernameController.text.trim(),
+      'password': _brsPasswordController.text.trim(),
+      'club': _club,
+      'reuseBrowser': true,
+    };
+    print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
+    print('🚨🚨 [AGENT-DIAG] FETCH PAYLOAD: ${jsonEncode(payload)}');
+    try {
+      final response = await http.post(
+        Uri.parse(fetchUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(payload),
+      );
+      final body = response.body;
+      final snippet = body.substring(0, body.length.clamp(0, 300));
+      print(
+          '🚨🚨 [AGENT-DIAG] FETCH STATUS: ${response.statusCode} BODY: $snippet');
+    } catch (e) {
+      print('🚨🚨 [AGENT-DIAG] FETCH ERROR: $e');
+    }
   }
 
   @override
@@ -293,12 +356,6 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     }
   }
 
-  String _resolveAgentBaseUrl() {
-    const override = String.fromEnvironment('FS_AGENT_BASE_URL');
-    if (override.isNotEmpty) return override;
-    return 'http://localhost:3000';
-  }
-
   Future<void> _fetchAvailableTimesForDate(DateTime date) async {
     if (_brsUsernameController.text.trim().isEmpty ||
         _brsPasswordController.text.isEmpty) {
@@ -308,8 +365,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       return;
     }
 
+    String agentUrl = _agentBaseUrl;
     try {
-      final agentUrl = _resolveAgentBaseUrl();
+      agentUrl = await getAgentBaseUrl();
       final dateStr = DateFormat('yyyy-MM-dd').format(date);
 
       final response = await http.post(
@@ -337,10 +395,13 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           }
         });
       } else {
-        throw Exception('Agent returned ${response.statusCode}');
+        throw Exception('Agent returned ${response.statusCode} at $agentUrl');
       }
     } catch (e) {
       if (!mounted) return;
+      _showSnack(
+        'Failed to fetch tee times at $agentUrl. ${_agentHelpText()} ($e)',
+      );
       setState(() {
         _availableTimes = _fallbackTimes;
       });
@@ -363,22 +424,36 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       ),
       body: Column(
         children: [
+          if (!_agentHealthOk && _agentHealthBaseUrl != null)
+            Container(
+              width: double.infinity,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              color: Colors.red.shade700,
+              child: Text(
+                'AGENT NOT RUNNING at $_agentHealthBaseUrl',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
           _buildStepper(),
           Expanded(
             child: PageView(
               controller: _pageController,
               physics: const NeverScrollableScrollPhysics(),
               onPageChanged: (p) => setState(() => _currentPage = p),
-        children: [
-          _buildCredentialsPage(),
-          _buildDatePage(),
-          _buildPreferredTimesPage(),
-          _buildPartySizePage(),
-          _buildPlayersPage(),
-        ],
-      ),
-    ),
-    _buildNavBar(),
+              children: [
+                _buildCredentialsPage(),
+                _buildDatePage(),
+                _buildPreferredTimesPage(),
+                _buildPartySizePage(),
+                _buildPlayersPage(),
+              ],
+            ),
+          ),
+          _buildNavBar(),
         ],
       ),
     );
@@ -484,6 +559,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               ),
             ),
           ),
+          const SizedBox(height: 24),
+          _buildAgentConnectionRow(),
         ],
       ),
     );
@@ -782,7 +859,146 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             onAddPlayers: _showPlayerSelector,
             maxPlayers: _playerCount - 1,
           ),
+          if (_isRefreshingPlayers) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Updating player directory...',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Colors.grey.shade600),
+            ),
+          ],
         ],
+      ),
+    );
+  }
+
+  String _agentHelpText() {
+    return 'If you are on Android emulator, use http://10.0.2.2:3000. '
+        'If you are on a physical phone, use your PC LAN IP (e.g. http://192.168.x.x:3000).';
+  }
+
+  Future<void> _showAgentUrlDialog() async {
+    final controller = TextEditingController(text: _agentBaseUrl);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Agent Base URL'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            hintText: 'http://localhost:3000',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) {
+      await setAgentBaseUrl(result);
+      await _loadAgentBaseUrl();
+      setState(() => _agentTestStatus = null);
+    }
+  }
+
+  Future<void> _testAgentConnection() async {
+    setState(() {
+      _agentTesting = true;
+      _agentTestStatus = null;
+    });
+
+    try {
+      final baseUrl = await getAgentBaseUrl();
+      final response =
+          await http.get(Uri.parse('$baseUrl/api/health')).timeout(
+                const Duration(seconds: 8),
+              );
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        setState(() {
+          _agentTestStatus = '✅ Agent reachable at $baseUrl';
+        });
+      } else {
+        setState(() {
+          _agentTestStatus =
+              '❌ Agent responded ${response.statusCode} at $baseUrl. ${_agentHelpText()}';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _agentTestStatus =
+            '❌ Failed to reach agent at $_agentBaseUrl. ${_agentHelpText()}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _agentTesting = false);
+      }
+    }
+  }
+
+  Widget _buildAgentConnectionRow() {
+    return Card(
+      color: Colors.blueGrey.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.link, color: Colors.blueGrey),
+                const SizedBox(width: 8),
+                const Text(
+                  'Agent Connection',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: _showAgentUrlDialog,
+                  child: const Text('Change'),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  onPressed: _agentTesting ? null : _testAgentConnection,
+                  child: _agentTesting
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Test'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              _agentBaseUrl,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            if (_agentTestStatus != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                _agentTestStatus!,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: _agentTestStatus!.startsWith('✅')
+                          ? Colors.green
+                          : Colors.red,
+                    ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -801,23 +1017,37 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     );
 
     if (selected != null) {
-      final directory = await _playerDirectoryService.getDirectory(
-        username: _brsUsernameController.text.trim(),
-        password: _brsPasswordController.text,
-      );
-      final map = <String, String>{};
-      if (directory != null) {
-        for (final category in directory.categories) {
-          for (final player in category.players) {
-            map[player.id] = player.name;
-          }
-        }
-      }
       setState(() {
         _selectedPlayerIds = selected;
-        _playerLabelsById
-          ..clear()
-          ..addAll(map);
+        _isRefreshingPlayers = true;
+      });
+
+      // Refresh labels in the background; keep UI responsive.
+      _playerDirectoryService
+          .getDirectory(
+            username: _brsUsernameController.text.trim(),
+            password: _brsPasswordController.text,
+          )
+          .then((directory) {
+        if (!mounted) return;
+        final map = <String, String>{};
+        if (directory != null) {
+          for (final category in directory.categories) {
+            for (final player in category.players) {
+              map[player.id] = player.name;
+            }
+          }
+        }
+        setState(() {
+          _playerLabelsById
+            ..clear()
+            ..addAll(map);
+          _currentUserName = directory?.currentUserName;
+          _isRefreshingPlayers = false;
+        });
+      }).catchError((_) {
+        if (!mounted) return;
+        setState(() => _isRefreshingPlayers = false);
       });
     }
   }
@@ -829,7 +1059,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       return;
     }
 
-    debugPrint('🧭 [SniperWizard] Base URL: ${_resolveAgentBaseUrl()}');
+    final baseUrl = await getAgentBaseUrl();
+    debugPrint('🧭 [SniperWizard] Base URL: $baseUrl');
     debugPrint('🧭 [SniperWizard] Loading player directory...');
     final directory = await _playerDirectoryService.getDirectory(
       username: _brsUsernameController.text.trim(),

@@ -3,9 +3,9 @@ import 'dart:convert';
 import 'package:fairway_sniper/models/booking_job.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/player_directory_service.dart';
+import 'package:fairway_sniper/services/agent_base_url.dart';
 import 'package:fairway_sniper/widgets/player_selector_modal.dart';
 import 'package:fairway_sniper/widgets/player_list_editor.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
@@ -40,7 +40,11 @@ class _NewJobWizardState extends State<NewJobWizard> {
     TextEditingController()
   ];
   static const int _rangeWindowDays = 5;
-  late final String _agentBaseUrl = _resolveAgentBaseUrl();
+  String _agentBaseUrl = defaultAgentBaseUrl();
+  bool _agentTesting = false;
+  String? _agentTestStatus;
+  bool _agentHealthOk = true;
+  String? _agentHealthBaseUrl;
   bool _isFetchingAvailability = false;
   String? _availabilityError;
   DateTime? _availabilityFetchedAt;
@@ -50,15 +54,17 @@ class _NewJobWizardState extends State<NewJobWizard> {
   Map<String, String>? _savedCreds; // loaded from Firestore user profile
   bool _useSavedCreds = true; // default to using saved if present
   bool _loadingSavedCreds = false;
+  bool _isRefreshingPlayers = false;
 
   @override
   void initState() {
     super.initState();
     _playerDirectoryService = PlayerDirectoryService(
       firebaseService: _firebaseService,
-      agentBaseUrl: _agentBaseUrl,
     );
     _loadSavedCreds();
+    _loadAgentBaseUrl();
+    _runAgentDiagnostics();
   }
 
   @override
@@ -91,6 +97,61 @@ class _NewJobWizardState extends State<NewJobWizard> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _loadingSavedCreds = false);
+    }
+  }
+
+  Future<void> _loadAgentBaseUrl() async {
+    final url = await getAgentBaseUrl();
+    if (!mounted) return;
+    setState(() => _agentBaseUrl = url);
+  }
+
+  Future<void> _runAgentDiagnostics() async {
+    final baseUrl = await getAgentBaseUrl();
+    if (!mounted) return;
+    setState(() => _agentHealthBaseUrl = baseUrl);
+
+    final healthUrl = '$baseUrl/api/health';
+    print('🚨🚨 [AGENT-DIAG] HEALTH CHECK URL: $healthUrl');
+    try {
+      final response = await http
+          .get(Uri.parse(healthUrl))
+          .timeout(const Duration(seconds: 8));
+      print(
+          '🚨🚨 [AGENT-DIAG] HEALTH STATUS: ${response.statusCode} BODY: ${response.body}');
+      if (!mounted) return;
+      setState(() => _agentHealthOk = response.statusCode == 200);
+    } catch (e) {
+      print('🚨🚨 [AGENT-DIAG] HEALTH ERROR: $e');
+      if (!mounted) return;
+      setState(() => _agentHealthOk = false);
+    }
+
+    if (!_agentHealthOk) return;
+
+    final fetchUrl = '$baseUrl/api/fetch-tee-times-range';
+    final payload = {
+      'startDate': DateTime.now().toIso8601String(),
+      'days': _rangeWindowDays,
+      'username': _brsEmailController.text.trim(),
+      'password': _brsPasswordController.text.trim(),
+      'club': _club,
+      'reuseBrowser': true,
+    };
+    print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
+    print('🚨🚨 [AGENT-DIAG] FETCH PAYLOAD: ${jsonEncode(payload)}');
+    try {
+      final response = await http.post(
+        Uri.parse(fetchUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(payload),
+      );
+      final body = response.body;
+      final snippet = body.substring(0, body.length.clamp(0, 300));
+      print(
+          '🚨🚨 [AGENT-DIAG] FETCH STATUS: ${response.statusCode} BODY: $snippet');
+    } catch (e) {
+      print('🚨🚨 [AGENT-DIAG] FETCH ERROR: $e');
     }
   }
 
@@ -335,11 +396,13 @@ class _NewJobWizardState extends State<NewJobWizard> {
     required int partySize,
     required String? pushToken,
   }) async {
+    String baseUrl = _agentBaseUrl;
     try {
+      baseUrl = await getAgentBaseUrl();
       final client = http.Client();
       final response = await client
           .post(
-            Uri.parse('$_agentBaseUrl/api/book-now'),
+            Uri.parse('$baseUrl/api/book-now'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'username': username,
@@ -367,7 +430,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
         return {
           'success': false,
           'result': 'error',
-          'error': 'Server error: ${response.statusCode}',
+          'error':
+              'Agent error ${response.statusCode} at $baseUrl. ${_agentHelpText()}',
         };
       }
     } catch (e) {
@@ -375,7 +439,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
       return {
         'success': false,
         'result': 'error',
-        'error': e.toString(),
+        'error':
+            'Failed to contact agent at $baseUrl. ${_agentHelpText()} ($e)',
       };
     }
   }
@@ -409,6 +474,20 @@ class _NewJobWizardState extends State<NewJobWizard> {
             margin: const EdgeInsets.symmetric(vertical: 20),
             child: Column(
               children: [
+                if (!_agentHealthOk && _agentHealthBaseUrl != null)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 10),
+                    color: Colors.red.shade700,
+                    child: Text(
+                      'AGENT NOT RUNNING at $_agentHealthBaseUrl',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
                 _buildProgressIndicator(),
                 Expanded(
                   child: PageView(
@@ -578,6 +657,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
             ),
             enabled: !_useSavedCreds || _savedCreds == null,
           ),
+          const SizedBox(height: 24),
+          _buildAgentConnectionRow(),
           const SizedBox(height: 24),
           Container(
             padding: const EdgeInsets.all(16),
@@ -1072,8 +1153,10 @@ class _NewJobWizardState extends State<NewJobWizard> {
     DateTime? focusedDate = _focusedAvailabilityDate;
     String? error;
 
+    String baseUrl = _agentBaseUrl;
     try {
-      final uri = Uri.parse('$_agentBaseUrl/api/fetch-tee-times-range');
+      baseUrl = await getAgentBaseUrl();
+      final uri = Uri.parse('$baseUrl/api/fetch-tee-times-range');
       final payload = {
         'startDate': DateTime.now().toIso8601String(),
         'days': _rangeWindowDays,
@@ -1082,7 +1165,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
         'club': _club,
         'reuseBrowser': true,
       };
-      debugPrint('[AvailabilityRange] Base URL: $_agentBaseUrl');
+      debugPrint('[AvailabilityRange] Base URL: $baseUrl');
       debugPrint('[AvailabilityRange] POST: $uri');
       debugPrint('[AvailabilityRange] Payload: ' + jsonEncode(payload));
       final response = await http.post(
@@ -1104,21 +1187,23 @@ class _NewJobWizardState extends State<NewJobWizard> {
           } else {
             final agentError = decoded['error']?.toString();
             error = agentError == null || agentError.isEmpty
-                ? 'Agent response did not include success=true.'
-                : 'Agent reported error: $agentError';
+                ? 'Agent response did not include success=true. Base URL: $baseUrl. ${_agentHelpText()}'
+                : 'Agent reported error: $agentError. Base URL: $baseUrl. ${_agentHelpText()}';
           }
         } else {
-          error = 'Agent returned an unexpected response (not a Map).';
+          error =
+              'Agent returned an unexpected response (not a Map). Base URL: $baseUrl. ${_agentHelpText()}';
         }
       } else {
         error =
-            'Agent request failed with status ${response.statusCode}. Body: ' +
+            'Agent request failed at $baseUrl with status ${response.statusCode}. Body: ' +
                 response.body.substring(0, response.body.length.clamp(0, 300));
       }
     } catch (e, st) {
       debugPrint('[AvailabilityRange] Exception: $e');
       debugPrint('[AvailabilityRange] Stack: $st');
-      error = 'Failed to contact agent: $e';
+      error =
+          'Failed to contact agent at $baseUrl. ${_agentHelpText()} ($e)';
     }
 
     if (!mounted) return;
@@ -1237,27 +1322,6 @@ class _NewJobWizardState extends State<NewJobWizard> {
     return null;
   }
 
-  static String _resolveAgentBaseUrl() {
-    const override =
-        String.fromEnvironment('FS_AGENT_BASE_URL', defaultValue: '');
-    if (override.isNotEmpty) {
-      return override;
-    }
-    if (kIsWeb) {
-      return 'http://localhost:3000';
-    }
-    switch (defaultTargetPlatform) {
-      case TargetPlatform.android:
-        return 'http://10.0.2.2:3000';
-      case TargetPlatform.iOS:
-      case TargetPlatform.macOS:
-      case TargetPlatform.windows:
-      case TargetPlatform.linux:
-      case TargetPlatform.fuchsia:
-        return 'http://localhost:3000';
-    }
-  }
-
   Widget _buildPage3() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -1294,7 +1358,146 @@ class _NewJobWizardState extends State<NewJobWizard> {
             onAddPlayers: _showPlayerSelector,
             maxPlayers: _playerCount > 1 ? _playerCount - 1 : 0,
           ),
+          if (_isRefreshingPlayers) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Updating player directory...',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Colors.grey.shade600),
+            ),
+          ],
         ],
+      ),
+    );
+  }
+
+  String _agentHelpText() {
+    return 'If you are on Android emulator, use http://10.0.2.2:3000. '
+        'If you are on a physical phone, use your PC LAN IP (e.g. http://192.168.x.x:3000).';
+  }
+
+  Future<void> _showAgentUrlDialog() async {
+    final controller = TextEditingController(text: _agentBaseUrl);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Agent Base URL'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            hintText: 'http://localhost:3000',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) {
+      await setAgentBaseUrl(result);
+      await _loadAgentBaseUrl();
+      setState(() => _agentTestStatus = null);
+    }
+  }
+
+  Future<void> _testAgentConnection() async {
+    setState(() {
+      _agentTesting = true;
+      _agentTestStatus = null;
+    });
+
+    try {
+      final baseUrl = await getAgentBaseUrl();
+      final response =
+          await http.get(Uri.parse('$baseUrl/api/health')).timeout(
+                const Duration(seconds: 8),
+              );
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        setState(() {
+          _agentTestStatus = '✅ Agent reachable at $baseUrl';
+        });
+      } else {
+        setState(() {
+          _agentTestStatus =
+              '❌ Agent responded ${response.statusCode} at $baseUrl. ${_agentHelpText()}';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _agentTestStatus =
+            '❌ Failed to reach agent at $_agentBaseUrl. ${_agentHelpText()}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _agentTesting = false);
+      }
+    }
+  }
+
+  Widget _buildAgentConnectionRow() {
+    return Card(
+      color: Colors.blueGrey.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.link, color: Colors.blueGrey),
+                const SizedBox(width: 8),
+                const Text(
+                  'Agent Connection',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: _showAgentUrlDialog,
+                  child: const Text('Change'),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  onPressed: _agentTesting ? null : _testAgentConnection,
+                  child: _agentTesting
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Test'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              _agentBaseUrl,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            if (_agentTestStatus != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                _agentTestStatus!,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: _agentTestStatus!.startsWith('✅')
+                          ? Colors.green
+                          : Colors.red,
+                    ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -1310,22 +1513,27 @@ class _NewJobWizardState extends State<NewJobWizard> {
     );
 
     if (selected != null) {
+      setState(() {
+        _selectedPlayers = selected;
+        _isRefreshingPlayers = true;
+      });
       print('🎯 Selected players from modal: $selected');
 
-      final directory = await _playerDirectoryService.getDirectory(
-        username: _brsEmailController.text,
-        password: _brsPasswordController.text,
-      );
-      setState(() {
-        _currentUserName = directory?.currentUserName;
-      });
-
-      setState(() {
-        _selectedPlayers = selected
-            .map((name) => name.trim())
-            .where((name) => name.isNotEmpty)
-            .toList();
-        print('🎯 Final player list: $_selectedPlayers');
+      // Refresh player directory in the background to update Player 1 name.
+      _playerDirectoryService
+          .getDirectory(
+            username: _brsEmailController.text,
+            password: _brsPasswordController.text,
+          )
+          .then((directory) {
+        if (!mounted) return;
+        setState(() {
+          _currentUserName = directory?.currentUserName;
+          _isRefreshingPlayers = false;
+        });
+      }).catchError((_) {
+        if (!mounted) return;
+        setState(() => _isRefreshingPlayers = false);
       });
     }
   }
