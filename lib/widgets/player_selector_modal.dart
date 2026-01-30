@@ -69,6 +69,7 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
   final Set<String> _pendingSelectedNames = {};
   late TabController _tabController;
   final TextEditingController _searchController = TextEditingController();
+  String? _currentUserName;
   
   String _agentHelpText() {
     return 'If you are on Android emulator, use http://10.0.2.2:3000. '
@@ -115,9 +116,11 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
       }
 
       final displayCategories = _filterCategories(directory);
+      _currentUserName = directory.currentUserName;
       if (_pendingSelectedNames.isNotEmpty) {
         final byName = <String, String>{};
         for (final player in directory.getAllPlayers()) {
+          if (_isCurrentUser(player)) continue;
           byName[player.name] = player.id;
         }
         for (final name in _pendingSelectedNames) {
@@ -214,20 +217,28 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
         // "All" tab
         return displayCategories
             .expand((category) => category.players)
+            .where((player) => !_isCurrentUser(player))
             .toList();
       } else {
         // Specific category tab
         final category = displayCategories[_tabController.index - 1];
-        return category.players;
+        return category.players.where((player) => !_isCurrentUser(player)).toList();
       }
     } else {
       // Search across displayed categories only
       final lowerQuery = _searchQuery.toLowerCase();
       return displayCategories
           .expand((category) => category.players)
+          .where((player) => !_isCurrentUser(player))
           .where((player) => player.name.toLowerCase().contains(lowerQuery))
           .toList();
     }
+  }
+
+  bool _isCurrentUser(Player player) {
+    final current = _currentUserName;
+    if (current == null || current.isEmpty) return false;
+    return player.name.trim().toLowerCase() == current.trim().toLowerCase();
   }
 
   void _togglePlayer(Player player) {

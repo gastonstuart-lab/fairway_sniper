@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/services/booking_prefetch_service.dart';
 import 'package:fairway_sniper/services/weather_service.dart';
 import 'package:fairway_sniper/services/golf_news_service.dart';
 import 'package:fairway_sniper/models/booking_job.dart';
@@ -22,6 +23,7 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   final _firebaseService = FirebaseService();
+  late final BookingPrefetchService _prefetchService;
   final _weatherService = WeatherService();
   final _golfNewsService = GolfNewsService();
   final _newsScrollController = ScrollController();
@@ -33,8 +35,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
+    _prefetchService = BookingPrefetchService(firebaseService: _firebaseService);
     _loadWeather();
     _loadNews();
+    _prefetchService.run();
   }
 
   @override
@@ -58,6 +62,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Future<void> _loadNews() async {
     final news = await _golfNewsService.getGolfNews();
     if (mounted) setState(() => _newsArticles = news);
+  }
+
+  String _partySizeLabel(BookingJob job) {
+    final size = job.partySize ?? (job.players.length + 1);
+    final unit = size == 1 ? 'player' : 'players';
+    return '$size $unit';
   }
 
   DateTime _getNextSaturday() {
@@ -304,6 +314,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
                         padding: const EdgeInsets.all(20),
+                        child: AnimatedBuilder(
+                          animation: _prefetchService,
+                          builder: (context, _) => _buildPrefetchCard(
+                            _prefetchService.state,
+                          ),
+                        ),
+                      ),
+                    ),
+                    Center(
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 800),
+                        padding: const EdgeInsets.all(20),
                         child: _buildJobsList(jobs),
                       ),
                     ),
@@ -358,8 +380,95 @@ class _DashboardScreenState extends State<DashboardScreen> {
           onPressed: () => Navigator.of(context).push(
             MaterialPageRoute(builder: (_) => const ModeSelectionScreen()),
           ),
+          backgroundColor: _prefetchService.state.isReady
+              ? const Color(0xFF2E7D32)
+              : null,
           icon: const Icon(Icons.add),
-          label: const Text('New Booking Job'),
+          label: Text(
+            _prefetchService.state.isReady ? 'Ready to Book' : 'New Booking Job',
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPrefetchCard(BookingPrefetchState state) {
+    final theme = Theme.of(context);
+    final isReady = state.isReady;
+    final hasError = state.hasError;
+    final statusColor = isReady
+        ? Colors.green
+        : hasError
+            ? Colors.red
+            : theme.colorScheme.primary;
+
+    return Card(
+      color: Colors.white.withValues(alpha: 0.95),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.data_saver_on, color: statusColor),
+                const SizedBox(width: 8),
+                Text(
+                  'Prepare Booking Data',
+                  style: theme.textTheme.titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: _prefetchService.isRunning
+                      ? null
+                      : () => _prefetchService.run(forceRefresh: true),
+                  child: const Text('Refresh Data'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(
+              value: state.step == PrefetchStep.failed ? null : state.progress,
+              color: statusColor,
+              backgroundColor: Colors.grey.shade200,
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    state.statusText,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: statusColor,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                Text(
+                  '${(state.progress * 100).round()}%',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: Colors.grey.shade700,
+                  ),
+                ),
+              ],
+            ),
+            if (hasError) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Prefetch failed. You can still use the app.',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: Colors.grey.shade700),
+              ),
+              const SizedBox(height: 8),
+              ElevatedButton(
+                onPressed: _prefetchService.isRunning
+                    ? null
+                    : () => _prefetchService.run(forceRefresh: true),
+                child: const Text('Retry'),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -1219,7 +1328,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               Icon(Icons.people, size: 14, color: subtextColor),
                               const SizedBox(width: 4),
                               Text(
-                                '${job.players.length} players',
+                                _partySizeLabel(job),
                                 style: TextStyle(
                                     color: subtextColor, fontSize: 13),
                               ),
@@ -2334,7 +2443,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const Divider(),
               _buildDetailRow(
                 'Players',
-                job.players.join(', '),
+                _partySizeLabel(job),
                 Icons.people,
               ),
               const Divider(),

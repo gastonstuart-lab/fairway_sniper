@@ -117,7 +117,7 @@ class PlayerDirectoryService {
         return null;
       }
 
-      print('🔑 Using credentials: $finalUsername');
+      // Do not log credentials.
 
       final agentBaseUrl = await getAgentBaseUrl();
 

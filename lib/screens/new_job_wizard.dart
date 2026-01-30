@@ -4,6 +4,7 @@ import 'package:fairway_sniper/models/booking_job.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/player_directory_service.dart';
 import 'package:fairway_sniper/services/agent_base_url.dart';
+import 'package:fairway_sniper/services/availability_cache_service.dart';
 import 'package:fairway_sniper/widgets/player_selector_modal.dart';
 import 'package:fairway_sniper/widgets/player_list_editor.dart';
 import 'package:flutter/material.dart';
@@ -33,7 +34,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
   DateTime? _targetDate;
   String? _selectedTime; // For Normal mode: single time selection
   DateTime? _selectedDate; // For Normal mode: which day the selected time is on
-  int _playerCount = 2; // For Normal mode: how many slots needed
+  int _additionalPlayerCount = 1; // Additional players beyond Player 1
   List<String> _selectedPlayers = []; // Additional players (Player 2+)
   String? _currentUserName; // Player 1 (logged-in user)
   final List<TextEditingController> _playerControllers = [
@@ -55,6 +56,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
   bool _useSavedCreds = true; // default to using saved if present
   bool _loadingSavedCreds = false;
   bool _isRefreshingPlayers = false;
+  bool _isNextBusy = false;
+  final _availabilityCacheService = AvailabilityCacheService();
+  int get _partySize => _additionalPlayerCount + 1;
 
   @override
   void initState() {
@@ -129,17 +133,20 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     if (!_agentHealthOk) return;
 
+    final diagUser = _brsEmailController.text.trim();
+    final diagPass = _brsPasswordController.text.trim();
+    if (diagUser.isEmpty || diagPass.isEmpty) return;
+
     final fetchUrl = '$baseUrl/api/fetch-tee-times-range';
     final payload = {
       'startDate': DateTime.now().toIso8601String(),
       'days': _rangeWindowDays,
-      'username': _brsEmailController.text.trim(),
-      'password': _brsPasswordController.text.trim(),
+      'username': diagUser,
+      'password': diagPass,
       'club': _club,
       'reuseBrowser': true,
     };
     print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
-    print('🚨🚨 [AGENT-DIAG] FETCH PAYLOAD: ${jsonEncode(payload)}');
     try {
       final response = await http.post(
         Uri.parse(fetchUrl),
@@ -156,6 +163,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
   }
 
   Future<void> _nextPage() async {
+    if (_isNextBusy) return;
     // Validate page 0 (BRS Credentials)
     if (_currentPage == 0) {
       final username = _brsEmailController.text.trim();
@@ -187,7 +195,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     // Validate players on page 2
     if (_currentPage == 2) {
-      final requiredAdditional = _playerCount > 1 ? _playerCount - 1 : 0;
+      final requiredAdditional = _additionalPlayerCount;
       if (_selectedPlayers.length < requiredAdditional) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -203,10 +211,17 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     if (_currentPage < 3) {
       // Changed from 4 to 3 (now 4 pages total)
-      _pageController.nextPage(
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeInOut,
-      );
+      setState(() => _isNextBusy = true);
+      _pageController
+          .nextPage(
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeInOut,
+          )
+          .whenComplete(() {
+        if (mounted) {
+          setState(() => _isNextBusy = false);
+        }
+      });
     }
   }
 
@@ -272,7 +287,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
       targetDay: DateFormat('EEEE').format(_selectedDate!),
       preferredTimes: [_selectedTime!], // Single time for Normal mode
       players: players,
-      partySize: _playerCount,
+      partySize: _partySize,
       pushToken: fcmToken,
       bookingMode: _mode,
       targetPlayDate:
@@ -298,7 +313,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
           targetDate: _selectedDate!,
           preferredTimes: [_selectedTime!],
           players: players,
-          partySize: _playerCount,
+          partySize: _partySize,
           pushToken: fcmToken,
         );
 
@@ -729,13 +744,13 @@ class _NewJobWizardState extends State<NewJobWizard> {
           ),
           const SizedBox(height: 8),
           Text(
-            'Choose your party size, then select ONE available slot to book immediately',
+            'Choose additional players, then select ONE available slot to book immediately',
             style: theme.textTheme.bodyLarge?.copyWith(
               color: Colors.grey.shade600,
             ),
           ),
           const SizedBox(height: 24),
-          _buildSectionTitle('Party Size'),
+          _buildSectionTitle('Additional Players'),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
@@ -744,24 +759,25 @@ class _NewJobWizardState extends State<NewJobWizard> {
                   const Icon(Icons.group),
                   const SizedBox(width: 16),
                   Expanded(
-                    child: Text('How many players?',
+                    child: Text('How many additional players?',
                         style: theme.textTheme.titleMedium),
                   ),
                   SegmentedButton<int>(
                     segments: const [
+                      ButtonSegment(value: 0, label: Text('0')),
                       ButtonSegment(value: 1, label: Text('1')),
                       ButtonSegment(value: 2, label: Text('2')),
                       ButtonSegment(value: 3, label: Text('3')),
-                      ButtonSegment(value: 4, label: Text('4')),
                     ],
-                    selected: {_playerCount},
+                    selected: {_additionalPlayerCount},
                     onSelectionChanged: (Set<int> newSelection) {
                       final nextCount = newSelection.first;
                       setState(() {
-                        _playerCount = nextCount;
-                        if (_selectedPlayers.length > nextCount) {
-                          _selectedPlayers =
-                              _selectedPlayers.take(nextCount).toList();
+                        _additionalPlayerCount = nextCount;
+                        if (_selectedPlayers.length > _additionalPlayerCount) {
+                          _selectedPlayers = _selectedPlayers
+                              .take(_additionalPlayerCount)
+                              .toList();
                         }
                       });
                     },
@@ -905,7 +921,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
       Align(
         alignment: Alignment.centerLeft,
         child: ElevatedButton.icon(
-          onPressed: canScan ? _refreshRangeFromAgent : null,
+          onPressed: canScan ? () => _refreshRangeFromAgent(forceRefresh: true) : null,
           icon: const Icon(Icons.rss_feed),
           label: Text(_availabilityDays.isEmpty
               ? 'Scan Next $_rangeWindowDays Days'
@@ -928,7 +944,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: 'Refresh availability',
-              onPressed: canScan ? _refreshRangeFromAgent : null,
+              onPressed: canScan ? () => _refreshRangeFromAgent(forceRefresh: true) : null,
             ),
           ],
         ),
@@ -1013,12 +1029,12 @@ class _NewJobWizardState extends State<NewJobWizard> {
                       summary != null && summary.openSlots != null;
                   if (!hasSlotData)
                     return true; // keep if no data so user can try
-                  return (summary.openSlots ?? 0) >= _playerCount;
+                  return (summary.openSlots ?? 0) >= _partySize;
                 }).toList();
 
                 if (filteredTimes.isEmpty) {
                   return Text(
-                    'No tee times have at least $_playerCount slots available.',
+                    'No tee times have at least $_partySize slots available.',
                     style: theme.textTheme.bodySmall
                         ?.copyWith(color: Colors.grey.shade600),
                   );
@@ -1033,7 +1049,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
                     final bool hasSlotData =
                         summary != null && summary.openSlots != null;
                     final bool hasEnoughSlots = hasSlotData
-                        ? (summary.openSlots ?? 0) >= _playerCount
+                        ? (summary.openSlots ?? 0) >= _partySize
                         : true; // Default to enabled if no slot data
                     final bool selected = _selectedTime == time &&
                         _selectedDate != null &&
@@ -1047,7 +1063,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
                     return FilterChip(
                       label: Text(
-                        _formatSlotLabel(time, summary, _playerCount),
+                        _formatSlotLabel(time, summary, _partySize),
                         style: TextStyle(
                           color: selected
                               ? Colors.white
@@ -1124,7 +1140,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
     });
   }
 
-  Future<void> _refreshRangeFromAgent() async {
+  Future<void> _refreshRangeFromAgent({bool forceRefresh = false}) async {
     final username = _brsEmailController.text.trim();
     final password = _brsPasswordController.text.trim();
 
@@ -1156,48 +1172,42 @@ class _NewJobWizardState extends State<NewJobWizard> {
     String baseUrl = _agentBaseUrl;
     try {
       baseUrl = await getAgentBaseUrl();
-      final uri = Uri.parse('$baseUrl/api/fetch-tee-times-range');
-      final payload = {
-        'startDate': DateTime.now().toIso8601String(),
-        'days': _rangeWindowDays,
-        'username': username,
-        'password': password,
-        'club': _club,
-        'reuseBrowser': true,
-      };
-      debugPrint('[AvailabilityRange] Base URL: $baseUrl');
-      debugPrint('[AvailabilityRange] POST: $uri');
-      debugPrint('[AvailabilityRange] Payload: ' + jsonEncode(payload));
-      final response = await http.post(
-        uri,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
-      );
-      debugPrint('[AvailabilityRange] Status: ${response.statusCode}');
-      debugPrint('[AvailabilityRange] Raw Body (truncated): ' +
-          response.body.substring(0, response.body.length.clamp(0, 500)));
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        final dynamic decoded = jsonDecode(response.body);
-        if (decoded is Map<String, dynamic>) {
-          if (decoded['success'] == true && decoded['days'] is List) {
-            final parsed = _parseAvailabilityDays(decoded['days'] as List);
-            nextDays = parsed;
-            fetchedAt = DateTime.now();
-            focusedDate = _computeFocusedAvailabilityDate(parsed);
-          } else {
-            final agentError = decoded['error']?.toString();
-            error = agentError == null || agentError.isEmpty
-                ? 'Agent response did not include success=true. Base URL: $baseUrl. ${_agentHelpText()}'
-                : 'Agent reported error: $agentError. Base URL: $baseUrl. ${_agentHelpText()}';
-          }
-        } else {
-          error =
-              'Agent returned an unexpected response (not a Map). Base URL: $baseUrl. ${_agentHelpText()}';
+      if (!forceRefresh) {
+        final entry = await _availabilityCacheService.getOrFetch(
+          baseUrl: baseUrl,
+          username: username,
+          password: password,
+          days: _rangeWindowDays,
+          club: _club,
+          reuseBrowser: true,
+        );
+        if (entry != null) {
+          final parsed = _parseAvailabilityDays(entry.days);
+          nextDays = parsed;
+          fetchedAt = entry.fetchedAt;
+          focusedDate = _computeFocusedAvailabilityDate(parsed);
         }
-      } else {
-        error =
-            'Agent request failed at $baseUrl with status ${response.statusCode}. Body: ' +
-                response.body.substring(0, response.body.length.clamp(0, 300));
+      }
+
+      if (nextDays.isEmpty || forceRefresh) {
+        debugPrint('[AvailabilityRange] Base URL: $baseUrl');
+        final entry = await _availabilityCacheService.fetchAndCache(
+          baseUrl: baseUrl,
+          username: username,
+          password: password,
+          days: _rangeWindowDays,
+          club: _club,
+          reuseBrowser: true,
+        );
+        if (entry == null) {
+          error =
+              'Failed to fetch availability from $baseUrl. ${_agentHelpText()}';
+        } else {
+          final parsed = _parseAvailabilityDays(entry.days);
+          nextDays = parsed;
+          fetchedAt = entry.fetchedAt;
+          focusedDate = _computeFocusedAvailabilityDate(parsed);
+        }
       }
     } catch (e, st) {
       debugPrint('[AvailabilityRange] Exception: $e');
@@ -1336,7 +1346,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
           ),
           const SizedBox(height: 8),
           Text(
-            'Choose up to ${_playerCount - 1} additional players (Player 1 is you)',
+            'Choose up to $_additionalPlayerCount additional players (Player 1 is you)',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: Colors.grey.shade600,
                 ),
@@ -1356,7 +1366,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
               setState(() => _selectedPlayers = updated);
             },
             onAddPlayers: _showPlayerSelector,
-            maxPlayers: _playerCount > 1 ? _playerCount - 1 : 0,
+            maxPlayers: _additionalPlayerCount,
           ),
           if (_isRefreshingPlayers) ...[
             const SizedBox(height: 8),
@@ -1507,7 +1517,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
       context: context,
       directoryService: _playerDirectoryService,
       initialSelectedNames: _selectedPlayers,
-      maxPlayers: _playerCount > 1 ? _playerCount - 1 : 0,
+      maxPlayers: _additionalPlayerCount,
       username: _brsEmailController.text,
       password: _brsPasswordController.text,
     );
@@ -1638,6 +1648,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
   }
 
   Widget _buildNavigationButtons() {
+    final busy = _isNextBusy || _isFetchingAvailability || _isRefreshingPlayers;
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -1655,7 +1666,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
           if (_currentPage > 0)
             Expanded(
               child: OutlinedButton(
-                onPressed: _previousPage,
+                onPressed: busy ? null : _previousPage,
                 child: const Text('Back'),
               ),
             ),
@@ -1663,8 +1674,14 @@ class _NewJobWizardState extends State<NewJobWizard> {
           Expanded(
             flex: 2,
             child: ElevatedButton(
-              onPressed: _currentPage == 3 ? _saveJob : _nextPage,
-              child: Text(_currentPage == 3 ? 'Create Job' : 'Continue'),
+              onPressed: busy ? null : (_currentPage == 3 ? _saveJob : _nextPage),
+              child: busy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Text(_currentPage == 3 ? 'Create Job' : 'Continue'),
             ),
           ),
         ],

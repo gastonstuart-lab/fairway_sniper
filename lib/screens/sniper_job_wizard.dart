@@ -1,14 +1,18 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:fairway_sniper/models/booking_job.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/player_directory_service.dart';
 import 'package:fairway_sniper/services/agent_base_url.dart';
+import 'package:fairway_sniper/services/availability_cache_service.dart';
 import 'package:fairway_sniper/widgets/player_selector_modal.dart';
 import 'package:fairway_sniper/widgets/player_list_editor.dart';
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:async';
 
 class SniperJobWizard extends StatefulWidget {
   const SniperJobWizard({super.key});
@@ -20,6 +24,7 @@ class SniperJobWizard extends StatefulWidget {
 class _SniperJobWizardState extends State<SniperJobWizard> {
   final _firebaseService = FirebaseService();
   late final PlayerDirectoryService _playerDirectoryService;
+  final _availabilityCacheService = AvailabilityCacheService();
   final _pageController = PageController();
   int _currentPage = 0;
 
@@ -37,7 +42,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   DateTime? _targetPlayDate; // actual desired play date (6+ days future)
   DateTime? _computedReleaseDateTime; // computed from target
   final List<String> _preferredTimes = [];
-  int _playerCount = 2; // total party size (includes Player 1 = user)
+  int _additionalPlayerCount = 1; // additional players beyond Player 1
   List<String> _selectedPlayerIds = [];
   final Map<String, String> _playerLabelsById = {};
   String? _currentUserName; // Player 1 (logged-in user)
@@ -51,6 +56,13 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   bool _agentTesting = false;
   String? _agentTestStatus;
   bool _isRefreshingPlayers = false;
+  bool _isNextBusy = false;
+  String? _sniperTestJobId;
+  String? _sniperTestStatus;
+  Timer? _sniperTestPoller;
+  bool _sniperTestRunning = false;
+
+  int get _partySize => _additionalPlayerCount + 1;
   bool _agentHealthOk = true;
   String? _agentHealthBaseUrl;
 
@@ -120,6 +132,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     _runAgentDiagnostics();
     _availableTimes =
         _fallbackTimes; // Start with fallback until real times fetched
+    if (kDebugMode) {
+      _loadLastSniperTestJob();
+    }
   }
 
   Future<void> _loadCreds() async {
@@ -167,17 +182,20 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
 
     if (!_agentHealthOk) return;
 
+    final diagUser = _brsUsernameController.text.trim();
+    final diagPass = _brsPasswordController.text.trim();
+    if (diagUser.isEmpty || diagPass.isEmpty) return;
+
     final fetchUrl = '$baseUrl/api/fetch-tee-times-range';
     final payload = {
       'startDate': DateTime.now().toIso8601String(),
       'days': 5,
-      'username': _brsUsernameController.text.trim(),
-      'password': _brsPasswordController.text.trim(),
+      'username': diagUser,
+      'password': diagPass,
       'club': _club,
       'reuseBrowser': true,
     };
     print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
-    print('🚨🚨 [AGENT-DIAG] FETCH PAYLOAD: ${jsonEncode(payload)}');
     try {
       final response = await http.post(
         Uri.parse(fetchUrl),
@@ -201,6 +219,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     for (final c in _playerControllers) {
       c.dispose();
     }
+    _sniperTestPoller?.cancel();
     super.dispose();
   }
 
@@ -235,6 +254,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   }
 
   Future<void> _nextPage() async {
+    if (_isNextBusy) return;
     if (_currentPage == 0) {
       if (_brsUsernameController.text.trim().isEmpty ||
           _brsPasswordController.text.isEmpty) {
@@ -251,31 +271,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         _showSnack('Date must be at least 5 days in future');
         return;
       }
-      // Show loading dialog while fetching times
-      if (!mounted) return;
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const CircularProgressIndicator(),
-              const SizedBox(height: 16),
-              Text(
-                'Fetching available tee times for ${DateFormat('EEE d MMM').format(_targetPlayDate!)}...',
-                textAlign: TextAlign.center,
-              ),
-            ],
-          ),
-        ),
-      );
-
-      // Fetch available times for selected date before moving to times page
+      setState(() => _isNextBusy = true);
       await _fetchAvailableTimesForDate(_targetPlayDate!);
-
-      // Close loading dialog
-      if (mounted) Navigator.of(context).pop();
+      if (mounted) setState(() => _isNextBusy = false);
 
       // Note: For sniper mode, it's normal to have no times available yet
       // since we're booking future dates that haven't been released
@@ -287,15 +285,17 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       }
     }
     if (_currentPage == 3) {
-      if (_playerCount < 2 || _playerCount > 4) {
-        _showSnack('Select party size (2 to 4)');
+      if (_partySize < 1 || _partySize > 4) {
+        _showSnack('Select additional players (0 to 3)');
         return;
       }
+      setState(() => _isNextBusy = true);
       await _preloadPlayerDirectory();
+      if (mounted) setState(() => _isNextBusy = false);
     }
     if (_currentPage == 4) {
-      if (_selectedPlayerIds.isEmpty) {
-        _showSnack('Select at least one player');
+      if (_additionalPlayerCount > 0 && _selectedPlayerIds.isEmpty) {
+        _showSnack('Select at least one additional player');
         return;
       }
     }
@@ -337,6 +337,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       targetDay: DateFormat('EEEE').format(_targetPlayDate!),
       preferredTimes: _preferredTimes,
       players: players,
+      partySize: _partySize,
       bookingMode: BookingMode.sniper,
       targetPlayDate: _targetPlayDate,
       releaseWindowStart: releaseDateTime.toUtc(),
@@ -369,6 +370,30 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     try {
       agentUrl = await getAgentBaseUrl();
       final dateStr = DateFormat('yyyy-MM-dd').format(date);
+
+      // Try cached availability first
+      final cacheKey = _availabilityCacheService.buildKey(
+        baseUrl: agentUrl,
+        username: _brsUsernameController.text.trim(),
+        days: 5,
+        club: _club,
+      );
+      final cached = _availabilityCacheService.getFresh(cacheKey);
+      if (cached != null) {
+        final cachedDay = cached.days.firstWhere(
+          (d) => d['date']?.toString() == dateStr,
+          orElse: () => {},
+        );
+        if (cachedDay.isNotEmpty && cachedDay['times'] is List) {
+          final times = (cachedDay['times'] as List)
+              .map((t) => t.toString())
+              .toList();
+          setState(() {
+            _availableTimes = times.isEmpty ? _fallbackTimes : times;
+          });
+          return;
+        }
+      }
 
       final response = await http.post(
         Uri.parse('$agentUrl/api/fetch-tee-times'),
@@ -414,6 +439,14 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       appBar: AppBar(
         title: const Text('Sniper Booking Wizard'),
         actions: [
+          if (kDebugMode)
+            TextButton(
+              onPressed: _sniperTestRunning ? null : _runSniperTest,
+              child: Text(
+                _sniperTestRunning ? 'Testing...' : 'Sniper Test (4m)',
+                style: const TextStyle(color: Colors.white),
+              ),
+            ),
           TextButton(
             onPressed: _saveJob,
             child: const Text('Save',
@@ -490,20 +523,120 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         children: [
           Expanded(
             child: OutlinedButton(
-              onPressed: _currentPage == 0 ? null : _prevPage,
+              onPressed: _currentPage == 0 || _isNextBusy ? null : _prevPage,
               child: const Text('Back'),
             ),
           ),
           const SizedBox(width: 12),
           Expanded(
             child: ElevatedButton(
-              onPressed: _currentPage == 4 ? _saveJob : _nextPage,
-              child: Text(_currentPage == 4 ? 'Create Job' : 'Continue'),
+              onPressed:
+                  _isNextBusy ? null : (_currentPage == 4 ? _saveJob : _nextPage),
+              child: _isNextBusy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Text(_currentPage == 4 ? 'Create Job' : 'Continue'),
             ),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _loadLastSniperTestJob() async {
+    final prefs = await SharedPreferences.getInstance();
+    final jobId = prefs.getString('last_sniper_test_job_id');
+    if (jobId == null || jobId.isEmpty) return;
+    setState(() => _sniperTestJobId = jobId);
+    _startSniperTestPolling(jobId);
+  }
+
+  Future<void> _runSniperTest() async {
+    if (_sniperTestRunning) return;
+    final username = _brsUsernameController.text.trim();
+    final password = _brsPasswordController.text;
+    if (username.isEmpty || password.isEmpty) {
+      _showSnack('Enter BRS credentials first');
+      return;
+    }
+    final targetDate = _targetPlayDate ?? DateTime.now();
+    if (_preferredTimes.isEmpty && _availableTimes.isEmpty) {
+      _showSnack('Select a preferred time first');
+      return;
+    }
+    final time =
+        _preferredTimes.isNotEmpty ? _preferredTimes.first : _availableTimes.first;
+
+    setState(() {
+      _sniperTestRunning = true;
+      _sniperTestStatus = 'Scheduling 4-min test...';
+    });
+
+    try {
+      final baseUrl = await getAgentBaseUrl();
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/sniper-test'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'username': username,
+          'password': password,
+          'targetDate': DateFormat('yyyy-MM-dd').format(targetDate),
+          'preferredTimes': [time],
+          'players': _selectedPlayerIds,
+          'partySize': _partySize,
+          'minutes': 4,
+        }),
+      );
+      if (response.statusCode != 200) {
+        throw Exception('Agent error ${response.statusCode}');
+      }
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (data['success'] != true) {
+        throw Exception(data['error'] ?? 'Sniper test failed');
+      }
+      final jobId = data['jobId']?.toString();
+      if (jobId == null || jobId.isEmpty) {
+        throw Exception('Missing jobId');
+      }
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('last_sniper_test_job_id', jobId);
+      setState(() {
+        _sniperTestJobId = jobId;
+        _sniperTestStatus = 'Scheduled. Waiting...';
+      });
+      _startSniperTestPolling(jobId);
+    } catch (e) {
+      _showSnack('Sniper test failed: $e');
+      setState(() => _sniperTestStatus = 'Failed: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _sniperTestRunning = false);
+      }
+    }
+  }
+
+  void _startSniperTestPolling(String jobId) {
+    _sniperTestPoller?.cancel();
+    _sniperTestPoller = Timer.periodic(const Duration(seconds: 2), (_) async {
+      try {
+        final baseUrl = await getAgentBaseUrl();
+        final resp = await http.get(Uri.parse('$baseUrl/api/jobs/$jobId'));
+        if (resp.statusCode != 200) return;
+        final data = jsonDecode(resp.body) as Map<String, dynamic>;
+        if (data['success'] != true) return;
+        final status = data['status']?.toString() ?? 'unknown';
+        if (!mounted) return;
+        setState(() {
+          _sniperTestStatus = 'Status: $status';
+        });
+        if (status == 'success' || status == 'failed') {
+          _sniperTestPoller?.cancel();
+        }
+      } catch (_) {}
+    });
   }
 
   Widget _buildCredentialsPage() {
@@ -561,6 +694,38 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           ),
           const SizedBox(height: 24),
           _buildAgentConnectionRow(),
+          if (kDebugMode && _sniperTestJobId != null) ...[
+            const SizedBox(height: 16),
+            Card(
+              color: Colors.blueGrey.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Sniper Test Status',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Job: $_sniperTestJobId',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    if (_sniperTestStatus != null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        _sniperTestStatus!,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              color: Colors.blueGrey.shade700,
+                            ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -783,25 +948,25 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         children: [
           const Icon(Icons.group, size: 56, color: Colors.redAccent),
           const SizedBox(height: 16),
-          Text('Party Size',
+          Text('Additional Players',
               style: Theme.of(context)
                   .textTheme
                   .headlineSmall
                   ?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
-          Text('How many players are in the group? (Player 1 is you)',
+          Text('How many additional players?',
               style: Theme.of(context).textTheme.bodyMedium),
           const SizedBox(height: 24),
           Wrap(
             spacing: 12,
-            children: [2, 3, 4]
+            children: [0, 1, 2, 3]
                 .map((count) => ChoiceChip(
                       label: Text('$count'),
-                      selected: _playerCount == count,
+                      selected: _additionalPlayerCount == count,
                       onSelected: (_) {
                         setState(() {
-                          _playerCount = count;
-                          final maxAdditional = _playerCount - 1;
+                          _additionalPlayerCount = count;
+                          final maxAdditional = _additionalPlayerCount;
                           if (_selectedPlayerIds.length > maxAdditional) {
                             _selectedPlayerIds =
                                 _selectedPlayerIds.sublist(0, maxAdditional);
@@ -813,7 +978,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           ),
           const SizedBox(height: 16),
           Text(
-            'You will select up to ${_playerCount - 1} additional player(s).',
+            'You will select up to $_additionalPlayerCount additional player(s).',
             style: Theme.of(context)
                 .textTheme
                 .bodySmall
@@ -839,7 +1004,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                   ?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           Text(
-              'Choose up to ${_playerCount - 1} additional player(s) from your club directory',
+              'Choose up to $_additionalPlayerCount additional player(s) from your club directory',
               style: Theme.of(context).textTheme.bodyMedium),
           const SizedBox(height: 12),
           if (_currentUserName != null && _currentUserName!.isNotEmpty)
@@ -857,7 +1022,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               setState(() => _selectedPlayerIds = updated);
             },
             onAddPlayers: _showPlayerSelector,
-            maxPlayers: _playerCount - 1,
+            maxPlayers: _additionalPlayerCount,
           ),
           if (_isRefreshingPlayers) ...[
             const SizedBox(height: 8),
@@ -1011,7 +1176,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       initialSelectedIds: _selectedPlayerIds,
       returnIds: true,
       allowedCategories: const ['You and your buddies', 'Other club members'],
-      maxPlayers: _playerCount - 1,
+      maxPlayers: _additionalPlayerCount,
       username: _brsUsernameController.text.trim(),
       password: _brsPasswordController.text,
     );
