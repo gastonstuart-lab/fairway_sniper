@@ -79,6 +79,10 @@ Endpoints:
 
 #### Flutter App
 
+## Release Snipe
+
+See [docs/RELEASE_SNIPE_READINESS.md](docs/RELEASE_SNIPE_READINESS.md) for a complete, repo-grounded readiness pack and implementation plan for the /api/release-snipe endpoint and sub-200ms release-night booking.
+
 ```powershell
 flutter run -d chrome
 # or
