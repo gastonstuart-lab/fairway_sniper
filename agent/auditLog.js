@@ -1,9 +1,19 @@
 import fs from 'fs';
 import path from 'path';
 
-export async function appendNdjson(filePath, obj) {
-  const dir = path.dirname(filePath);
-  await fs.promises.mkdir(dir, { recursive: true }).catch(() => {});
-  const line = JSON.stringify(obj) + '\n';
-  await fs.promises.appendFile(filePath, line, 'utf8');
+const logDir = path.join(process.cwd(), 'logs');
+const logFile = path.join(logDir, 'release-snipe.ndjson');
+let warned = false;
+
+export async function appendAudit(event) {
+  try {
+    await fs.promises.mkdir(logDir, { recursive: true });
+    const line = JSON.stringify(event) + '\n';
+    await fs.promises.appendFile(logFile, line, 'utf8');
+  } catch (err) {
+    if (!warned) {
+      console.warn('audit append failed', err?.message || err);
+      warned = true;
+    }
+  }
 }

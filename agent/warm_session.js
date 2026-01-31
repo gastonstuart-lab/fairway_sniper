@@ -11,12 +11,17 @@ let warmContext = null;
 let warmPage = null;
 let inflightInit = null;
 let lastTargetDate = null;
+let keepAliveTimer = null;
+let lastKeepAliveAt = null;
 let status = {
   warm: false,
   authenticated: false,
   teeSheetLoaded: false,
   targetDate: null,
   lastError: null,
+  lastKeepAliveAt: null,
+  contextAlive: false,
+  pageUrl: null,
 };
 
 const DEFAULT_LOGIN_URL =
@@ -68,7 +73,9 @@ async function isAuthenticated(page) {
     .catch(() => false);
   if (logout) return true;
   const tee = await page
-    .locator('a[href*="tee-sheet"], a:has-text("Tee Sheet"), button:has-text("Book")')
+    .locator(
+      'a[href*="tee-sheet"], a:has-text("Tee Sheet"), button:has-text("Book")',
+    )
     .first()
     .isVisible()
     .catch(() => false);
@@ -124,9 +131,7 @@ async function performLogin(page, loginUrl, username, password) {
     .first();
   await loginButton.click({ timeout: 10000 }).catch(() => {});
 
-  await page
-    .waitForURL(/(?!.*\/login)/, { timeout: 20000 })
-    .catch(() => {});
+  await page.waitForURL(/(?!.*\/login)/, { timeout: 20000 }).catch(() => {});
 
   // Final auth check
   const authed = await isAuthenticated(page);
@@ -137,7 +142,11 @@ async function performLogin(page, loginUrl, username, password) {
   status.authenticated = true;
 }
 
-async function ensureLoggedIn(username, password, loginUrl = DEFAULT_LOGIN_URL) {
+async function ensureLoggedIn(
+  username,
+  password,
+  loginUrl = DEFAULT_LOGIN_URL,
+) {
   await ensureContext();
   const page = warmPage;
 
@@ -157,11 +166,25 @@ async function waitForTeeSheet(page, timeout = 25000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     // Any tee sheet row
-    if ((await page.locator('tr').count().catch(() => 0)) > 0) return true;
+    if (
+      (await page
+        .locator('tr')
+        .count()
+        .catch(() => 0)) > 0
+    )
+      return true;
     // Any visible time
-    if ((await page.locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/').count().catch(() => 0)) > 0) return true;
+    if (
+      (await page
+        .locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/')
+        .count()
+        .catch(() => 0)) > 0
+    )
+      return true;
     // Any tee-sheet container
-    const teeSheetShell = page.locator('[data-tee-sheet], .tee-sheet, #tee-sheet, [aria-label*="tee sheet" i], section:has-text("tee sheet"), div:has-text("Booking")');
+    const teeSheetShell = page.locator(
+      '[data-tee-sheet], .tee-sheet, #tee-sheet, [aria-label*="tee sheet" i], section:has-text("tee sheet"), div:has-text("Booking")',
+    );
     if (await teeSheetShell.isVisible().catch(() => false)) return true;
     await page.waitForTimeout(100);
   }
@@ -186,7 +209,11 @@ export async function waitForBookingReleaseObserver(page, timeoutMs = 2000) {
       const observer = new MutationObserver((mutations) => {
         for (const m of mutations) {
           for (const node of m.addedNodes) {
-            if (node.nodeType === 1 && node.matches && node.matches('a[href*="/bookings/book"]')) {
+            if (
+              node.nodeType === 1 &&
+              node.matches &&
+              node.matches('a[href*="/bookings/book"]')
+            ) {
               finish(node);
               return;
             }
@@ -249,10 +276,12 @@ export async function getWarmPage(targetDate, username, password) {
   }
   await inflightInit;
   status.warm = !!warmContext && !warmContext.isClosed?.();
+  startKeepAlive();
   return warmPage;
 }
 
 export async function closeWarmSession() {
+  stopKeepAlive();
   if (warmContext && !warmContext.isClosed?.()) {
     log('closing warm session');
     await warmContext.close().catch(() => {});
@@ -265,15 +294,82 @@ export async function closeWarmSession() {
     teeSheetLoaded: false,
     targetDate: null,
     lastError: null,
+    lastKeepAliveAt: null,
+    contextAlive: false,
+    pageUrl: null,
   };
+  lastKeepAliveAt = null;
 }
 
 export function getWarmStatus() {
+  const contextAlive = !!warmContext && !warmContext.isClosed?.();
+  const pageUrl = warmPage?.url?.();
   return {
     warm: status.warm,
     authenticated: status.authenticated,
     teeSheetLoaded: status.teeSheetLoaded,
     targetDate: status.targetDate,
     lastError: status.lastError,
+    lastKeepAliveAt,
+    contextAlive,
+    pageUrl,
   };
+}
+
+async function keepaliveTick() {
+  const contextAlive = !!warmContext && !warmContext.isClosed?.();
+  if (!contextAlive || !warmPage) {
+    status.warm = false;
+    status.authenticated = false;
+    status.teeSheetLoaded = false;
+    status.contextAlive = false;
+    // Do not set lastError if missing, keep it null
+    return;
+  }
+
+  lastKeepAliveAt = Date.now();
+
+  try {
+    // cheap ping to keep session alive
+    await warmPage.evaluate(() => document.title).catch(() => {});
+    status.contextAlive = true;
+    status.pageUrl = warmPage.url?.();
+
+    // cheap auth heuristic (no navigation)
+    const authed = await isAuthenticated(warmPage).catch(() => false);
+    status.authenticated = authed;
+
+    // tee sheet presence without heavy queries
+    const url = warmPage.url();
+    const onSheet =
+      typeof url === 'string' &&
+      status.targetDate &&
+      url.includes(status.targetDate) &&
+      url.includes('/tee-sheet/');
+    if (onSheet) {
+      const anyRow = await warmPage.locator('tr').first().isVisible().catch(() => false);
+      status.teeSheetLoaded = anyRow || status.teeSheetLoaded;
+    }
+
+    status.lastError = null;
+    status.warm = true;
+  } catch (err) {
+    status.lastError = err?.message || String(err);
+    status.contextAlive = false;
+  }
+}
+
+export function startKeepAlive(options = {}) {
+  const { intervalMs = 30000 } = options;
+  if (keepAliveTimer) return;
+  keepAliveTimer = setInterval(() => {
+    keepaliveTick().catch(() => {});
+  }, intervalMs);
+}
+
+export function stopKeepAlive() {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
 }
