@@ -1,10 +1,62 @@
-# Logs
-logs
+# Node/Playwright/automation artifacts (root)
+node_modules/
+logs/
+output/
+build/
+dist/
+test-results/
+playwright-report/
+.playwright/
+.cache/
+.cache/ms-playwright/
+downloads/
+screenshots/
+*.zip
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-lerna-debug.log*
+*.ndjson
+.last-run.json
+scripts/
+ersstuarProjectsfairway_sniper
+# Node, build, and output artifacts
+node_modules/
+output/
+logs/
+build/
+test-results/
+.session/
+*.zip
+*.log
+*.tmp
+*.cache
+*.bak
+*.DS_Store
+# Ignore all .env files except example
+.env
+.env.*
+!.env.example
+node_modules/
+logs/
+output/
+build/
+test-results/
+.session/
+dist/
+automation/test-results/
+android/.gradle/
+ios/Flutter/ephemeral/
+.dart_tool/
+*.zip
+*.apk
+*.dill
+*.log
+*.png
+*.cache
+*.bak
+*.tmp
+.DS_Store
+.env
+.env.*
+!.env.example
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
