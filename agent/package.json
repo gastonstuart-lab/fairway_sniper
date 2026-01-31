@@ -6,12 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "start:boot": "node boot.js",
-    "test": "node index.js --dry-run",
-    "test:fetch": "powershell -ExecutionPolicy Bypass -File ./scripts/test-fetch.ps1",
-    "test:player-directory": "pwsh -NoProfile -File ./test-fetch-player-directory.ps1",
-    "test:snipe-check": "pwsh -NoProfile -Command \"$body = @{ username = $env:BRS_USERNAME; password = $env:BRS_PASSWORD; targetDate = (Get-Date).ToString('yyyy-MM-dd'); preferredTimes = @(); players = @(); checkOnly = $true } | ConvertTo-Json; Invoke-RestMethod -Uri 'http://localhost:3000/api/snipe' -Method Post -ContentType 'application/json' -Body $body | ConvertTo-Json -Depth 6\"",
-    "test:snipe-preview": "pwsh -NoProfile -Command \"$body = @{ username = $env:BRS_USERNAME; password = $env:BRS_PASSWORD; targetDate = (Get-Date).ToString('yyyy-MM-dd'); preferredTimes = @(); players = @(); previewBooking = $true } | ConvertTo-Json; Invoke-RestMethod -Uri 'http://localhost:3000/api/snipe' -Method Post -ContentType 'application/json' -Body $body | ConvertTo-Json -Depth 6\""
+    "dev": "node index.js",
+    "verify:health": "pwsh -ExecutionPolicy Bypass -File ./scripts/verify-health.ps1",
+    "verify:release": "pwsh -ExecutionPolicy Bypass -File ./RELEASE_SNIPE_VERIFICATION.ps1",
+    "cleanup": "pwsh -ExecutionPolicy Bypass -File ./scripts/cleanup.ps1"
   },
   "dependencies": {
     "@playwright/test": "^1.57.0",

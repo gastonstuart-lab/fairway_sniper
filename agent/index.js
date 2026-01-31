@@ -1,4 +1,15 @@
 import 'dotenv/config';
+
+// === Directory Guard: Ensure running from agent directory ===
+import fs from 'fs';
+import path from 'path';
+const cwd = process.cwd();
+const expected = path.basename(cwd).toLowerCase() === 'agent';
+const hasPkg = fs.existsSync(path.join(cwd, 'package.json'));
+if (!expected || !hasPkg) {
+  console.error('\n[ERROR] Wrong directory. Run: cd <repo>\\agent && node index.js');
+  process.exit(1);
+}
 import fs from 'fs';
 import path from 'path';
 
