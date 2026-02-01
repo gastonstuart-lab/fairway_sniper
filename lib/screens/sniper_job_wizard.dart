@@ -7,7 +7,6 @@ import 'package:fairway_sniper/models/booking_job.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/player_directory_service.dart';
 import 'package:fairway_sniper/services/agent_base_url.dart';
-import 'package:fairway_sniper/services/availability_cache_service.dart';
 import 'package:fairway_sniper/widgets/player_selector_modal.dart';
 import 'package:fairway_sniper/widgets/player_list_editor.dart';
 import 'package:intl/intl.dart';
@@ -24,7 +23,6 @@ class SniperJobWizard extends StatefulWidget {
 class _SniperJobWizardState extends State<SniperJobWizard> {
   final _firebaseService = FirebaseService();
   late final PlayerDirectoryService _playerDirectoryService;
-  final _availabilityCacheService = AvailabilityCacheService();
   final _pageController = PageController();
   int _currentPage = 0;
 
@@ -65,9 +63,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   int get _partySize => _additionalPlayerCount + 1;
   bool _agentHealthOk = true;
   String? _agentHealthBaseUrl;
+  bool _skipCredsDone = false;
 
   final List<String> _fallbackTimes = [
-    '08:00',
     '08:10',
     '08:20',
     '08:30',
@@ -116,10 +114,23 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     '15:40',
     '15:50',
     '16:00',
-    '16:10',
-    '16:20',
-    '16:30'
+    '16:10'
   ];
+
+  List<String> _sniperGridTimes() {
+    return List<String>.from(_fallbackTimes);
+  }
+
+  void _maybeSkipCreds() {
+    if (_skipCredsDone) return;
+    if (_savedCreds != null && _useSavedCreds) {
+      if (_pageController.hasClients) {
+        _skipCredsDone = true;
+        _pageController.jumpToPage(1);
+        setState(() => _currentPage = 1);
+      }
+    }
+  }
 
   @override
   void initState() {
@@ -150,6 +161,11 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         _brsUsernameController.text = creds['username'] ?? '';
         _brsPasswordController.text = creds['password'] ?? '';
       }
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _maybeSkipCreds();
     });
   }
 
@@ -371,29 +387,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       agentUrl = await getAgentBaseUrl();
       final dateStr = DateFormat('yyyy-MM-dd').format(date);
 
-      // Try cached availability first
-      final cacheKey = _availabilityCacheService.buildKey(
-        baseUrl: agentUrl,
-        username: _brsUsernameController.text.trim(),
-        days: 5,
-        club: _club,
-      );
-      final cached = _availabilityCacheService.getFresh(cacheKey);
-      if (cached != null) {
-        final cachedDay = cached.days.firstWhere(
-          (d) => d['date']?.toString() == dateStr,
-          orElse: () => {},
-        );
-        if (cachedDay.isNotEmpty && cachedDay['times'] is List) {
-          final times = (cachedDay['times'] as List)
-              .map((t) => t.toString())
-              .toList();
-          setState(() {
-            _availableTimes = times.isEmpty ? _fallbackTimes : times;
-          });
-          return;
-        }
-      }
+      // Sniper mode should always live-check the selected date
+      // to avoid showing stale or wrong-day availability.
 
       final response = await http.post(
         Uri.parse('$agentUrl/api/fetch-tee-times'),
@@ -402,6 +397,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           'date': dateStr,
           'username': _brsUsernameController.text.trim(),
           'password': _brsPasswordController.text,
+          'includeUnavailable': true,
         }),
       );
 
@@ -411,13 +407,32 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         final data = jsonDecode(response.body);
         final List<dynamic> times = data['times'] ?? [];
 
-        setState(() {
-          _availableTimes = times.cast<String>();
+        List<String> normalizeTimes(List<dynamic> raw) {
+          final cleaned = raw
+              .map((t) => t.toString().trim())
+              .where((t) => RegExp(r'^\d{1,2}:\d{2}$').hasMatch(t))
+              .map((t) => t.padLeft(5, '0'))
+              .toSet()
+              .toList();
+          cleaned.sort();
 
-          if (_availableTimes.isEmpty) {
-            // For sniper mode, use fallback times since target date isn't released yet
-            _availableTimes = _fallbackTimes;
-          }
+          if (cleaned.isEmpty) return _fallbackTimes;
+
+          final fallbackSet = _fallbackTimes.toSet();
+          final inFallback = cleaned.where(fallbackSet.contains).toList();
+
+          final looksLikeFallback =
+              inFallback.length >= (_fallbackTimes.length * 0.8) &&
+              inFallback.contains('08:10') &&
+              inFallback.contains('16:10');
+
+          return looksLikeFallback ? inFallback : _fallbackTimes;
+        }
+
+        setState(() {
+          _availableTimes = normalizeTimes(times);
+          _preferredTimes.removeWhere(
+              (t) => !_fallbackTimes.contains(t));
         });
       } else {
         throw Exception('Agent returned ${response.statusCode} at $agentUrl');
@@ -435,6 +450,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
 
   @override
   Widget build(BuildContext context) {
+    _maybeSkipCreds();
     return Scaffold(
       appBar: AppBar(
         title: const Text('Sniper Booking Wizard'),
@@ -880,6 +896,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   }
 
   Widget _buildPreferredTimesPage() {
+    final displayTimes = _sniperGridTimes();
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
       child: Column(
@@ -924,7 +941,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           Wrap(
             spacing: 8,
             runSpacing: 8,
-            children: _availableTimes
+            children: displayTimes
                 .where((t) => !_preferredTimes.contains(t))
                 .map((t) => ActionChip(
                       label: Text(t),
@@ -1175,7 +1192,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       directoryService: _playerDirectoryService,
       initialSelectedIds: _selectedPlayerIds,
       returnIds: true,
-      allowedCategories: const ['You and your buddies', 'Other club members'],
+      allowedCategories: const ['You', 'You and your buddies', 'Members', 'Guests'],
       maxPlayers: _additionalPlayerCount,
       username: _brsUsernameController.text.trim(),
       password: _brsPasswordController.text,

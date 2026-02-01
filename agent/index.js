@@ -78,7 +78,7 @@ app.get('/api/self-check', (req, res) => {
 app.post('/api/fetch-tee-times', async (req, res) => {
   let browser;
   try {
-    const { date, username, password, club, reuseBrowser = true } = req.body || {};
+    const { date, username, password, club, reuseBrowser = true, includeUnavailable = false } = req.body || {};
     if (!date || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing date/username/password' });
     }
@@ -100,7 +100,7 @@ app.post('/api/fetch-tee-times', async (req, res) => {
       if (browser) await browser.close();
       return res.json({ success: true, date, count: 0, times: [], slots: [] });
     }
-    const { times, slots } = await scrapeAvailableTimes(page);
+    const { times, slots } = await scrapeAvailableTimes(page, { includeUnavailable });
 
     if (browser) await browser.close();
     return res.json({ success: true, date, count: times.length, times, slots });
@@ -945,7 +945,7 @@ async function navigateToTeeSheet(page, date, allowHop = true) {
   throw new Error('No tee sheet detected after several day hops');
 }
 
-async function scrapeAvailableTimes(page) {
+async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   const bookableMap = new Map();
   const timeRegex = /\b(\d{1,2}:\d{2})\b/;
@@ -1165,7 +1165,8 @@ async function scrapeAvailableTimes(page) {
         .elementHandles();
 
       for (const handle of timeHandles) {
-        const row = await handle.evaluate((timeEl) => {
+        const row = await handle.evaluate((timeEl, opts) => {
+          const { includeUnavailable } = opts || {};
           const timeRegex = /\b(\d{1,2}:\d{2})\b/;
           const ignore = [
             'member',
@@ -1310,7 +1311,7 @@ async function scrapeAvailableTimes(page) {
 
           const buttons = Array.from(row.querySelectorAll('button, a, [role="button"]'));
           const hasBook = buttons.some((b) => /\bbook( now)?\b/i.test(b.textContent || ''));
-          if (!hasBook) return null;
+          if (!hasBook && !includeUnavailable) return null;
 
           const playerText = stripToPlayers(text || '');
           const names = extractNames(playerText);
@@ -1369,8 +1370,9 @@ async function scrapeAvailableTimes(page) {
               ? Math.max(0, totalSlots - filled)
               : null;
 
-          return { time, status: 'bookable', openSlots, totalSlots };
-        }, handle);
+          const status = hasBook ? 'bookable' : 'unavailable';
+          return { time, status, openSlots, totalSlots };
+        }, handle, { includeUnavailable });
 
         if (!row) continue;
         const time = String(row.time || '').padStart(5, '0');
