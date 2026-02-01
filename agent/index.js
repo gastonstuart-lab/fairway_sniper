@@ -14,6 +14,20 @@ async function waitForBookingRelease(page, timeoutMs = 2000) {
     return new Promise((resolve) => {
       let done = false;
       const start = Date.now();
+      const existing = document.querySelector('a[href*="/bookings/book"]');
+      if (existing) {
+        const slotText = existing.textContent || '';
+        const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
+        const slotTime = match ? match[1] : null;
+        console.log('[SNIPER] Booking link already present; using immediate match');
+        resolve({
+          found: true,
+          elapsedMs: 0,
+          slotTime,
+          immediate: true,
+        });
+        return;
+      }
       const observer = new MutationObserver(() => {
         if (done) return;
         const link = document.querySelector('a[href*="/bookings/book"]');
