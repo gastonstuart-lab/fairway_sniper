@@ -94,6 +94,12 @@ app.post('/api/fetch-tee-times', async (req, res) => {
     }
 
     await navigateToTeeSheet(page, date, false);
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(300);
+    if (!pageMatchesDate(page, new Date(date))) {
+      if (browser) await browser.close();
+      return res.json({ success: true, date, count: 0, times: [], slots: [] });
+    }
     const { times, slots } = await scrapeAvailableTimes(page);
 
     if (browser) await browser.close();
