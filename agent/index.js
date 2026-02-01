@@ -7,6 +7,8 @@ import fs from 'fs';
 import path from 'path';
 import { DateTime } from 'luxon';
 import * as warmSession from './warm_session.js';
+import os from 'os';
+import crypto from 'crypto';
 
 // --- Release watcher: Wait for first booking link to appear ---
 async function waitForBookingRelease(page, timeoutMs = 2000) {
@@ -695,6 +697,253 @@ async function fsGetActiveSniperJobs(limit = 5) {
   }
 }
 
+const JOBS_COLLECTION = 'jobs';
+const READY_JOB_STATUSES = ['active', 'queued', 'accepted', 'pending'];
+const RUNNER_POLL_MS = 2000;
+const AGENT_ID = `${os.hostname()}:${process.pid}`;
+const jobTimers = new Map();
+
+function makeRunId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function getJobStatus(job) {
+  const raw = job?.status || job?.state || '';
+  return String(raw || '').toLowerCase();
+}
+
+function isReadyJob(job) {
+  if (!job) return false;
+  const status = getJobStatus(job);
+  const state = String(job.state || '').toLowerCase();
+  const mode = String(job.mode || job.bookingMode || '').toLowerCase();
+  if (mode && mode !== 'sniper') return false;
+  if (['running', 'finished', 'error'].includes(state)) return false;
+  return READY_JOB_STATUSES.includes(status);
+}
+
+function getFireTimeFromJob(job) {
+  return (
+    toDateMaybe(job.fireTimeUtc) ||
+    toDateMaybe(job.fire_time_utc) ||
+    toDateMaybe(job.release_window_start) ||
+    toDateMaybe(job.next_fire_time_utc) ||
+    toDateMaybe(job.nextFireTimeUtc)
+  );
+}
+
+async function fsClaimSniperJob(jobId) {
+  if (!db) return null;
+  const ref = db.collection(JOBS_COLLECTION).doc(jobId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
+      const data = snap.data() || {};
+      if (!isReadyJob(data)) return null;
+      const existingClaim = data.claimed_by || data.claimedBy || null;
+      if (existingClaim && existingClaim !== AGENT_ID) return null;
+      const runId = makeRunId();
+      tx.update(ref, {
+        status: 'running',
+        state: 'running',
+        claimed_at: admin.firestore.FieldValue.serverTimestamp(),
+        claimed_by: AGENT_ID,
+        run_id: runId,
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { id: snap.id, ...data, run_id: runId };
+    });
+  } catch (error) {
+    console.error('Error claiming job:', error);
+    return null;
+  }
+}
+
+async function markJobError(jobId, message) {
+  await fsUpdateJob(jobId, {
+    status: 'error',
+    state: 'error',
+    error_message: message,
+    finished_at: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function scheduleClaimedJob(job) {
+  const jobId = job.id;
+  if (!jobId) return;
+  if (jobTimers.has(jobId)) return;
+
+  const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+  if (!targetPlayDate) {
+    await markJobError(jobId, 'missing-target-play-date');
+    return;
+  }
+
+  const fireTime = getFireTimeFromJob(job) || computeNextFireUTC(
+    job.release_day || job.releaseDay,
+    job.release_time_local || job.releaseTimeLocal,
+    job.tz || job.timezone || CONFIG.TZ_LONDON,
+  );
+
+  const fireMs = fireTime?.getTime?.() ? fireTime.getTime() : null;
+  if (!fireMs || Number.isNaN(fireMs)) {
+    await markJobError(jobId, 'missing-fire-time');
+    return;
+  }
+
+  const now = Date.now();
+  const delayMs = Math.max(0, fireMs - now);
+  const scheduleAt = new Date(fireMs);
+
+  console.log(`[RUNNER] Fire time resolved for ${jobId}: ${scheduleAt.toISOString()} (in ${delayMs}ms)`);
+
+  await fsUpdateJob(jobId, {
+    scheduled_for: admin.firestore.Timestamp.fromDate(scheduleAt),
+    warm_state: 'warming',
+  });
+
+  let warmPage = null;
+  try {
+    const username = job.brs_email || job.brsEmail || job.username;
+    const password = job.brs_password || job.brsPassword || job.password;
+    if (!username || !password) {
+      await markJobError(jobId, 'missing-credentials');
+      return;
+    }
+    console.log(`[RUNNER] Warm start ${jobId}`);
+    warmPage = await warmSession.getWarmPage(targetPlayDate, username, password);
+    await fsUpdateJob(jobId, { warm_state: 'warmed' });
+    console.log(`[RUNNER] Warm success ${jobId}`);
+  } catch (error) {
+    await fsUpdateJob(jobId, { warm_state: 'warm_error', warm_error: error?.message || String(error) });
+    console.log(`[RUNNER] Warm fail ${jobId}: ${error?.message || error}`);
+  }
+
+  console.log(`[RUNNER] Scheduling run for ${jobId} in ${delayMs}ms`);
+  const timeoutId = setTimeout(async () => {
+    jobTimers.delete(jobId);
+    try {
+      const ownerUid = job.ownerUid || job.owner_uid || 'unknown';
+      const username = job.brs_email || job.brsEmail || job.username;
+      const password = job.brs_password || job.brsPassword || job.password;
+      const preferredTimes = Array.isArray(job.preferred_times)
+        ? job.preferred_times
+        : Array.isArray(job.preferredTimes)
+          ? job.preferredTimes
+          : [];
+      const players = Array.isArray(job.players) ? job.players : [];
+      const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
+      const pushToken = job.push_token || job.pushToken;
+
+      console.log(`[RUNNER] runBooking start ${jobId}`);
+      const result = await runBooking({
+        jobId,
+        ownerUid,
+        loginUrl: CONFIG.CLUB_LOGIN_URL,
+        username,
+        password,
+        preferredTimes,
+        targetFireTime: fireMs,
+        targetPlayDate: targetPlayDate,
+        players,
+        partySize,
+        slotsData: [],
+        warmPage,
+        useReleaseObserver: true,
+        pushToken,
+      });
+
+      console.log(`[RUNNER] runBooking finished ${jobId} booked=${result?.bookedTime || 'n/a'}`);
+      await fsUpdateJob(jobId, {
+        status: 'finished',
+        state: 'finished',
+        result: result?.result || (result?.success ? 'success' : 'failed'),
+        booked_time: result?.bookedTime || null,
+        finished_at: admin.firestore.FieldValue.serverTimestamp(),
+        error_message: result?.success ? null : result?.error || null,
+      });
+    } catch (error) {
+      console.log(`[RUNNER] runBooking error ${jobId}: ${error?.message || error}`);
+      await markJobError(jobId, error?.message || String(error));
+    }
+  }, delayMs);
+
+  jobTimers.set(jobId, timeoutId);
+}
+
+async function handleReadyJob(job) {
+  if (!job?.id) return;
+  console.log(`[RUNNER] Job detected ${job.id}`);
+  const claimed = await fsClaimSniperJob(job.id);
+  if (!claimed) return;
+  console.log(`[RUNNER] Job claimed ${job.id} run_id=${claimed.run_id || 'n/a'}`);
+  await scheduleClaimedJob({ ...job, ...claimed });
+}
+
+async function resumeRunningJobs() {
+  if (!db) return;
+  try {
+    const snapshot = await db
+      .collection(JOBS_COLLECTION)
+      .where('status', '==', 'running')
+      .where('claimed_by', '==', AGENT_ID)
+      .get();
+    if (snapshot.empty) return;
+
+    const now = Date.now();
+    for (const doc of snapshot.docs) {
+      const job = { id: doc.id, ...doc.data() };
+      const fireTime = getFireTimeFromJob(job);
+      const fireMs = fireTime?.getTime?.() ? fireTime.getTime() : null;
+      if (fireMs && fireMs > now) {
+        await scheduleClaimedJob(job);
+      } else {
+        await markJobError(job.id, 'agent restart during run');
+      }
+    }
+  } catch (error) {
+    console.error('Error resuming running jobs:', error);
+  }
+}
+
+function startSniperRunner() {
+  if (!db) {
+    console.log('[RUNNER] Firebase Admin not configured; runner disabled');
+    return;
+  }
+  console.log('[RUNNER] Sniper job runner started');
+  resumeRunningJobs().catch((e) => console.error('[RUNNER] resume error:', e.message));
+
+  const query = db
+    .collection(JOBS_COLLECTION)
+    .where('mode', '==', 'sniper')
+    .where('status', 'in', READY_JOB_STATUSES);
+
+  try {
+    query.onSnapshot((snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added' || change.type === 'modified') {
+          const job = { id: change.doc.id, ...change.doc.data() };
+          if (isReadyJob(job)) {
+            handleReadyJob(job).catch((e) => console.error('[RUNNER] job error:', e.message));
+          }
+        }
+      });
+    }, (err) => {
+      console.error('[RUNNER] onSnapshot error:', err?.message || err);
+    });
+  } catch (error) {
+    console.error('[RUNNER] onSnapshot unavailable, falling back to polling:', error?.message || error);
+    setInterval(() => {
+      fsGetActiveSniperJobs(10)
+        .then((jobs) => jobs.filter(isReadyJob).forEach((job) => handleReadyJob(job)))
+        .catch((e) => console.error('[RUNNER] poll error:', e.message));
+    }, RUNNER_POLL_MS).unref?.();
+  }
+}
+
 function toDateMaybe(value) {
   if (!value) return null;
   if (value instanceof Date) return value;
@@ -796,9 +1045,7 @@ if (process.env.AGENT_RUN_MAIN === 'true') {
   console.log('[SCHEDULER] Background scheduler enabled');
   if (!schedulerRunning) {
     schedulerRunning = true;
-    setInterval(() => {
-      schedulerTick().catch((e) => console.error('[SCHEDULER] tick error:', e.message));
-    }, 15000).unref?.();
+    startSniperRunner();
   }
 }
 
