@@ -50,11 +50,302 @@ const agentDir = path.dirname(__filename);
 
 // === [AGENT] index.js starting (cleaned up) ===
 const app = express();
+
 app.use(cors());
 app.use(express.json());
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'fairway-sniper-agent' });
+});
+
 // Debug endpoint for warm session status (must be after app is defined)
 app.get('/api/warm-status', (req, res) => {
   res.json(warmSession.getWarmStatus());
+});
+
+// Self-check endpoint for diagnostics
+app.get('/api/self-check', (req, res) => {
+  res.json({
+    file: __filename,
+    cwd: process.cwd(),
+    routes: listRegisteredRoutes(),
+    time: new Date().toISOString(),
+  });
+});
+
+// Fetch available tee times for a single date
+app.post('/api/fetch-tee-times', async (req, res) => {
+  let browser;
+  try {
+    const { date, username, password, club, reuseBrowser = true } = req.body || {};
+    if (!date || !username || !password) {
+      return res.status(400).json({ success: false, error: 'Missing date/username/password' });
+    }
+
+    let page;
+    if (reuseBrowser) {
+      page = await warmSession.getWarmPage(date, username, password);
+    } else {
+      browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+      const context = await browser.newContext();
+      page = await context.newPage();
+      await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+    }
+
+    await navigateToTeeSheet(page, date, false);
+    const { times, slots } = await scrapeAvailableTimes(page);
+
+    if (browser) await browser.close();
+    return res.json({ success: true, date, count: times.length, times, slots });
+  } catch (error) {
+    if (browser) await browser.close().catch(() => {});
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Fetch available tee times across a range of days
+app.post('/api/fetch-tee-times-range', async (req, res) => {
+  let browser;
+  try {
+    const { startDate, days = 5, username, password, club, reuseBrowser = true } = req.body || {};
+    if (!startDate || !username || !password) {
+      return res.status(400).json({ success: false, error: 'Missing startDate/username/password' });
+    }
+
+    const start = new Date(startDate);
+    if (Number.isNaN(start.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid startDate' });
+    }
+
+    let page;
+    if (reuseBrowser) {
+      page = await warmSession.getWarmPage(start, username, password);
+    } else {
+      browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+      const context = await browser.newContext();
+      page = await context.newPage();
+      await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+    }
+
+    const daysInt = Math.max(1, Math.min(14, Number(days) || 5));
+    const results = [];
+    for (let i = 0; i < daysInt; i++) {
+      const target = new Date(start);
+      target.setDate(start.getDate() + i);
+      await navigateToTeeSheet(page, target, false);
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(300);
+      if (!pageMatchesDate(page, target)) {
+        results.push({
+          date: target.toISOString().slice(0, 10),
+          times: [],
+          slots: [],
+        });
+        continue;
+      }
+      const { times, slots } = await scrapeAvailableTimes(page);
+      results.push({
+        date: target.toISOString().slice(0, 10),
+        times,
+        slots,
+      });
+    }
+
+    if (browser) await browser.close();
+    return res.json({ success: true, days: results });
+  } catch (error) {
+    if (browser) await browser.close().catch(() => {});
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Immediate booking endpoint (Normal mode)
+app.post('/api/book-now', async (req, res) => {
+  try {
+    const { username, password, targetDate, preferredTimes, players = [], partySize, pushToken } = req.body || {};
+    if (!username || !password || !targetDate) {
+      return res.status(400).json({ success: false, error: 'Missing username/password/targetDate' });
+    }
+
+    const warmPage = await warmSession.getWarmPage(targetDate, username, password);
+    const result = await runBooking({
+      jobId: `book-now-${Date.now()}`,
+      ownerUid: 'local',
+      loginUrl: CONFIG.CLUB_LOGIN_URL,
+      username,
+      password,
+      preferredTimes: Array.isArray(preferredTimes) ? preferredTimes : [],
+      targetFireTime: Date.now() + 500,
+      targetPlayDate: targetDate,
+      players: Array.isArray(players) ? players : [],
+      partySize,
+      slotsData: [],
+      warmPage,
+      useReleaseObserver: false,
+      pushToken,
+    });
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Player directory endpoint for Flutter app
+app.post('/api/brs/player-directory', async (req, res) => {
+  try {
+    const { username } = req.body || {};
+    const analysisPath = path.join(agentDir, 'inspection-output', 'form-analysis.json');
+    const bookingFormPath = path.join(agentDir, 'inspection-output', 'booking-form.html');
+
+    const normalizeOptLabel = (label) => String(label || '').trim().toLowerCase();
+    const buildPlayer = (value, text) => ({
+      name: String(text || '').trim(),
+      id: String(value || '').trim(),
+      type: String(value || '').trim() === '-2' ? 'guest' : 'member',
+    });
+
+    const parseOptions = (block) => {
+      const optionRegex = /<option[^>]*value="([^"]*)"[^>]*>([^<]*)<\/option>/gi;
+      const list = [];
+      let opt;
+      while ((opt = optionRegex.exec(block)) !== null) {
+        const value = opt[1];
+        const text = opt[2];
+        if (!value || !text) continue;
+        if (String(value).trim() === '') continue;
+        if (String(text).toLowerCase().includes('start typing')) continue;
+        list.push(buildPlayer(value, text));
+      }
+      return list;
+    };
+
+    let categories = [];
+    let players = [];
+    let currentUser = null;
+
+    if (fs.existsSync(bookingFormPath)) {
+      const html = await fs.promises.readFile(bookingFormPath, 'utf8');
+      const currentMemberMatch = html.match(
+        /id="current-member-id"[^>]*data-member-id="([^"]+)"/i
+      );
+      const currentMemberId = currentMemberMatch ? String(currentMemberMatch[1]).trim() : null;
+
+      const selectMatch =
+        html.match(
+          /<select[^>]*id="member_booking_form_player_3"[^>]*>([\s\S]*?)<\/select>/i
+        ) ||
+        html.match(
+          /<select[^>]*id="member_booking_form_player_4"[^>]*>([\s\S]*?)<\/select>/i
+        );
+
+      if (selectMatch) {
+        const selectHtml = selectMatch[1];
+        const optgroupRegex = /<optgroup[^>]*label="([^"]+)"[^>]*>([\s\S]*?)<\/optgroup>/gi;
+        let groupMatch;
+        const groupCategories = [];
+
+        while ((groupMatch = optgroupRegex.exec(selectHtml)) !== null) {
+          const label = groupMatch[1];
+          const block = groupMatch[2];
+          const groupPlayers = parseOptions(block);
+          if (groupPlayers.length === 0) continue;
+
+          const lower = normalizeOptLabel(label);
+          let name = String(label).trim();
+          if (lower.includes('budd')) name = 'You and your buddies';
+          else if (lower.includes('general')) name = 'Guests';
+          else if (lower.includes('other')) name = 'Members';
+          else if (lower.includes('member')) name = 'Members';
+
+          groupCategories.push({ name, players: groupPlayers });
+          players = players.concat(groupPlayers);
+        }
+
+        if (groupCategories.length > 0) {
+          categories = groupCategories;
+          if (currentMemberId) {
+            currentUser = players.find((p) => p.id === currentMemberId) || null;
+          }
+        }
+      }
+    }
+
+    if (categories.length === 0) {
+      if (!fs.existsSync(analysisPath)) {
+        return res.status(404).json({ success: false, error: 'player-directory-not-found' });
+      }
+
+      const raw = await fs.promises.readFile(analysisPath, 'utf8');
+      const data = JSON.parse(raw);
+      const selects = Array.isArray(data?.selectElements) ? data.selectElements : [];
+      let options = [];
+      for (const sel of selects) {
+        if (sel?.id && String(sel.id).includes('member_booking_form_player_')) {
+          const opts = Array.isArray(sel.options) ? sel.options : [];
+          if (opts.length > options.length) options = opts;
+        }
+      }
+
+      players = options
+        .filter((o) => o && o.value !== '' && o.text)
+        .map((o) => buildPlayer(o.value, o.text));
+
+      currentUser = players.find((p) => p.id === String(username)) || null;
+      const guests = players.filter((p) => p.type === 'guest');
+      const members = players.filter((p) => p.type === 'member' && p.id !== currentUser?.id);
+
+      categories = [];
+      if (currentUser) {
+        categories.push({
+          name: 'You',
+          players: [currentUser],
+        });
+      }
+      if (guests.length > 0) {
+        categories.push({
+          name: 'Guests',
+          players: guests,
+        });
+      }
+      categories.push({
+        name: 'Members',
+        players: members,
+      });
+    } else {
+      const guests = players.filter((p) => p.type === 'guest');
+      const members = players.filter((p) => p.type === 'member');
+      const buddies = categories
+        .filter((c) => normalizeOptLabel(c.name).includes('budd'))
+        .flatMap((c) => c.players)
+        .filter((p) => !currentUser || p.id !== currentUser.id);
+
+      const finalCategories = [];
+      if (currentUser) {
+        finalCategories.push({ name: 'You', players: [currentUser] });
+      }
+      if (buddies.length > 0) {
+        finalCategories.push({ name: 'You and your buddies', players: buddies });
+      }
+      if (guests.length > 0) {
+        finalCategories.push({ name: 'Guests', players: guests });
+      }
+      if (members.length > 0) {
+        finalCategories.push({ name: 'Members', players: members });
+      }
+      categories = finalCategories;
+    }
+
+    return res.json({
+      success: true,
+      count: players.length,
+      categories,
+      currentUserName: currentUser?.name ?? null,
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // Global safety nets to keep the process from exiting silently
@@ -195,6 +486,120 @@ function logJobEvent(jobId, message) {
   fs.promises.appendFile(jobLogPath, line).catch(() => {});
 }
 
+function getJob(jobId) {
+  return jobStore.get(jobId) || null;
+}
+
+function setJob(jobId, patch) {
+  const prev = jobStore.get(jobId) || {};
+  const next = {
+    ...prev,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  jobStore.set(jobId, next);
+  return next;
+}
+
+function parseFireTime(minutes, fireTimeUtc) {
+  if (fireTimeUtc) {
+    const t = new Date(fireTimeUtc).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  const mins = Number.isFinite(Number(minutes)) ? Number(minutes) : 4;
+  return Date.now() + mins * 60 * 1000;
+}
+
+async function runSniperJob(jobId, payload) {
+  const {
+    username,
+    password,
+    targetDate,
+    preferredTimes,
+    players = [],
+    partySize,
+    fireTimeUtc,
+    minutes,
+  } = payload;
+
+  const fireTime = parseFireTime(minutes, fireTimeUtc);
+  setJob(jobId, {
+    status: 'queued',
+    scheduledFor: new Date(fireTime).toISOString(),
+    payload: { targetDate, preferredTimes, players, partySize },
+  });
+
+  const delayMs = Math.max(0, fireTime - Date.now());
+  logJobEvent(jobId, `Scheduled for ${new Date(fireTime).toISOString()} (in ${delayMs}ms)`);
+
+  setTimeout(async () => {
+    try {
+      setJob(jobId, { status: 'running', startedAt: new Date().toISOString() });
+      logJobEvent(jobId, 'Starting sniper job');
+
+      const warmPage = await warmSession.getWarmPage(targetDate, username, password);
+
+      const result = await runBooking({
+        jobId,
+        ownerUid: 'sniper-test',
+        loginUrl: CONFIG.CLUB_LOGIN_URL,
+        username,
+        password,
+        preferredTimes: Array.isArray(preferredTimes) ? preferredTimes : [],
+        targetFireTime: fireTime,
+        targetPlayDate: targetDate,
+        players,
+        partySize,
+        slotsData: [],
+        warmPage,
+        useReleaseObserver: false,
+      });
+
+      setJob(jobId, {
+        status: result?.success ? 'success' : 'failed',
+        finishedAt: new Date().toISOString(),
+        result,
+      });
+      logJobEvent(jobId, `Completed with status ${result?.success ? 'success' : 'failed'}`);
+    } catch (error) {
+      setJob(jobId, {
+        status: 'failed',
+        finishedAt: new Date().toISOString(),
+        error: error?.message || String(error),
+      });
+      logJobEvent(jobId, `Failed: ${error?.message || error}`);
+    }
+  }, delayMs);
+}
+
+// Job status endpoint
+app.get('/api/jobs/:jobId', (req, res) => {
+  const jobId = req.params.jobId;
+  const job = getJob(jobId);
+  if (!job) return res.status(404).json({ error: 'job-not-found' });
+  res.json(job);
+});
+
+// Sniper test endpoint
+app.post('/api/sniper-test', async (req, res) => {
+  try {
+    if (jobStore.size >= JOB_MAX_QUEUE) {
+      return res.status(429).json({ error: 'job-queue-full' });
+    }
+    const { username, password, targetDate, preferredTimes, players, partySize, minutes, fireTimeUtc } = req.body || {};
+    if (!username || !password || !targetDate) {
+      return res.status(400).json({ error: 'Missing required fields: username, password, targetDate' });
+    }
+    const jobId = `sniper-${Date.now()}`;
+    setJob(jobId, { status: 'queued', createdAt: new Date().toISOString() });
+    await runSniperJob(jobId, { username, password, targetDate, preferredTimes, players, partySize, minutes, fireTimeUtc });
+    const job = getJob(jobId);
+    res.json({ jobId, scheduledFor: job?.scheduledFor, status: job?.status });
+  } catch (error) {
+    res.status(500).json({ error: error?.message || String(error) });
+  }
+});
+
 function getLondonTimeString(date) {
   return DateTime.fromJSDate(date).setZone(CONFIG.TZ_LONDON).toISO();
 }
@@ -234,6 +639,146 @@ async function fsFinishRun(runId, resultObject) {
     console.log(`Run ${runId} finished with result: ${resultObject.result}`);
   } catch (error) {
     console.error('Error finishing run:', error);
+  }
+}
+
+async function fsUpdateJob(jobId, patch) {
+  if (!db || !jobId) return;
+  try {
+    await db
+      .collection('jobs')
+      .doc(jobId)
+      .update({
+        ...patch,
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+  } catch (error) {
+    console.error('Error updating job:', error);
+  }
+}
+
+async function fsGetActiveSniperJobs(limit = 5) {
+  if (!db) return [];
+  try {
+    const snapshot = await db
+      .collection('jobs')
+      .where('status', '==', 'active')
+      .where('mode', '==', 'sniper')
+      .orderBy('created_at', 'asc')
+      .limit(limit)
+      .get();
+    if (snapshot.empty) return [];
+    return snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+  } catch (error) {
+    console.error('Error fetching active sniper jobs:', error);
+    return [];
+  }
+}
+
+function toDateMaybe(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (value.toDate) return value.toDate();
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+async function runScheduledJob(job) {
+  const jobId = job.id;
+  const ownerUid = job.ownerUid || job.owner_uid || 'unknown';
+  const username = job.brs_email || job.brsEmail || job.username;
+  const password = job.brs_password || job.brsPassword || job.password;
+  const preferredTimes = Array.isArray(job.preferred_times)
+    ? job.preferred_times
+    : Array.isArray(job.preferredTimes)
+      ? job.preferredTimes
+      : [];
+  const players = Array.isArray(job.players) ? job.players : [];
+  const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
+  const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+  const pushToken = job.push_token || job.pushToken;
+
+  if (!username || !password || !targetPlayDate) {
+    await fsUpdateJob(jobId, { status: 'failed', last_error: 'missing-credentials-or-target-date' });
+    return;
+  }
+
+  await fsUpdateJob(jobId, { status: 'running', started_at: admin.firestore.FieldValue.serverTimestamp() });
+
+  try {
+    const warmPage = await warmSession.getWarmPage(targetPlayDate, username, password);
+    const fireTime = Date.now();
+
+    const result = await runBooking({
+      jobId,
+      ownerUid,
+      loginUrl: CONFIG.CLUB_LOGIN_URL,
+      username,
+      password,
+      preferredTimes,
+      targetFireTime: fireTime,
+      targetPlayDate: targetPlayDate,
+      players,
+      partySize,
+      slotsData: [],
+      warmPage,
+      useReleaseObserver: false,
+      pushToken,
+    });
+
+    await fsUpdateJob(jobId, {
+      status: result?.success ? 'completed' : 'failed',
+      last_result: result?.result || 'failed',
+      last_notes: result?.notes || null,
+      finished_at: admin.firestore.FieldValue.serverTimestamp(),
+      next_fire_time_utc: null,
+    });
+  } catch (error) {
+    await fsUpdateJob(jobId, {
+      status: 'failed',
+      last_error: error?.message || String(error),
+      finished_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+}
+
+async function schedulerTick() {
+  const jobs = await fsGetActiveSniperJobs(5);
+  if (!jobs.length) return;
+
+  const now = Date.now();
+  for (const job of jobs) {
+    const nextFire = toDateMaybe(job.next_fire_time_utc) || toDateMaybe(job.nextFireTimeUtc);
+    const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+
+    let fireTime = nextFire;
+    if (!fireTime) {
+      try {
+        fireTime = computeNextFireUTC(job.release_day || job.releaseDay, job.release_time_local || job.releaseTimeLocal, job.tz || job.timezone || CONFIG.TZ_LONDON);
+        await fsUpdateJob(job.id, {
+          next_fire_time_utc: admin.firestore.Timestamp.fromDate(fireTime),
+        });
+      } catch (e) {
+        await fsUpdateJob(job.id, { status: 'failed', last_error: `invalid-release-window: ${e.message}` });
+        continue;
+      }
+    }
+
+    if (!fireTime || !targetPlayDate) continue;
+    if (fireTime.getTime() <= now + 5000) {
+      await runScheduledJob(job);
+    }
+  }
+}
+
+let schedulerRunning = false;
+if (process.env.AGENT_RUN_MAIN === 'true') {
+  console.log('[SCHEDULER] Background scheduler enabled');
+  if (!schedulerRunning) {
+    schedulerRunning = true;
+    setInterval(() => {
+      schedulerTick().catch((e) => console.error('[SCHEDULER] tick error:', e.message));
+    }, 15000).unref?.();
   }
 }
 
@@ -357,9 +902,23 @@ function teeSheetUrlForDate(date) {
   return `https://members.brsgolf.com/galgorm/tee-sheet/1/${y}/${m}/${day}`;
 }
 
-async function navigateToTeeSheet(page, date) {
+function pageMatchesDate(page, date) {
+  try {
+    const d = date instanceof Date ? date : new Date(date);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const needle = `/${y}/${m}/${day}`;
+    const url = page?.url?.() || '';
+    return typeof url === 'string' && url.includes(needle);
+  } catch {
+    return false;
+  }
+}
+
+async function navigateToTeeSheet(page, date, allowHop = true) {
   const baseDate = date instanceof Date ? date : new Date(date);
-  const maxHops = 2; // try today and next 2 days if sheet is empty
+  const maxHops = allowHop ? 2 : 0; // avoid hopping for availability scans
 
   for (let i = 0; i <= maxHops; i++) {
     const target = new Date(baseDate);
@@ -371,13 +930,471 @@ async function navigateToTeeSheet(page, date) {
 
     try {
       await waitForTeeSheet(page, 15000);
-      return;
+      return target;
     } catch (e) {
       console.log(`   ⚠️ Tee sheet not ready on hop ${i}: ${e.message}`);
     }
   }
 
   throw new Error('No tee sheet detected after several day hops');
+}
+
+async function scrapeAvailableTimes(page) {
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  const bookableMap = new Map();
+  const timeRegex = /\b(\d{1,2}:\d{2})\b/;
+  const roots = [page];
+
+  const extractFromButton = async (handle) => {
+    try {
+      return await page.evaluate((btn) => {
+        const timeRegex = /\b(\d{1,2}:\d{2})\b/;
+        const ignore = [
+          'member',
+          'format',
+          'holes',
+          'back',
+          'nine',
+          'only',
+          'tee',
+          'unavailable',
+          'book now',
+        ];
+        const isName = (text) => {
+          const t = text.trim();
+          if (!t) return false;
+          const lower = t.toLowerCase();
+          if (ignore.some((w) => lower.includes(w))) return false;
+          if (/\d/.test(t)) return false;
+          const commaName = /^[A-Za-z][A-Za-z'\-]+,\s*[A-Za-z][A-Za-z'\-\.]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)*$/.test(t);
+          const spaceName = /^[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)+$/.test(t);
+          return commaName || spaceName;
+        };
+        const normalizeName = (name) => {
+          const trimmed = name.trim();
+          if (!trimmed) return '';
+          let normalized = trimmed;
+          if (normalized.includes(',')) {
+            const parts = normalized.split(',');
+            const last = parts[0].trim();
+            const rest = parts.slice(1).join(' ').trim();
+            normalized = `${rest} ${last}`.trim();
+          }
+          normalized = normalized.replace(/\./g, ' ');
+          const tokens = normalized.split(/\s+/).filter(Boolean);
+          if (tokens.length >= 2) {
+            const filtered = tokens.filter((token, idx) => {
+              if (idx === 0 || idx === tokens.length - 1) return true;
+              return token.length > 1;
+            });
+            return filtered.join(' ').toLowerCase();
+          }
+          return normalized.toLowerCase();
+        };
+
+        const extractNames = (text) => {
+          const matches = text.match(/\b[A-Z][a-zA-Z'\-]+(?:,\s*[A-Z][a-zA-Z'\-\.]+(?:\s+[A-Z][a-zA-Z'\-\.]+)*)?\b|\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-\.]+){1,3}\b/g) || [];
+          return matches
+            .map((m) => m.trim())
+            .filter((m) => isName(m));
+        };
+
+        const extractOpenFromText = (text) => {
+          if (!text) return { open: null, total: null };
+          const fraction = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+          if (fraction) {
+            return {
+              open: parseInt(fraction[1], 10),
+              total: parseInt(fraction[2], 10),
+            };
+          }
+          const openMatch = text.match(/\b(?:only\s*)?(\d+)\s*(?:spaces?|slots?|spots?)\s*(?:left|open|available)?\b/i);
+          if (openMatch) {
+            return { open: parseInt(openMatch[1], 10), total: null };
+          }
+          return { open: null, total: null };
+        };
+
+        const extractBookedFromText = (text) => {
+          if (!text) return { booked: null, total: null };
+          const bookedOf = text.match(/\b(\d+)\s*of\s*(\d+)\s*booked\b/i);
+          if (bookedOf) {
+            return {
+              booked: parseInt(bookedOf[1], 10),
+              total: parseInt(bookedOf[2], 10),
+            };
+          }
+          const bookedMatch = text.match(/\b(\d+)\s*(?:players?)\s*booked\b/i);
+          if (bookedMatch) {
+            return { booked: parseInt(bookedMatch[1], 10), total: null };
+          }
+          return { booked: null, total: null };
+        };
+
+        const attrInt = (el, keys) => {
+          if (!el || !el.getAttribute) return null;
+          for (const key of keys) {
+            const val = el.getAttribute(key);
+            if (val !== null && val !== '') {
+              const n = parseInt(String(val), 10);
+              if (!Number.isNaN(n)) return n;
+            }
+          }
+          return null;
+        };
+
+        const attrIntFromTree = (root, keys) => {
+          if (!root || !root.querySelector) return null;
+          for (const key of keys) {
+            const node = root.querySelector(`[${key}]`);
+            if (node) {
+              const n = attrInt(node, [key]);
+              if (n !== null) return n;
+            }
+          }
+          return null;
+        };
+
+        const stripToPlayers = (text) => {
+          if (!text) return '';
+          const formatIndex = text.search(/\bformat\b/i);
+          if (formatIndex >= 0) return text.slice(formatIndex);
+          const holeIndex = text.search(/\b(?:\d+\s*holes?|holes?|back\s+nine|front\s+nine|nine\s+only)\b/i);
+          if (holeIndex >= 0) return text.slice(holeIndex);
+          return text;
+        };
+
+        let container = btn.closest('tr, .tee-row, .slot-row, .timeslot, .slot, .availability, li, section, div');
+        let hops = 0;
+        let best = null;
+        let bestNode = null;
+        let bestNames = 0;
+        while (container && hops < 8) {
+          const text = (container.textContent || '').replace(/\s+/g, ' ').trim();
+          if (timeRegex.test(text)) {
+            const playerText = stripToPlayers(text);
+            const names = extractNames(playerText);
+            const normalizedNames = names.map(normalizeName).filter(Boolean);
+            const uniqueNames = Array.from(new Set(normalizedNames));
+            if (uniqueNames.length > bestNames) {
+              bestNames = uniqueNames.length;
+              best = { text, names: uniqueNames };
+              bestNode = container;
+            }
+          }
+          container = container.parentElement;
+          hops++;
+        }
+
+        if (!best) return null;
+        const match = best.text.match(timeRegex);
+        if (!match) return null;
+        const time = match[1];
+
+        const playerText = stripToPlayers(best.text || '');
+        const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
+        const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
+        const textCounts = extractOpenFromText(best.text || '');
+        const textBooked = extractBookedFromText(best.text || '');
+        const scope = bestNode || container || document;
+        const bookedNodes = Array.from(scope.querySelectorAll('[data-booked]'));
+        const bookedCount = bookedNodes.filter((el) => {
+          const val = String(el.getAttribute('data-booked') || '').toLowerCase();
+          return val === '1' || val === 'true';
+        }).length;
+
+        const openKeys = [
+          'data-open-slots',
+          'data-open',
+          'data-available',
+          'data-spaces',
+          'data-spaces-available',
+        ];
+        const totalKeys = [
+          'data-total-slots',
+          'data-total',
+          'data-capacity',
+          'data-players',
+          'data-max-players',
+          'data-bookable-players-number',
+        ];
+        const bookedKeys = [
+          'data-booked',
+          'data-players-booked',
+          'data-booked-count',
+        ];
+
+        const explicitTotal =
+          attrInt(scope, totalKeys) ?? attrIntFromTree(scope, totalKeys) ?? textCounts.total ?? textBooked.total;
+        const explicitOpen =
+          attrInt(scope, openKeys) ?? attrIntFromTree(scope, openKeys) ?? textCounts.open;
+        const explicitBooked =
+          attrInt(scope, bookedKeys) ?? attrIntFromTree(scope, bookedKeys) ?? textBooked.booked;
+
+        const totalSlots =
+          explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
+        const filled = explicitBooked !== null
+          ? explicitBooked
+          : explicitOpen !== null && totalSlots !== null
+            ? Math.max(0, totalSlots - explicitOpen)
+            : bookedNodes.length > 0
+              ? bookedCount
+              : Math.min(4, Math.max(best.names.length, memberCount + guestCount));
+        const openSlots = explicitOpen !== null
+          ? explicitOpen
+          : totalSlots !== null
+            ? Math.max(0, totalSlots - filled)
+            : null;
+        return { time, status: 'bookable', openSlots, totalSlots };
+      }, handle);
+    } catch {
+      return null;
+    }
+  };
+
+  const collectRows = async (root) => {
+    try {
+      const timeHandles = await root
+        .locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/')
+        .elementHandles();
+
+      for (const handle of timeHandles) {
+        const row = await handle.evaluate((timeEl) => {
+          const timeRegex = /\b(\d{1,2}:\d{2})\b/;
+          const ignore = [
+            'member',
+            'format',
+            'holes',
+            'back',
+            'nine',
+            'only',
+            'tee',
+            'unavailable',
+            'book now',
+          ];
+
+          const isName = (text) => {
+            const t = text.trim();
+            if (!t) return false;
+            const lower = t.toLowerCase();
+            if (ignore.some((w) => lower.includes(w))) return false;
+            if (/\d/.test(t)) return false;
+            const commaName = /^[A-Za-z][A-Za-z'\-]+,\s*[A-Za-z][A-Za-z'\-\.]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)*$/.test(t);
+            const spaceName = /^[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)+$/.test(t);
+            return commaName || spaceName;
+          };
+
+          const normalizeName = (name) => {
+            const trimmed = name.trim();
+            if (!trimmed) return '';
+            let normalized = trimmed;
+            if (normalized.includes(',')) {
+              const parts = normalized.split(',');
+              const last = parts[0].trim();
+              const rest = parts.slice(1).join(' ').trim();
+              normalized = `${rest} ${last}`.trim();
+            }
+            normalized = normalized.replace(/\./g, ' ');
+            const tokens = normalized.split(/\s+/).filter(Boolean);
+            if (tokens.length >= 2) {
+              const filtered = tokens.filter((token, idx) => {
+                if (idx === 0 || idx === tokens.length - 1) return true;
+                return token.length > 1;
+              });
+              return filtered.join(' ').toLowerCase();
+            }
+            return normalized.toLowerCase();
+          };
+
+          const extractNames = (text) => {
+            const matches =
+              text.match(/\b[A-Z][a-zA-Z'\-]+(?:,\s*[A-Z][a-zA-Z'\-\.]+(?:\s+[A-Z][a-zA-Z'\-\.]+)*)?\b|\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-\.]+){1,3}\b/g) || [];
+            return matches.map((m) => m.trim()).filter((m) => isName(m));
+          };
+
+          const extractOpenFromText = (text) => {
+            if (!text) return { open: null, total: null };
+            const fraction = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+            if (fraction) {
+              return {
+                open: parseInt(fraction[1], 10),
+                total: parseInt(fraction[2], 10),
+              };
+            }
+            const openMatch = text.match(/\b(?:only\s*)?(\d+)\s*(?:spaces?|slots?|spots?)\s*(?:left|open|available)?\b/i);
+            if (openMatch) {
+              return { open: parseInt(openMatch[1], 10), total: null };
+            }
+            return { open: null, total: null };
+          };
+
+          const extractBookedFromText = (text) => {
+            if (!text) return { booked: null, total: null };
+            const bookedOf = text.match(/\b(\d+)\s*of\s*(\d+)\s*booked\b/i);
+            if (bookedOf) {
+              return {
+                booked: parseInt(bookedOf[1], 10),
+                total: parseInt(bookedOf[2], 10),
+              };
+            }
+            const bookedMatch = text.match(/\b(\d+)\s*(?:players?)\s*booked\b/i);
+            if (bookedMatch) {
+              return { booked: parseInt(bookedMatch[1], 10), total: null };
+            }
+            return { booked: null, total: null };
+          };
+
+          const stripToPlayers = (text) => {
+            if (!text) return '';
+            const formatIndex = text.search(/\bformat\b/i);
+            if (formatIndex >= 0) return text.slice(formatIndex);
+            const holeIndex = text.search(/\b(?:\d+\s*holes?|holes?|back\s+nine|front\s+nine|nine\s+only)\b/i);
+            if (holeIndex >= 0) return text.slice(holeIndex);
+            return text;
+          };
+
+          const attrInt = (el, keys) => {
+            if (!el || !el.getAttribute) return null;
+            for (const key of keys) {
+              const val = el.getAttribute(key);
+              if (val !== null && val !== '') {
+                const n = parseInt(String(val), 10);
+                if (!Number.isNaN(n)) return n;
+              }
+            }
+            return null;
+          };
+
+          const attrIntFromTree = (root, keys) => {
+            if (!root || !root.querySelector) return null;
+            for (const key of keys) {
+              const node = root.querySelector(`[${key}]`);
+              if (node) {
+                const n = attrInt(node, [key]);
+                if (n !== null) return n;
+              }
+            }
+            return null;
+          };
+
+          const findRow = (el) => {
+            let node = el;
+            let hops = 0;
+            let best = null;
+            while (node && hops < 8) {
+              const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+              if (timeRegex.test(text)) {
+                best = node;
+                if (node.matches && node.matches('tr, .tee-row, .slot-row, .timeslot, .slot, .availability, [role="row"]')) {
+                  return node;
+                }
+              }
+              node = node.parentElement;
+              hops++;
+            }
+            return best;
+          };
+
+          const row = findRow(timeEl);
+          if (!row) return null;
+          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          const match = text.match(timeRegex);
+          if (!match) return null;
+          const time = match[1];
+
+          const buttons = Array.from(row.querySelectorAll('button, a, [role="button"]'));
+          const hasBook = buttons.some((b) => /\bbook( now)?\b/i.test(b.textContent || ''));
+          if (!hasBook) return null;
+
+          const playerText = stripToPlayers(text || '');
+          const names = extractNames(playerText);
+          const normalizedNames = names.map(normalizeName).filter(Boolean);
+          const uniqueNames = Array.from(new Set(normalizedNames));
+          const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
+          const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
+          const textCounts = extractOpenFromText(text || '');
+          const textBooked = extractBookedFromText(text || '');
+          const bookedNodes = Array.from(row.querySelectorAll('[data-booked]'));
+          const bookedCount = bookedNodes.filter((el) => {
+            const val = String(el.getAttribute('data-booked') || '').toLowerCase();
+            return val === '1' || val === 'true';
+          }).length;
+
+          const openKeys = [
+            'data-open-slots',
+            'data-open',
+            'data-available',
+            'data-spaces',
+            'data-spaces-available',
+          ];
+          const totalKeys = [
+            'data-total-slots',
+            'data-total',
+            'data-capacity',
+            'data-players',
+            'data-max-players',
+            'data-bookable-players-number',
+          ];
+          const bookedKeys = [
+            'data-booked',
+            'data-players-booked',
+            'data-booked-count',
+          ];
+
+          const explicitTotal =
+            attrInt(row, totalKeys) ?? attrIntFromTree(row, totalKeys) ?? textCounts.total ?? textBooked.total;
+          const explicitOpen =
+            attrInt(row, openKeys) ?? attrIntFromTree(row, openKeys) ?? textCounts.open;
+          const explicitBooked =
+            attrInt(row, bookedKeys) ?? attrIntFromTree(row, bookedKeys) ?? textBooked.booked;
+
+          const totalSlots =
+            explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
+          const filled = explicitBooked !== null
+            ? explicitBooked
+            : explicitOpen !== null && totalSlots !== null
+              ? Math.max(0, totalSlots - explicitOpen)
+              : bookedNodes.length > 0
+                ? bookedCount
+                : Math.min(4, Math.max(uniqueNames.length, memberCount + guestCount));
+          const openSlots = explicitOpen !== null
+            ? explicitOpen
+            : totalSlots !== null
+              ? Math.max(0, totalSlots - filled)
+              : null;
+
+          return { time, status: 'bookable', openSlots, totalSlots };
+        }, handle);
+
+        if (!row) continue;
+        const time = String(row.time || '').padStart(5, '0');
+        if (!bookableMap.has(time)) {
+          bookableMap.set(time, row);
+        }
+      }
+    } catch (e) {
+      return;
+    }
+  };
+
+  // Scroll through the page to capture virtualized lists
+  const scrollSteps = 10;
+  const scrollBy = 900;
+  for (let i = 0; i < scrollSteps; i++) {
+    await collectRows(page);
+    await page.evaluate((y) => window.scrollTo(0, y), i * scrollBy).catch(() => {});
+    await page.waitForTimeout(250);
+  }
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+
+  const times = Array.from(bookableMap.keys()).sort();
+  const slots = Array.from(bookableMap.values());
+
+  if (times.length === 0) {
+    return { times: [], slots: [] };
+  }
+
+  return { times, slots };
 }
 
 // ========================================
@@ -723,15 +1740,61 @@ async function tryBookTime(
   await page.waitForSelector('tr', { timeout: 10000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
-  const hhmm = time.replace(':', '').padStart(4, '0');
+  const hhmm = normalizeTimeToHHMM(time);
+  if (!hhmm || hhmm.length !== 4) {
+    console.log(`  ❌ Invalid time format: "${time}"`);
+    return { booked: false, error: 'invalid-time-format' };
+  }
   const fallbackLocator = page
     .locator(`a[href*="/bookings/book/${hhmm}"]`)
     .first();
   const bookButton = cachedLocator || fallbackLocator;
 
   if ((await bookButton.count()) === 0) {
-    console.log(`  ⚠️ No booking button found for ${time}`);
-    return { booked: false, error: 'no-booking-button-found' };
+    const timeLabel = `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`;
+    console.log(`  ⚠️ No booking link found for ${time}. Trying row scan for ${timeLabel}...`);
+
+    const rowCandidates = page.locator(
+      '.tee-row, .slot-row, .timeslot, .slot, .availability, tr',
+    );
+    const row = rowCandidates.filter({ hasText: timeLabel }).first();
+    if ((await row.count()) === 0) {
+      console.log(`  ⚠️ No row found for ${timeLabel}`);
+      return { booked: false, error: 'no-booking-button-found' };
+    }
+
+    const rowBookButton = row
+      .locator(
+        'button:has-text("Book"), a:has-text("Book"), [role="button"]:has-text("Book")',
+      )
+      .first();
+
+    if ((await rowBookButton.count()) === 0) {
+      console.log(`  ⚠️ No Book action found in row for ${timeLabel}`);
+      return { booked: false, error: 'no-booking-button-found' };
+    }
+
+    console.log(`  📍 Clicking Book action for ${timeLabel} (row scan)...`);
+    const clickTime = Date.now();
+    await rowBookButton.click({ timeout: 2000 }).catch(() => {});
+    console.log(`[FIRE] Click executed at: ${new Date(clickTime).toISOString()}`);
+    console.log(`[FIRE] Delta ms: ${clickTime - targetFireTime}ms`);
+    await page.waitForTimeout(2000);
+
+    const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
+    return {
+      booked:
+        confirmResult.confirmationText !== null &&
+        confirmResult.confirmationText !== 'confirm-button-not-found',
+      playersFilled: confirmResult.filled,
+      playersRequested: players.slice(0, Math.min(openSlots, 3)),
+      confirmationText: confirmResult.confirmationText,
+      skippedReason: confirmResult.skippedReason,
+      error:
+        confirmResult.confirmationText === 'confirm-button-not-found'
+          ? 'confirm-button-not-found'
+          : null,
+    };
   }
 
   const clickDeltaMs = Date.now() - targetFireTime;
@@ -856,6 +1919,12 @@ async function executeReleaseBooking(page, locator, additionalPlayers, openSlots
   return { booked, confirmationText, playersFilled };
 }
 
+function normalizeTimeToHHMM(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (!digits) return '';
+  return digits.padStart(4, '0').slice(-4);
+}
+
 async function runBooking(config) {
   const {
     jobId,
@@ -897,9 +1966,29 @@ async function runBooking(config) {
     } else {
       // ...existing browser launch, login, and tee sheet navigation...
     }
+
+    // --- PATCH: Add delay and reload before fallback scan ---
+    if (useReleaseObserver) {
+      console.log('[PATCH] Waiting 2 seconds and reloading tee sheet before fallback scan...');
+      await page.waitForTimeout(2000);
+      if (targetPlayDate) {
+        const reloadUrl = teeSheetUrlForDate(targetPlayDate);
+        await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForTimeout(1000);
+        console.log('[PATCH] Tee sheet reloaded for fallback scan.');
+        // Force a full page reload to ensure DOM is fresh
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForTimeout(1000);
+        console.log('[PATCH] Full page reload complete before fallback scan.');
+      }
+    }
     const locatorCache = {};
     for (const time of normalizedPreferredTimes) {
-      const hhmm = time.replace(':', '').padStart(4, '0');
+      const hhmm = normalizeTimeToHHMM(time);
+      if (!hhmm || hhmm.length !== 4) {
+        console.log(`[WARN] Skipping invalid time format in preferredTimes: "${time}"`);
+        continue;
+      }
       const fallbackSel = `a[href*="/bookings/book/${hhmm}"]`;
       const cachedSel = cachedSelectors?.[time] || fallbackSel;
       locatorCache[time] = page.locator(cachedSel).first();
@@ -983,9 +2072,69 @@ async function runBooking(config) {
         notes.push(msg);
       }
     }
-    // ...existing result/notification/cleanup logic...
+    const success = !!bookedTime;
+    const resultType = success
+      ? fallbackLevel === 0
+        ? 'success'
+        : 'fallback'
+      : 'failed';
+
+    const finalNotes = notes.join(' | ') || (success ? 'booking-complete' : 'booking-failed');
+
+    await fsFinishRun(runId, {
+      result: resultType,
+      notes: finalNotes,
+      latency_ms: Date.now() - startTime,
+      chosen_time: bookedTime,
+      fallback_level: fallbackLevel,
+    });
+
+    if (success) {
+      await sendPushFCM(
+        '✅ Tee Time Booked!',
+        `Successfully booked ${bookedTime}`,
+        pushToken,
+      );
+    } else {
+      await sendPushFCM(
+        '❌ Booking Failed',
+        notes.slice(-1)[0] || 'No booking slot could be booked',
+        pushToken,
+      );
+    }
+
+    if (browser && !isWarm) await browser.close();
+
+    return {
+      success,
+      result: resultType,
+      bookedTime,
+      fallbackLevel,
+      latencyMs: Date.now() - startTime,
+      notes: finalNotes,
+      playersRequested: additionalPlayers,
+    };
   } catch (error) {
-    // ...existing error handling...
+    const msg = `Booking run failed: ${error.message}`;
+    console.error(msg);
+    await fsFinishRun(runId, {
+      result: 'error',
+      notes: msg,
+      latency_ms: Date.now() - startTime,
+      chosen_time: bookedTime,
+      fallback_level: fallbackLevel,
+    });
+    if (browser && !isWarm) await browser.close();
+    return {
+      success: false,
+      result: 'error',
+      bookedTime,
+      fallbackLevel,
+      latencyMs: Date.now() - startTime,
+      notes: msg,
+      playersRequested: additionalPlayers,
+      error: error.message,
+    };
   }
 }
 
@@ -1029,10 +2178,6 @@ app.post('/api/release-snipe', async (req, res) => {
   }
 });
 
-main().catch((err) => {
-  console.error('❌ Unhandled main() rejection:', err);
-  process.exit(1);
-});
 
 // Query Firestore for one active job (used by agent main loop)
 async function fsGetOneActiveJob() {
@@ -1053,10 +2198,15 @@ async function fsGetOneActiveJob() {
   }
 }
 
+
+// Start the Express server
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  logStartupBanner(port);
+});
+
 export {
-  main,
   runBooking,
   computeNextFireUTC,
   fsGetOneActiveJob,
-  fetchAvailableTeeTimesFromBRS,
 };
