@@ -1763,7 +1763,66 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
 
           const buttons = Array.from(row.querySelectorAll('button, a, [role="button"]'));
           const hasBook = buttons.some((b) => /\bbook( now)?\b/i.test(b.textContent || ''));
+          // PATCH: Always include all visible times if includeUnavailable is true
           if (!hasBook && !includeUnavailable) return null;
+          if (!hasBook && includeUnavailable) {
+            // Mark as unavailable, but still include the time
+            const playerText = stripToPlayers(text || '');
+            const names = extractNames(playerText);
+            const normalizedNames = names.map(normalizeName).filter(Boolean);
+            const uniqueNames = Array.from(new Set(normalizedNames));
+            const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
+            const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
+            const textCounts = extractOpenFromText(text || '');
+            const textBooked = extractBookedFromText(text || '');
+            const bookedNodes = Array.from(row.querySelectorAll('[data-booked]'));
+            const bookedCount = bookedNodes.filter((el) => {
+              const val = String(el.getAttribute('data-booked') || '').toLowerCase();
+              return val === '1' || val === 'true';
+            }).length;
+            const openKeys = [
+              'data-open-slots',
+              'data-open',
+              'data-available',
+              'data-spaces',
+              'data-spaces-available',
+            ];
+            const totalKeys = [
+              'data-total-slots',
+              'data-total',
+              'data-capacity',
+              'data-players',
+              'data-max-players',
+              'data-bookable-players-number',
+            ];
+            const bookedKeys = [
+              'data-booked',
+              'data-players-booked',
+              'data-booked-count',
+            ];
+            const explicitTotal =
+              attrInt(row, totalKeys) ?? attrIntFromTree(row, totalKeys) ?? textCounts.total ?? textBooked.total;
+            const explicitOpen =
+              attrInt(row, openKeys) ?? attrIntFromTree(row, openKeys) ?? textCounts.open;
+            const explicitBooked =
+              attrInt(row, bookedKeys) ?? attrIntFromTree(row, bookedKeys) ?? textBooked.booked;
+            const totalSlots =
+              explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
+            const filled = explicitBooked !== null
+              ? explicitBooked
+              : explicitOpen !== null && totalSlots !== null
+                ? Math.max(0, totalSlots - explicitOpen)
+                : bookedNodes.length > 0
+                  ? bookedCount
+                  : Math.min(4, Math.max(uniqueNames.length, memberCount + guestCount));
+            const openSlots = explicitOpen !== null
+              ? explicitOpen
+              : totalSlots !== null
+                ? Math.max(0, totalSlots - filled)
+                : null;
+            const status = 'unavailable';
+            return { time, status, openSlots, totalSlots };
+          }
 
           const playerText = stripToPlayers(text || '');
           const names = extractNames(playerText);
