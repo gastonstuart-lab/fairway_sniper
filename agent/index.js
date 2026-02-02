@@ -2644,7 +2644,14 @@ async function runBooking(config) {
         console.log(
           `[SNIPER] Release watcher (MutationObserver) armed... attempt ${attempt}/${maxAttempts} timeout ${watchMs}ms`,
         );
-        releaseResult = await waitForBookingRelease(page, watchMs, CONFIG.TEST_MODE);
+        try {
+          await page.waitForLoadState('domcontentloaded');
+          releaseResult = await waitForBookingRelease(page, watchMs, CONFIG.TEST_MODE);
+        } catch (error) {
+          const msg = error?.message || String(error);
+          console.warn(`[SNIPER] Release watcher error on attempt ${attempt}/${maxAttempts}: ${msg}`);
+          releaseResult = null;
+        }
         if (releaseResult && releaseResult.found) {
           break;
         }
