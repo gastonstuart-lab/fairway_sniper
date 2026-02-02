@@ -1,0 +1,17 @@
+{
+  "mode": "sniper",
+  "status": "active",
+  "owner_uid": "test-validation",
+  "brs_email": "YOUR_BRS_USERNAME",
+  "brs_password": "YOUR_BRS_PASSWORD",
+  "next_fire_time_utc": "REPLACE_WITH_TIMESTAMP_4MIN_FROM_NOW",
+  "target_play_date": "REPLACE_WITH_DATE_4_DAYS_AHEAD",
+  "preferred_times": ["10:10", "10:20", "10:30"],
+  "party_size": 2,
+  "players": [],
+  "window_minutes": 3,
+  "fallback_step_minutes": 5,
+  "test_run": true,
+  "warm_up_test": true,
+  "push_token": null
+}

@@ -444,6 +444,7 @@ const CONFIG = {
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
   SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '5', 10),
   DRY_RUN: process.argv.includes('--dry-run'),
+  TEST_MODE: process.env.TEST_MODE === 'true',
   // Railway cold-start mitigation
   WARM_UP_WINDOW_MINUTES: Number.parseInt(process.env.WARM_UP_WINDOW_MINUTES || '5', 10),
   WARM_UP_TRIGGER_MINUTES: Number.parseInt(process.env.WARM_UP_TRIGGER_MINUTES || '3', 10),
@@ -1001,23 +1002,28 @@ async function warmUpSchedulerTick() {
         const alreadyWarmed = warmedAt && (now - toDateMaybe(warmedAt)?.getTime()) < 5 * 60 * 1000;
         
         if (!alreadyWarmed && minutesUntilFire <= CONFIG.WARM_UP_TRIGGER_MINUTES) {
-          console.log(`[WARM-UP] Job ${job.id} fires in ${minutesUntilFire.toFixed(1)} min - warming service`);
+          const runId = job.run_id || job.runId || 'pending';
+          console.log(`[WARM-UP] 🔥 Job detected: ${job.id} | runId: ${runId} | fireTime: ${fireTime.toISOString()} | T-${minutesUntilFire.toFixed(2)}min`);
           
           // Self-ping to wake Railway service
+          const pingStart = Date.now();
           try {
             const warmUrl = `${CONFIG.AGENT_URL}/api/warm`;
+            console.log(`[WARM-UP] 📡 Warm ping start: ${warmUrl}`);
             const response = await fetch(warmUrl, { 
               method: 'GET',
               signal: AbortSignal.timeout(5000)
             });
+            const pingMs = Date.now() - pingStart;
             
             if (response.ok) {
-              console.log(`[WARM-UP] Service warmed successfully for job ${job.id}`);
+              console.log(`[WARM-UP] ✅ Warm ping success (${pingMs}ms)`);
             } else {
-              console.warn(`[WARM-UP] Warm ping returned ${response.status}`);
+              console.warn(`[WARM-UP] ⚠️ Warm ping returned ${response.status} (${pingMs}ms)`);
             }
           } catch (fetchErr) {
-            console.error(`[WARM-UP] Self-ping failed:`, fetchErr.message);
+            const pingMs = Date.now() - pingStart;
+            console.error(`[WARM-UP] ❌ Warm ping failed (${pingMs}ms):`, fetchErr.message);
           }
           
           // Optionally preload tee sheet (warm browser session)
@@ -1026,12 +1032,15 @@ async function warmUpSchedulerTick() {
           const password = job.brs_password || job.brsPassword || job.password;
           
           if (targetPlayDate && username && password) {
+            const preloadStart = Date.now();
             try {
-              console.log(`[WARM-UP] Preloading tee sheet for job ${job.id}`);
+              console.log(`[WARM-UP] 🌐 Browser preload start for ${targetPlayDate.toISOString().slice(0, 10)}`);
               await warmSession.getWarmPage(targetPlayDate, username, password);
-              console.log(`[WARM-UP] Tee sheet preloaded for job ${job.id}`);
+              const preloadMs = Date.now() - preloadStart;
+              console.log(`[WARM-UP] ✅ Browser preload complete (${preloadMs}ms)`);
             } catch (warmErr) {
-              console.warn(`[WARM-UP] Tee sheet preload failed:`, warmErr.message);
+              const preloadMs = Date.now() - preloadStart;
+              console.warn(`[WARM-UP] ⚠️ Browser preload failed (${preloadMs}ms):`, warmErr.message);
             }
           }
           
@@ -1039,13 +1048,14 @@ async function warmUpSchedulerTick() {
           await fsUpdateJob(job.id, {
             warmed_at: admin.firestore.FieldValue.serverTimestamp()
           });
+          console.log(`[WARM-UP] ✅ Job ${job.id} marked as warmed`);
         } else if (alreadyWarmed) {
-          console.log(`[WARM-UP] Job ${job.id} already warmed (${minutesUntilFire.toFixed(1)} min until fire)`);
+          console.log(`[WARM-UP] ⏭️ Job ${job.id} already warmed (T-${minutesUntilFire.toFixed(2)}min)`);
         }
       }
     }
   } catch (error) {
-    console.error('[WARM-UP] Scheduler tick error:', error.message);
+    console.error('[WARM-UP] ❌ Scheduler tick error:', error.message);
   }
 }
 
@@ -2353,19 +2363,39 @@ async function executeReleaseBooking(
 ) {
   const clickStart = Date.now();
   // Log target reached and click delta
-  console.log(`[FIRE] Target reached at: ${new Date(fireTime).toISOString()}`);
+  console.log(`[FIRE] 🎯 Target reached at: ${new Date(fireTime).toISOString()}`);
   let clickDelta = clickDeltaOverride;
-  if (!skipClick) {
+  
+  // TEST_MODE: suppress booking click but continue flow for validation
+  if (CONFIG.TEST_MODE) {
+    console.log(`[TEST_MODE] ⚠️ Booking click SUPPRESSED (validation mode)`);
+    clickDelta = Date.now() - fireTime;
+    console.log(`[TEST_MODE] 📊 Click delta (simulated): ${clickDelta}ms`);
+    if (jobId) logJobEvent(jobId, `🧪 TEST_MODE: Click suppressed, delta=${clickDelta}ms`);
+  } else if (!skipClick) {
     await locator.click();
     clickDelta = Date.now() - fireTime;
-    console.log(`[FIRE] Click executed delta: ${clickDelta}ms`);
+    console.log(`[FIRE] ✅ Click executed delta: ${clickDelta}ms`);
   } else if (typeof clickDelta === 'number') {
     console.log(`[FIRE] Click executed delta: ${clickDelta}ms`);
   }
+  
   if (clickDelta > 200) {
-    console.warn(`[WARN] Booking click delta >200ms: ${clickDelta}ms`);
+    console.warn(`[WARN] ⚠️ Booking click delta >200ms: ${clickDelta}ms`);
     if (jobId) logJobEvent(jobId, `⚠️ FIRE DELTA TOO HIGH (${clickDelta}ms)`);
   }
+  
+  // TEST_MODE: return early with validation metrics (skip player fill)
+  if (CONFIG.TEST_MODE) {
+    console.log(`[TEST_MODE] ✅ Validation complete - skipping player fill and confirmation`);
+    return { 
+      booked: false, 
+      confirmationText: 'TEST_MODE_VALIDATION_ONLY', 
+      playersFilled: [], 
+      clickDeltaMs: clickDelta 
+    };
+  }
+  
   // Always run the normal booking flow to fill players (if any) and confirm
   const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun);
   const playersFilled = confirmResult.filled || [];
