@@ -1460,272 +1460,33 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
         const extractOpenFromText = (text) => {
           if (!text) return { open: null, total: null };
           const fraction = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
-          if (fraction) {
-            return {
-              open: parseInt(fraction[1], 10),
-              total: parseInt(fraction[2], 10),
-            };
-          }
-          const openMatch = text.match(/\b(?:only\s*)?(\d+)\s*(?:spaces?|slots?|spots?)\s*(?:left|open|available)?\b/i);
-          if (openMatch) {
-            return { open: parseInt(openMatch[1], 10), total: null };
-          }
-          return { open: null, total: null };
-        };
-
-        const extractBookedFromText = (text) => {
-          if (!text) return { booked: null, total: null };
-          const bookedOf = text.match(/\b(\d+)\s*of\s*(\d+)\s*booked\b/i);
-          if (bookedOf) {
-            return {
-              booked: parseInt(bookedOf[1], 10),
-              total: parseInt(bookedOf[2], 10),
-            };
-          }
-          const bookedMatch = text.match(/\b(\d+)\s*(?:players?)\s*booked\b/i);
-          if (bookedMatch) {
-            return { booked: parseInt(bookedMatch[1], 10), total: null };
-          }
-          return { booked: null, total: null };
-        };
-
-        const attrInt = (el, keys) => {
-          if (!el || !el.getAttribute) return null;
-          for (const key of keys) {
-            const val = el.getAttribute(key);
-            if (val !== null && val !== '') {
-              const n = parseInt(String(val), 10);
-              if (!Number.isNaN(n)) return n;
-            }
-          }
-          return null;
-        };
-
-        const attrIntFromTree = (root, keys) => {
-          if (!root || !root.querySelector) return null;
-          for (const key of keys) {
-            const node = root.querySelector(`[${key}]`);
-            if (node) {
-              const n = attrInt(node, [key]);
-              if (n !== null) return n;
-            }
-          }
-          return null;
-        };
-
-        const stripToPlayers = (text) => {
-          if (!text) return '';
-          const formatIndex = text.search(/\bformat\b/i);
-          if (formatIndex >= 0) return text.slice(formatIndex);
-          const holeIndex = text.search(/\b(?:\d+\s*holes?|holes?|back\s+nine|front\s+nine|nine\s+only)\b/i);
-          if (holeIndex >= 0) return text.slice(holeIndex);
-          return text;
-        };
-
-        let container = btn.closest('tr, .tee-row, .slot-row, .timeslot, .slot, .availability, li, section, div');
-        let hops = 0;
-        let best = null;
-        let bestNode = null;
-        let bestNames = 0;
-        while (container && hops < 8) {
-          const text = (container.textContent || '').replace(/\s+/g, ' ').trim();
-          if (timeRegex.test(text)) {
-            const playerText = stripToPlayers(text);
-            const names = extractNames(playerText);
-            const normalizedNames = names.map(normalizeName).filter(Boolean);
-            const uniqueNames = Array.from(new Set(normalizedNames));
-            if (uniqueNames.length > bestNames) {
-              bestNames = uniqueNames.length;
-              best = { text, names: uniqueNames };
-              bestNode = container;
-            }
-          }
-          container = container.parentElement;
-          hops++;
-        }
-
-        if (!best) return null;
-        const match = best.text.match(timeRegex);
-        if (!match) return null;
-        const time = match[1];
-
-        const playerText = stripToPlayers(best.text || '');
-        const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
-        const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
-        const textCounts = extractOpenFromText(best.text || '');
-        const textBooked = extractBookedFromText(best.text || '');
-        const scope = bestNode || container || document;
-        const bookedNodes = Array.from(scope.querySelectorAll('[data-booked]'));
-        const bookedCount = bookedNodes.filter((el) => {
-          const val = String(el.getAttribute('data-booked') || '').toLowerCase();
-          return val === '1' || val === 'true';
-        }).length;
-
-        const openKeys = [
-          'data-open-slots',
-          'data-open',
-          'data-available',
-          'data-spaces',
-          'data-spaces-available',
-        ];
-        const totalKeys = [
-          'data-total-slots',
-          'data-total',
-          'data-capacity',
-          'data-players',
-          'data-max-players',
-          'data-bookable-players-number',
-        ];
-        const bookedKeys = [
-          'data-booked',
-          'data-players-booked',
-          'data-booked-count',
-        ];
-
-        const explicitTotal =
-          attrInt(scope, totalKeys) ?? attrIntFromTree(scope, totalKeys) ?? textCounts.total ?? textBooked.total;
-        const explicitOpen =
-          attrInt(scope, openKeys) ?? attrIntFromTree(scope, openKeys) ?? textCounts.open;
-        const explicitBooked =
-          attrInt(scope, bookedKeys) ?? attrIntFromTree(scope, bookedKeys) ?? textBooked.booked;
-
-        const totalSlots =
-          explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
-        const filled = explicitBooked !== null
-          ? explicitBooked
-          : explicitOpen !== null && totalSlots !== null
-            ? Math.max(0, totalSlots - explicitOpen)
-            : bookedNodes.length > 0
-              ? bookedCount
-              : Math.min(4, Math.max(best.names.length, memberCount + guestCount));
-        const openSlots = explicitOpen !== null
-          ? explicitOpen
-          : totalSlots !== null
-            ? Math.max(0, totalSlots - filled)
-            : null;
-        return { time, status: 'bookable', openSlots, totalSlots };
-      }, handle);
-    } catch {
-      return null;
-    }
-  };
-
-  const collectRows = async (root) => {
-    try {
-      const timeHandles = await root
-        .locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/')
-        .elementHandles();
-
-      for (const handle of timeHandles) {
-        const row = await handle.evaluate((timeEl, opts) => {
-          const { includeUnavailable } = opts || {};
+          const bookableMap = new Map();
           const timeRegex = /\b(\d{1,2}:\d{2})\b/;
-          const ignore = [
-            'member',
-            'format',
-            'holes',
-            'back',
-            'nine',
-            'only',
-            'tee',
-            'unavailable',
-            'book now',
-          ];
 
-          const isName = (text) => {
-            const t = text.trim();
-            if (!t) return false;
-            const lower = t.toLowerCase();
-            if (ignore.some((w) => lower.includes(w))) return false;
-            if (/\d/.test(t)) return false;
-            const commaName = /^[A-Za-z][A-Za-z'\-]+,\s*[A-Za-z][A-Za-z'\-\.]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)*$/.test(t);
-            const spaceName = /^[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)+$/.test(t);
-            return commaName || spaceName;
-          };
-
-          const normalizeName = (name) => {
-            const trimmed = name.trim();
-            if (!trimmed) return '';
-            let normalized = trimmed;
-            if (normalized.includes(',')) {
-              const parts = normalized.split(',');
-              const last = parts[0].trim();
-              const rest = parts.slice(1).join(' ').trim();
-              normalized = `${rest} ${last}`.trim();
+          // PATCH: Scrape all visible time labels, including those with 'UNAVAILABLE' buttons
+          const rows = await page.locator('tr, .tee-row, .slot-row, .timeslot, .slot, .availability').elementHandles();
+          for (const rowHandle of rows) {
+            const rowData = await rowHandle.evaluate((row, opts) => {
+              const { includeUnavailable } = opts || {};
+              const timeRegex = /\b(\d{1,2}:\d{2})\b/;
+              const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+              const match = text.match(timeRegex);
+              if (!match) return null;
+              const time = match[1];
+              const hasUnavailable = Array.from(row.querySelectorAll('button, [role="button"]')).some(b => b.textContent?.toLowerCase().includes('unavailable'));
+              const hasBook = Array.from(row.querySelectorAll('button, a, [role="button"]')).some(b => /\bbook( now)?\b/i.test(b.textContent || ''));
+              // Always include if includeUnavailable, otherwise only if bookable
+              if (!hasBook && !includeUnavailable && !hasUnavailable) return null;
+              const status = hasBook ? 'bookable' : 'unavailable';
+              return { time, status };
+            }, { includeUnavailable });
+            if (rowData && rowData.time) {
+              bookableMap.set(rowData.time, rowData);
             }
-            normalized = normalized.replace(/\./g, ' ');
-            const tokens = normalized.split(/\s+/).filter(Boolean);
-            if (tokens.length >= 2) {
-              const filtered = tokens.filter((token, idx) => {
-                if (idx === 0 || idx === tokens.length - 1) return true;
-                return token.length > 1;
-              });
-              return filtered.join(' ').toLowerCase();
-            }
-            return normalized.toLowerCase();
-          };
-
-          const extractNames = (text) => {
-            const matches =
-              text.match(/\b[A-Z][a-zA-Z'\-]+(?:,\s*[A-Z][a-zA-Z'\-\.]+(?:\s+[A-Z][a-zA-Z'\-\.]+)*)?\b|\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-\.]+){1,3}\b/g) || [];
-            return matches.map((m) => m.trim()).filter((m) => isName(m));
-          };
-
-          const extractOpenFromText = (text) => {
-            if (!text) return { open: null, total: null };
-            const fraction = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
-            if (fraction) {
-              return {
-                open: parseInt(fraction[1], 10),
-                total: parseInt(fraction[2], 10),
-              };
-            }
-            const openMatch = text.match(/\b(?:only\s*)?(\d+)\s*(?:spaces?|slots?|spots?)\s*(?:left|open|available)?\b/i);
-            if (openMatch) {
-              return { open: parseInt(openMatch[1], 10), total: null };
-            }
-            return { open: null, total: null };
-          };
-
-          const extractBookedFromText = (text) => {
-            if (!text) return { booked: null, total: null };
-            const bookedOf = text.match(/\b(\d+)\s*of\s*(\d+)\s*booked\b/i);
-            if (bookedOf) {
-              return {
-                booked: parseInt(bookedOf[1], 10),
-                total: parseInt(bookedOf[2], 10),
-              };
-            }
-            const bookedMatch = text.match(/\b(\d+)\s*(?:players?)\s*booked\b/i);
-            if (bookedMatch) {
-              return { booked: parseInt(bookedMatch[1], 10), total: null };
-            }
-            return { booked: null, total: null };
-          };
-
-          const stripToPlayers = (text) => {
-            if (!text) return '';
-            const formatIndex = text.search(/\bformat\b/i);
-            if (formatIndex >= 0) return text.slice(formatIndex);
-            const holeIndex = text.search(/\b(?:\d+\s*holes?|holes?|back\s+nine|front\s+nine|nine\s+only)\b/i);
-            if (holeIndex >= 0) return text.slice(holeIndex);
-            return text;
-          };
-
-          const attrInt = (el, keys) => {
-            if (!el || !el.getAttribute) return null;
-            for (const key of keys) {
-              const val = el.getAttribute(key);
-              if (val !== null && val !== '') {
-                const n = parseInt(String(val), 10);
-                if (!Number.isNaN(n)) return n;
-              }
-            }
-            return null;
-          };
-
-          const attrIntFromTree = (root, keys) => {
-            if (!root || !root.querySelector) return null;
+          }
+          const times = Array.from(bookableMap.keys()).sort();
+          const slots = Array.from(bookableMap.values());
+          return { times, slots };
             for (const key of keys) {
               const node = root.querySelector(`[${key}]`);
               if (node) {
