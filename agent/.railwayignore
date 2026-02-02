@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+*.log
+test-*.js
+prove-*.ps1
+*.ps1
+START_AGENT.ps1
+stop-agent-detached.ps1
+agent_detached.pid
+_agent_start.err

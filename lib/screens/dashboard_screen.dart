@@ -9,6 +9,9 @@ import 'package:fairway_sniper/models/booking_run.dart';
 import 'package:fairway_sniper/screens/mode_selection_screen.dart';
 import 'package:fairway_sniper/screens/admin_dashboard.dart';
 import 'package:fairway_sniper/screens/course_info_screen.dart';
+import 'package:fairway_sniper/widgets/brs_credentials_modal.dart';
+import 'package:fairway_sniper/widgets/dashboard_widgets.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'dart:async';
@@ -31,6 +34,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Map<String, dynamic>? _weatherForecast;
   List<Map<String, dynamic>>? _newsArticles;
   bool _isDarkMode = false;
+  String? _displayName;
+  Map<String, String>? _savedCreds;
+  bool _loadingCreds = false;
 
   @override
   void initState() {
@@ -38,6 +44,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _prefetchService = BookingPrefetchService(firebaseService: _firebaseService);
     _loadWeather();
     _loadNews();
+    _loadProfile();
     _prefetchService.run();
   }
 
@@ -64,12 +71,47 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (mounted) setState(() => _newsArticles = news);
   }
 
+  Future<void> _loadProfile() async {
+    final userId = _firebaseService.currentUserId;
+    if (userId == null) return;
+    setState(() => _loadingCreds = true);
+    final creds = await _firebaseService.loadBRSCredentials(userId);
+    final name = await _firebaseService.getUserDisplayName(userId);
+    if (!mounted) return;
+    setState(() {
+      _savedCreds = creds;
+      _displayName = name ?? _firebaseService.currentUser?.displayName;
+      _loadingCreds = false;
+    });
+  }
+
+  Future<void> _editSavedCreds() async {
+    final uid = _firebaseService.currentUserId;
+    if (uid == null) return;
+
+    final result = await showBRSCredentialsModal(
+      context,
+      initialUsername: _savedCreds?['username'],
+      initialPassword: _savedCreds?['password'],
+      title: 'Edit Saved BRS Login',
+    );
+
+    if (result != null) {
+      await _firebaseService.saveBRSCredentials(uid, result['username']!, result['password']!);
+      if (!mounted) return;
+      setState(() => _savedCreds = result);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Saved BRS login updated.')),
+      );
+      _prefetchService.run(forceRefresh: true);
+    }
+  }
+
   String _partySizeLabel(BookingJob job) {
     final size = job.partySize ?? (job.players.length + 1);
     final unit = size == 1 ? 'player' : 'players';
     return '$size $unit';
   }
-
   DateTime _getNextSaturday() {
     final now = DateTime.now();
     int daysUntilSaturday = (DateTime.saturday - now.weekday) % 7;
@@ -98,7 +140,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: Scaffold(
         backgroundColor: Colors.transparent,
         appBar: AppBar(
-          backgroundColor: Colors.white.withValues(alpha: 0.95),
+          backgroundColor: Colors.white.withValues(alpha: 0.85),
           elevation: 2,
           title: Text('Fairway Sniper',
               style: TextStyle(
@@ -261,6 +303,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
         body: StreamBuilder<List<BookingJob>>(
           stream: _firebaseService.getUserJobs(userId),
           builder: (context, jobSnapshot) {
+            // Debug: Log job statuses from Firestore
+            if (jobSnapshot.hasData) {
+              for (var job in jobSnapshot.data!) {
+                print('🔍 [DASHBOARD] Job ${job.id}: status="${job.status}"');
+              }
+            }
+            
             if (jobSnapshot.connectionState == ConnectionState.waiting) {
               return const Center(child: CircularProgressIndicator());
             }
@@ -280,13 +329,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         style: TextStyle(
                             fontSize: 20, fontWeight: FontWeight.bold),
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: AppSpacing.sm),
                       Text(
                         'Please check your Firestore security rules',
                         textAlign: TextAlign.center,
                         style: TextStyle(color: Colors.grey.shade600),
                       ),
-                      const SizedBox(height: 24),
+                      const SizedBox(height: AppSpacing.xl),
                       ElevatedButton.icon(
                         onPressed: () => setState(() {}),
                         icon: const Icon(Icons.refresh),
@@ -304,6 +353,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               onRefresh: () async {
                 await _loadWeather();
                 await _loadNews();
+                await _loadProfile();
               },
               child: SingleChildScrollView(
                 physics: const AlwaysScrollableScrollPhysics(),
@@ -313,11 +363,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.all(20),
+                        padding: const EdgeInsets.all(AppSpacing.xl),
+                        child: DashboardWelcomeCard(
+                          displayName: _displayName,
+                          savedCreds: _savedCreds,
+                          loadingCreds: _loadingCreds,
+                          onEditCreds: _editSavedCreds,
+                          currentUserEmail: _firebaseService.currentUser?.email,
+                        ),
+                      ),
+                    ),
+                    Center(
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 800),
+                        padding: const EdgeInsets.all(AppSpacing.xl),
                         child: AnimatedBuilder(
                           animation: _prefetchService,
-                          builder: (context, _) => _buildPrefetchCard(
-                            _prefetchService.state,
+                          builder: (context, _) => DashboardPrefetchCard(
+                            state: _prefetchService.state,
+                            isRunning: _prefetchService.isRunning,
+                            onRefresh: () => _prefetchService.run(forceRefresh: true),
                           ),
                         ),
                       ),
@@ -325,41 +390,41 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.all(20),
+                        padding: const EdgeInsets.all(AppSpacing.xl),
                         child: _buildJobsList(jobs),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
                         child: LocalTimeCard(isDarkMode: _isDarkMode),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
                         child: _buildWeatherCard(jobs),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
                         child: Row(
                           children: [
                             Expanded(child: _buildJokeButton()),
-                            const SizedBox(width: 12),
+                            const SizedBox(width: AppSpacing.md),
                             Expanded(child: _buildCourseInfoButton()),
                           ],
                         ),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     _buildGolfNewsSection(),
                     const SizedBox(height: 20),
                     Center(
@@ -387,88 +452,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
           label: Text(
             _prefetchService.state.isReady ? 'Ready to Book' : 'New Booking Job',
           ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPrefetchCard(BookingPrefetchState state) {
-    final theme = Theme.of(context);
-    final isReady = state.isReady;
-    final hasError = state.hasError;
-    final statusColor = isReady
-        ? Colors.green
-        : hasError
-            ? Colors.red
-            : theme.colorScheme.primary;
-
-    return Card(
-      color: Colors.white.withValues(alpha: 0.95),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.data_saver_on, color: statusColor),
-                const SizedBox(width: 8),
-                Text(
-                  'Prepare Booking Data',
-                  style: theme.textTheme.titleMedium
-                      ?.copyWith(fontWeight: FontWeight.w600),
-                ),
-                const Spacer(),
-                TextButton(
-                  onPressed: _prefetchService.isRunning
-                      ? null
-                      : () => _prefetchService.run(forceRefresh: true),
-                  child: const Text('Refresh Data'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            LinearProgressIndicator(
-              value: state.step == PrefetchStep.failed ? null : state.progress,
-              color: statusColor,
-              backgroundColor: Colors.grey.shade200,
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    state.statusText,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: statusColor,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-                Text(
-                  '${(state.progress * 100).round()}%',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: Colors.grey.shade700,
-                  ),
-                ),
-              ],
-            ),
-            if (hasError) ...[
-              const SizedBox(height: 6),
-              Text(
-                'Prefetch failed. You can still use the app.',
-                style: theme.textTheme.bodySmall
-                    ?.copyWith(color: Colors.grey.shade700),
-              ),
-              const SizedBox(height: 8),
-              ElevatedButton(
-                onPressed: _prefetchService.isRunning
-                    ? null
-                    : () => _prefetchService.run(forceRefresh: true),
-                child: const Text('Retry'),
-              ),
-            ],
-          ],
         ),
       ),
     );
@@ -506,7 +489,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     final cardBg = _isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final textColor = _isDarkMode ? Colors.white : Colors.black87;
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
@@ -1129,7 +1112,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           Card(
             color: _isDarkMode
                 ? Colors.grey.shade900.withValues(alpha: 0.85)
-                : Colors.white.withValues(alpha: 0.95),
+                : Colors.white.withValues(alpha: 0.85),
             child: Padding(
               padding: const EdgeInsets.all(40),
               child: Center(
@@ -1171,7 +1154,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget _buildJobCard(BookingJob job) {
     final cardBg = _isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final textColor = _isDarkMode ? Colors.white : Colors.black87;
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
@@ -1773,7 +1756,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               return Card(
                 color: _isDarkMode
                     ? Colors.grey.shade900.withValues(alpha: 0.85)
-                    : Colors.white.withValues(alpha: 0.95),
+                    : Colors.white.withValues(alpha: 0.85),
                 child: Padding(
                   padding: const EdgeInsets.all(32),
                   child: Center(
@@ -1794,7 +1777,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               return Card(
                 color: _isDarkMode
                     ? Colors.grey.shade900.withValues(alpha: 0.85)
-                    : Colors.white.withValues(alpha: 0.95),
+                    : Colors.white.withValues(alpha: 0.85),
                 child: Padding(
                   padding: const EdgeInsets.all(32),
                   child: Center(
@@ -1826,7 +1809,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final resultColor = _getResultColor(run.result);
     final cardBg = _isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
 
@@ -2560,7 +2543,7 @@ class _LocalTimeCardState extends State<LocalTimeCard> {
   Widget build(BuildContext context) {
     final cardBg = widget.isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final textColor = widget.isDarkMode ? Colors.white : Colors.black87;
     final subtextColor =
         widget.isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
@@ -2635,3 +2618,4 @@ class _LocalTimeCardState extends State<LocalTimeCard> {
     );
   }
 }
+

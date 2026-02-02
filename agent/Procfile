@@ -1,0 +1,1 @@
+web: AGENT_RUN_MAIN=true node index.js
