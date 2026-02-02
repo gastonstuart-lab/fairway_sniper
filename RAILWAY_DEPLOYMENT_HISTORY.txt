@@ -1,0 +1,79 @@
+Railway Deployment History (Fairway Sniper)
+Date: Feb 2, 2026
+
+1) Initial Goal
+- Move the agent from localhost to Railway for 24/7 operation.
+- Update Flutter app to point to Railway URL.
+
+2) App URL Update
+- lib/services/agent_base_url.dart updated to use: https://fairwaysniper-production.up.railway.app
+- App successfully connected to the agent (health 200, fast tee time/name fetch from cloud).
+
+3) Railway Environment Configuration
+- Set AGENT_RUN_MAIN=true
+- Set Firebase credentials: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
+- Set timezone (Europe/London) and login URL.
+
+4) Firebase Admin Initialization Issues
+- ERROR: Failed to parse private key (invalid PEM / literal \n vs real newlines).
+- Resolution: use private_key value from service account JSON and keep literal \n so code can replace with real newlines.
+- After fix: Firebase Admin initialized successfully.
+- Runner enabled: jobs detected, claimed, and scheduled.
+
+5) Playwright Browser Missing (Main Blocker)
+- ERROR repeatedly in logs:
+  browserType.launchPersistentContext: Executable doesn't exist at /root/.cache/ms-playwright/...
+- Result: fetch tee times & booking fail; warm session fails.
+
+6) Attempted Fixes (All Failed)
+- postinstall script: "npx playwright install" (not executed)
+- build script: "npx playwright install" (not executed)
+- nixpacks.toml in agent/ (ignored)
+- nixpacks.toml in root (ignored)
+- Root Dockerfile (Railpack still used)
+- Switch Builder to Dockerfile (Railway reported missing Dockerfile)
+
+7) Root Cause Discovered
+- Service Root Directory set to /agent in Railway.
+- Dockerfile for agent was ignored by agent/.gitignore, so it never reached GitHub.
+- Railway kept building with Railpack and never installed Playwright browsers.
+
+8) Dockerfile Solution (in progress)
+- Dockerfile created in /agent using Playwright base image:
+  FROM mcr.microsoft.com/playwright:v1.57.0-jammy
+- agent/.gitignore updated to allow Dockerfile.
+- Dockerfile and gitignore pushed.
+- Railway Builder set to Dockerfile, Root Directory = /agent.
+- Dockerfile Path should be "Dockerfile" (relative to /agent root).
+- Multiple failed deploys still reported:
+  Dockerfile `/agent/Dockerfile` does not exist (likely because Dockerfile not committed earlier).
+
+9) Alternative Solution (Current Best Option)
+Use Railpack and force Playwright install at build time:
+- Builder: Railpack
+- Root Directory: agent
+- Custom Build Command:
+  npm install && npx playwright install chromium
+- Custom Start Command:
+  AGENT_RUN_MAIN=true node index.js
+- Deploy and confirm build logs show: npx playwright install chromium
+
+10) Current Status
+- Agent runs on Railway and responds to /api/health.
+- Firebase Admin initializes and Runner starts.
+- Jobs can be detected and claimed.
+- Playwright still not installed => booking & tee time fetch fail.
+
+11) Next Steps
+Option A (Dockerfile):
+- Ensure /agent/Dockerfile is in GitHub.
+- Railway: Builder=Dockerfile, Root Directory=agent, Dockerfile Path=Dockerfile.
+- Deploy and verify logs show: FROM mcr.microsoft.com/playwright:v1.57.0-jammy
+
+Option B (Railpack):
+- Builder=Railpack, Root Directory=agent.
+- Set Custom Build Command:
+  npm install && npx playwright install chromium
+- Deploy and verify build logs include playwright install.
+
+If either option succeeds, booking and tee time fetch should work immediately.
