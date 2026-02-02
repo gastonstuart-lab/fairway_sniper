@@ -2417,7 +2417,7 @@ async function executeReleaseBooking(
         confirmationText,
       );
   }
-  return { booked, confirmationText, playersFilled, clickDeltaMs: clickDelta };
+  return { booked, confirmationText, playersFilled, clickDeltaMs: fireLatencyMs };
 }
 
 async function verifyBookingConfirmation(page, timeLabel, timeoutMs = 10000) {
