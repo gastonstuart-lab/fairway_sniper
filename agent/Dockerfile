@@ -5,8 +5,8 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (npm install handles lock file updates)
+RUN npm install --omit=dev
 
 # Install Playwright with system dependencies
 RUN npx playwright install --with-deps chromium
