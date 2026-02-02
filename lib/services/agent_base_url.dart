@@ -19,18 +19,18 @@ String defaultAgentBaseUrl() {
   }
 
   if (kIsWeb) {
-    return 'http://localhost:3000';
+    return 'https://fairwaysniper-production.up.railway.app';
   }
 
   switch (defaultTargetPlatform) {
     case TargetPlatform.android:
-      return 'http://10.0.2.2:3000';
+      return 'https://fairwaysniper-production.up.railway.app';
     case TargetPlatform.iOS:
     case TargetPlatform.macOS:
     case TargetPlatform.windows:
     case TargetPlatform.linux:
     case TargetPlatform.fuchsia:
-      return 'http://localhost:3000';
+      return 'https://fairwaysniper-production.up.railway.app';
   }
 }
 
