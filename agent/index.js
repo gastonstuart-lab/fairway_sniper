@@ -75,6 +75,11 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'fairway-sniper-agent' });
 });
 
+// Warm-up endpoint for Railway cold-start mitigation
+app.get('/api/warm', (req, res) => {
+  res.json({ status: 'warm', timestamp: new Date().toISOString() });
+});
+
 // Debug endpoint for warm session status (must be after app is defined)
 app.get('/api/warm-status', (req, res) => {
   res.json(warmSession.getWarmStatus());
@@ -439,6 +444,11 @@ const CONFIG = {
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
   SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '5', 10),
   DRY_RUN: process.argv.includes('--dry-run'),
+  // Railway cold-start mitigation
+  WARM_UP_WINDOW_MINUTES: Number.parseInt(process.env.WARM_UP_WINDOW_MINUTES || '5', 10),
+  WARM_UP_TRIGGER_MINUTES: Number.parseInt(process.env.WARM_UP_TRIGGER_MINUTES || '3', 10),
+  WARM_UP_POLL_INTERVAL_MS: Number.parseInt(process.env.WARM_UP_POLL_INTERVAL_MS || '30000', 10),
+  AGENT_URL: process.env.AGENT_URL || 'https://fairwaysniper-production.up.railway.app',
 };
 
 initFirebaseAdmin();
@@ -956,6 +966,106 @@ async function resumeRunningJobs() {
   }
 }
 
+// ========================================
+// RAILWAY COLD-START MITIGATION
+// ========================================
+
+async function warmUpSchedulerTick() {
+  if (!db) return;
+  
+  try {
+    const now = Date.now();
+    const windowStart = now;
+    const windowEnd = now + CONFIG.WARM_UP_WINDOW_MINUTES * 60 * 1000;
+    
+    // Query jobs with fireTime in the next 5 minutes
+    const snapshot = await db
+      .collection('jobs')
+      .where('mode', '==', 'sniper')
+      .where('status', 'in', ['active', 'ready', 'claimed', 'running'])
+      .get();
+    
+    if (snapshot.empty) return;
+    
+    for (const doc of snapshot.docs) {
+      const job = { id: doc.id, ...doc.data() };
+      const fireTime = getFireTimeFromJob(job);
+      if (!fireTime) continue;
+      
+      const fireMs = fireTime.getTime();
+      const minutesUntilFire = (fireMs - now) / 60000;
+      
+      // Check if within warm-up window and trigger threshold
+      if (minutesUntilFire > 0 && minutesUntilFire <= CONFIG.WARM_UP_WINDOW_MINUTES) {
+        const warmedAt = job.warmed_at || job.warmedAt;
+        const alreadyWarmed = warmedAt && (now - toDateMaybe(warmedAt)?.getTime()) < 5 * 60 * 1000;
+        
+        if (!alreadyWarmed && minutesUntilFire <= CONFIG.WARM_UP_TRIGGER_MINUTES) {
+          console.log(`[WARM-UP] Job ${job.id} fires in ${minutesUntilFire.toFixed(1)} min - warming service`);
+          
+          // Self-ping to wake Railway service
+          try {
+            const warmUrl = `${CONFIG.AGENT_URL}/api/warm`;
+            const response = await fetch(warmUrl, { 
+              method: 'GET',
+              signal: AbortSignal.timeout(5000)
+            });
+            
+            if (response.ok) {
+              console.log(`[WARM-UP] Service warmed successfully for job ${job.id}`);
+            } else {
+              console.warn(`[WARM-UP] Warm ping returned ${response.status}`);
+            }
+          } catch (fetchErr) {
+            console.error(`[WARM-UP] Self-ping failed:`, fetchErr.message);
+          }
+          
+          // Optionally preload tee sheet (warm browser session)
+          const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+          const username = job.brs_email || job.brsEmail || job.username;
+          const password = job.brs_password || job.brsPassword || job.password;
+          
+          if (targetPlayDate && username && password) {
+            try {
+              console.log(`[WARM-UP] Preloading tee sheet for job ${job.id}`);
+              await warmSession.getWarmPage(targetPlayDate, username, password);
+              console.log(`[WARM-UP] Tee sheet preloaded for job ${job.id}`);
+            } catch (warmErr) {
+              console.warn(`[WARM-UP] Tee sheet preload failed:`, warmErr.message);
+            }
+          }
+          
+          // Mark as warmed in Firestore
+          await fsUpdateJob(job.id, {
+            warmed_at: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } else if (alreadyWarmed) {
+          console.log(`[WARM-UP] Job ${job.id} already warmed (${minutesUntilFire.toFixed(1)} min until fire)`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[WARM-UP] Scheduler tick error:', error.message);
+  }
+}
+
+function startWarmUpScheduler() {
+  if (!db) {
+    console.log('[WARM-UP] Firebase Admin not configured; warm-up scheduler disabled');
+    return;
+  }
+  
+  console.log(`[WARM-UP] Scheduler started (poll every ${CONFIG.WARM_UP_POLL_INTERVAL_MS / 1000}s, trigger at T-${CONFIG.WARM_UP_TRIGGER_MINUTES}min)`);
+  
+  // Run initial tick
+  warmUpSchedulerTick().catch((e) => console.error('[WARM-UP] Initial tick error:', e.message));
+  
+  // Schedule recurring ticks
+  setInterval(() => {
+    warmUpSchedulerTick().catch((e) => console.error('[WARM-UP] Tick error:', e.message));
+  }, CONFIG.WARM_UP_POLL_INTERVAL_MS).unref?.();
+}
+
 function startSniperRunner() {
   if (!db) {
     console.log('[RUNNER] Firebase Admin not configured; runner disabled');
@@ -1094,6 +1204,7 @@ if (process.env.AGENT_RUN_MAIN === 'true') {
   if (!schedulerRunning) {
     schedulerRunning = true;
     startSniperRunner();
+    startWarmUpScheduler();
   }
 }
 
