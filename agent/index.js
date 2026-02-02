@@ -10,21 +10,28 @@ import * as warmSession from './warm_session.js';
 import os from 'os';
 import crypto from 'crypto';
 
-// --- Release watcher: Wait for first booking link to appear ---
-async function waitForBookingRelease(page, timeoutMs = 2000) {
-  return await page.evaluateHandle((timeout) => {
+// --- Release watcher: Wait for first booking link to appear AND click with latency measurement ---
+async function waitForBookingRelease(page, timeoutMs = 2000, skipClick = false) {
+  return await page.evaluateHandle((args) => {
+    const { timeout, skipClick } = args;
     return new Promise((resolve) => {
       let done = false;
-      const start = Date.now();
       const existing = document.querySelector('a[href*="/bookings/book"]');
       if (existing) {
         const slotText = existing.textContent || '';
         const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
         const slotTime = match ? match[1] : null;
         console.log('[SNIPER] Booking link already present; using immediate match');
+        
+        // Measure and click atomically
+        const tDetect = performance.now();
+        if (!skipClick) existing.click();
+        const tClick = performance.now();
+        const fireLatencyMs = Math.round(tClick - tDetect);
+        
         resolve({
           found: true,
-          elapsedMs: 0,
+          fireLatencyMs,
           slotTime,
           immediate: true,
         });
@@ -38,9 +45,16 @@ async function waitForBookingRelease(page, timeoutMs = 2000) {
           const slotText = link.textContent || '';
           const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
           const slotTime = match ? match[1] : null;
+          
+          // Measure and click atomically
+          const tDetect = performance.now();
+          if (!skipClick) link.click();
+          const tClick = performance.now();
+          const fireLatencyMs = Math.round(tClick - tDetect);
+          
           resolve({
             found: true,
-            elapsedMs: Date.now() - start,
+            fireLatencyMs,
             slotTime,
           });
           observer.disconnect();
@@ -51,12 +65,12 @@ async function waitForBookingRelease(page, timeoutMs = 2000) {
       setTimeout(() => {
         if (!done) {
           done = true;
-          resolve({ found: false, elapsedMs: Date.now() - start });
+          resolve({ found: false, fireLatencyMs: null });
           observer.disconnect();
         }
       }, timeout);
     });
-  }, timeoutMs).then(h => h.jsonValue ? h.jsonValue() : h);
+  }, { timeout: timeoutMs, skipClick }).then(h => h.jsonValue ? h.jsonValue() : h);
 }
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -2361,29 +2375,9 @@ async function executeReleaseBooking(
   skipClick = false,
   clickDeltaOverride = null,
 ) {
-  const clickStart = Date.now();
-  // Log target reached and click delta
-  console.log(`[FIRE] 🎯 Target reached at: ${new Date(fireTime).toISOString()}`);
-  let clickDelta = clickDeltaOverride;
-  
-  // TEST_MODE: suppress booking click but continue flow for validation
-  if (CONFIG.TEST_MODE) {
-    console.log(`[TEST_MODE] ⚠️ Booking click SUPPRESSED (validation mode)`);
-    clickDelta = Date.now() - fireTime;
-    console.log(`[TEST_MODE] 📊 Click delta (simulated): ${clickDelta}ms`);
-    if (jobId) logJobEvent(jobId, `🧪 TEST_MODE: Click suppressed, delta=${clickDelta}ms`);
-  } else if (!skipClick) {
-    await locator.click();
-    clickDelta = Date.now() - fireTime;
-    console.log(`[FIRE] ✅ Click executed delta: ${clickDelta}ms`);
-  } else if (typeof clickDelta === 'number') {
-    console.log(`[FIRE] Click executed delta: ${clickDelta}ms`);
-  }
-  
-  if (clickDelta > 200) {
-    console.warn(`[WARN] ⚠️ Booking click delta >200ms: ${clickDelta}ms`);
-    if (jobId) logJobEvent(jobId, `⚠️ FIRE DELTA TOO HIGH (${clickDelta}ms)`);
-  }
+  // Click already executed in page context (skipClick=true for release mode)
+  // clickDeltaOverride contains the fireLatencyMs from MutationObserver
+  const fireLatencyMs = clickDeltaOverride;
   
   // TEST_MODE: return early with validation metrics (skip player fill)
   if (CONFIG.TEST_MODE) {
@@ -2392,7 +2386,7 @@ async function executeReleaseBooking(
       booked: false, 
       confirmationText: 'TEST_MODE_VALIDATION_ONLY', 
       playersFilled: [], 
-      clickDeltaMs: clickDelta 
+      clickDeltaMs: fireLatencyMs 
     };
   }
   
@@ -2650,7 +2644,7 @@ async function runBooking(config) {
         console.log(
           `[SNIPER] Release watcher (MutationObserver) armed... attempt ${attempt}/${maxAttempts} timeout ${watchMs}ms`,
         );
-        releaseResult = await waitForBookingRelease(page, watchMs);
+        releaseResult = await waitForBookingRelease(page, watchMs, CONFIG.TEST_MODE);
         if (releaseResult && releaseResult.found) {
           break;
         }
@@ -2668,34 +2662,36 @@ async function runBooking(config) {
         }
       }
       if (releaseResult && releaseResult.found) {
-        const detectedAt = targetReachedAt + releaseResult.elapsedMs;
-        const delta = detectedAt - targetReachedAt;
-        console.log(`[FIRE] Booking detected at: ${new Date(detectedAt).toISOString()}`);
-        console.log(`[FIRE] Click executed delta: ${delta}ms`);
-        if (delta > 200) console.warn(`[WARN] Booking click delta >200ms: ${delta}ms`);
-        // Click the first booking link instantly
-        const bookingLink = page.locator('a[href*="/bookings/book"]').first();
-        console.log('[SNIPER] Clicked booking link');
+        const fireLatencyMs = releaseResult.fireLatencyMs;
+        console.log(`[FIRE] FIRE_LATENCY_MS=${fireLatencyMs}`);
+        if (fireLatencyMs > 200) {
+          console.warn(`[WARN] ⚠️ FIRE_LATENCY_MS >200ms: ${fireLatencyMs}ms`);
+          if (jobId) logJobEvent(jobId, `⚠️ FIRE LATENCY HIGH (${fireLatencyMs}ms)`);
+        }
+        if (CONFIG.TEST_MODE) {
+          console.log(`[TEST_MODE] ⚠️ Booking click executed in page context (TEST_MODE active)`);
+        }
+        // Click already executed in page context by waitForBookingRelease
         const clickResult = await executeReleaseBooking(
           page,
-          bookingLink,
+          null,
           additionalPlayers,
           slotsData[0]?.openSlots || 3,
-          targetReachedAt + releaseResult.elapsedMs,
+          targetReachedAt,
           jobId,
           dryRun,
+          true,
+          fireLatencyMs,
         );
         if (dryRun) {
-          const clickDeltaMs = clickResult?.clickDeltaMs ?? null;
           const diagnostics = {
-            click_delta_ms: clickDeltaMs,
-            release_detect_delta_ms: delta,
+            fire_latency_ms: fireLatencyMs,
             verification_url: page.url(),
             verification_signal: 'dry-run',
           };
           bookedTime = releaseResult.slotTime || 'release';
           fallbackLevel = 0;
-          notes.push(`Dry-run; detected at delta ${delta}ms`);
+          notes.push(`Dry-run; fire_latency=${fireLatencyMs}ms`);
           await fsFinishRun(runId, {
             result: 'dry_run',
             notes: `Dry-run; ${notes.join(' | ')}`,
