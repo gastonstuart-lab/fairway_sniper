@@ -12,43 +12,21 @@ import crypto from 'crypto';
 
 // --- Release watcher: Wait for first booking link to appear AND click with latency measurement ---
 async function waitForBookingRelease(page, timeoutMs = 2000, skipClick = false) {
-  return await page.evaluateHandle((args) => {
-    const { timeout, skipClick } = args;
-    return new Promise((resolve) => {
-      let done = false;
-      const existing = document.querySelector('a[href*="/bookings/book"]');
-      if (existing) {
-        const slotText = existing.textContent || '';
-        const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
-        const slotTime = match ? match[1] : null;
-        console.log('[SNIPER] Booking link already present; using immediate match');
-        
-        // Measure and click atomically
-        const tDetect = performance.now();
-        if (!skipClick) existing.click();
-        const tClick = performance.now();
-        const fireLatencyMs = Math.round(tClick - tDetect);
-        
-        resolve({
-          found: true,
-          fireLatencyMs,
-          slotTime,
-          immediate: true,
-        });
-        return;
-      }
-      const observer = new MutationObserver(() => {
-        if (done) return;
-        const link = document.querySelector('a[href*="/bookings/book"]');
-        if (link) {
-          done = true;
-          const slotText = link.textContent || '';
+  try {
+    return await page.evaluate((args) => {
+      const { timeout, skipClick } = args;
+      return new Promise((resolve) => {
+        let done = false;
+        const existing = document.querySelector('a[href*="/bookings/book"]');
+        if (existing) {
+          const slotText = existing.textContent || '';
           const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
           const slotTime = match ? match[1] : null;
+          console.log('[SNIPER] Booking link already present; using immediate match');
           
           // Measure and click atomically
           const tDetect = performance.now();
-          if (!skipClick) link.click();
+          if (!skipClick) existing.click();
           const tClick = performance.now();
           const fireLatencyMs = Math.round(tClick - tDetect);
           
@@ -56,21 +34,51 @@ async function waitForBookingRelease(page, timeoutMs = 2000, skipClick = false) 
             found: true,
             fireLatencyMs,
             slotTime,
+            immediate: true,
           });
-          observer.disconnect();
+          return;
         }
+        const observer = new MutationObserver(() => {
+          if (done) return;
+          const link = document.querySelector('a[href*="/bookings/book"]');
+          if (link) {
+            done = true;
+            const slotText = link.textContent || '';
+            const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
+            const slotTime = match ? match[1] : null;
+            
+            // Measure and click atomically
+            const tDetect = performance.now();
+            if (!skipClick) link.click();
+            const tClick = performance.now();
+            const fireLatencyMs = Math.round(tClick - tDetect);
+            
+            resolve({
+              found: true,
+              fireLatencyMs,
+              slotTime,
+            });
+            observer.disconnect();
+          }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        // Fallback: timeout
+        setTimeout(() => {
+          if (!done) {
+            done = true;
+            resolve({ found: false, fireLatencyMs: null });
+            observer.disconnect();
+          }
+        }, timeout);
       });
-      observer.observe(document.body, { childList: true, subtree: true });
-      // Fallback: timeout
-      setTimeout(() => {
-        if (!done) {
-          done = true;
-          resolve({ found: false, fireLatencyMs: null });
-          observer.disconnect();
-        }
-      }, timeout);
-    });
-  }, { timeout: timeoutMs, skipClick }).then(h => h.jsonValue ? h.jsonValue() : h);
+    }, { timeout: timeoutMs, skipClick });
+  } catch (error) {
+    const msg = error?.message || String(error);
+    if (msg.includes('Execution context was destroyed')) {
+      return { found: false, fireLatencyMs: null, error: 'context-destroyed' };
+    }
+    throw error;
+  }
 }
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
