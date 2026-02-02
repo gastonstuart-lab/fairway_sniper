@@ -12,6 +12,20 @@ A complete automation system for booking golf tee times at Galgorm Castle (BRS G
 
 ## 🚀 Quick Start
 
+## How to run agent (Windows)
+
+```bash
+cd agent
+npm install
+npm run start
+```
+
+Test:
+
+```powershell
+Invoke-RestMethod http://localhost:3000/api/health
+```
+
 ### Prerequisites
 - Node.js 18+ 
 - Firebase project with Firestore and Authentication enabled

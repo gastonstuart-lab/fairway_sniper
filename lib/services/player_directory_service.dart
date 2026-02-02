@@ -3,19 +3,18 @@ import 'dart:async';
 import 'package:http/http.dart' as http;
 import 'package:fairway_sniper/models/player_directory.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/services/agent_base_url.dart';
 
 /// Service for managing the player directory cache
 /// Handles fetching from agent and caching in Firestore
 class PlayerDirectoryService {
   final FirebaseService _firebaseService;
-  final String agentBaseUrl;
 
   // Cache duration - refresh if directory is older than this
   static const Duration cacheMaxAge = Duration(days: 7);
 
   PlayerDirectoryService({
     required FirebaseService firebaseService,
-    required this.agentBaseUrl,
   }) : _firebaseService = firebaseService;
 
   /// Get the player directory, using cache if available and fresh
@@ -27,8 +26,16 @@ class PlayerDirectoryService {
     String? password,
   }) async {
     // Allow local mode: if credentials are provided, use a local fallback userId
-    final userId = _firebaseService.currentUserId ?? 'local-user';
-    final skipCache = username != null && password != null;
+    String userId = 'local-user';
+    bool skipCache = true;
+    try {
+      userId = _firebaseService.currentUserId ?? 'local-user';
+      skipCache = _firebaseService.currentUserId == null;
+    } catch (e) {
+      print('⚠️ Firebase not available, skipping cache. $e');
+      userId = 'local-user';
+      skipCache = true;
+    }
 
     // Try to load from cache first (unless forcing refresh or skipping cache because creds provided)
     if (!forceRefresh && !skipCache) {
@@ -90,7 +97,7 @@ class PlayerDirectoryService {
       await _firebaseService.savePlayerDirectory(userId, directory);
     } catch (e) {
       print('❌ Error saving player directory to cache: $e');
-      rethrow;
+      // Cache failure should not block UI usage.
     }
   }
 
@@ -118,7 +125,9 @@ class PlayerDirectoryService {
         return null;
       }
 
-      print('🔑 Using credentials: $finalUsername');
+      // Do not log credentials.
+
+      final agentBaseUrl = await getAgentBaseUrl();
 
       // Make request to agent
       final url = Uri.parse('$agentBaseUrl/api/brs/player-directory');

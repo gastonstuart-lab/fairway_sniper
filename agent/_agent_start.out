@@ -1,0 +1,7 @@
+=== [AGENT] index.js starting (isolation test) ===
+=== [AGENT] index.js (no requires) ===
+⚠️ Firebase Admin not configured. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY to enable DB logging.
+🚀 Fairway Sniper Agent HTTP server running on port 3000
+   - Health: http://localhost:3000/api/health
+   - Sniper (unified): POST http://localhost:3000/api/snipe
+   - Fetch Tee Times: POST http://localhost:3000/api/fetch-tee-times

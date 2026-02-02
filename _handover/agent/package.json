@@ -1,0 +1,26 @@
+{
+  "name": "fairway-sniper-agent",
+  "version": "1.0.0",
+  "description": "BRS Golf auto-booking automation agent",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "verify:health": "pwsh -ExecutionPolicy Bypass -File ./scripts/verify-health.ps1",
+    "verify:release": "pwsh -ExecutionPolicy Bypass -File ./RELEASE_SNIPE_VERIFICATION.ps1",
+    "cleanup": "pwsh -ExecutionPolicy Bypass -File ./scripts/cleanup.ps1"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.57.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.18.2",
+    "firebase-admin": "^12.7.0",
+    "luxon": "^3.4.4",
+    "winston": "^3.18.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

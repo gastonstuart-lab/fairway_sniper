@@ -1,16 +1,450 @@
-
-
-console.log('=== [AGENT] index.js starting (isolation test) ===');
 import 'dotenv/config';
 import { chromium } from '@playwright/test';
 import express from 'express';
 import cors from 'cors';
-console.log('=== [AGENT] index.js (no requires) ===');
+import admin from 'firebase-admin';
+import fs from 'fs';
+import path from 'path';
+import { DateTime } from 'luxon';
+import * as warmSession from './warm_session.js';
+import os from 'os';
+import crypto from 'crypto';
 
-// ...existing code...
+// --- Release watcher: Wait for first booking link to appear AND click with latency measurement ---
+async function waitForBookingRelease(page, timeoutMs = 2000, skipClick = false) {
+  try {
+    return await page.evaluate((args) => {
+      const { timeout, skipClick } = args;
+      return new Promise((resolve) => {
+        let done = false;
+        const existing = document.querySelector('a[href*="/bookings/book"]');
+        if (existing) {
+          const slotText = existing.textContent || '';
+          const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
+          const slotTime = match ? match[1] : null;
+          console.log('[SNIPER] Booking link already present; using immediate match');
+          
+          // Measure and click atomically
+          const tDetect = performance.now();
+          if (!skipClick) existing.click();
+          const tClick = performance.now();
+          const fireLatencyMs = Math.round(tClick - tDetect);
+          
+          resolve({
+            found: true,
+            fireLatencyMs,
+            slotTime,
+            immediate: true,
+          });
+          return;
+        }
+        const observer = new MutationObserver(() => {
+          if (done) return;
+          const link = document.querySelector('a[href*="/bookings/book"]');
+          if (link) {
+            done = true;
+            const slotText = link.textContent || '';
+            const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
+            const slotTime = match ? match[1] : null;
+            
+            // Measure and click atomically
+            const tDetect = performance.now();
+            if (!skipClick) link.click();
+            const tClick = performance.now();
+            const fireLatencyMs = Math.round(tClick - tDetect);
+            
+            resolve({
+              found: true,
+              fireLatencyMs,
+              slotTime,
+            });
+            observer.disconnect();
+          }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        // Fallback: timeout
+        setTimeout(() => {
+          if (!done) {
+            done = true;
+            resolve({ found: false, fireLatencyMs: null });
+            observer.disconnect();
+          }
+        }, timeout);
+      });
+    }, { timeout: timeoutMs, skipClick });
+  } catch (error) {
+    const msg = error?.message || String(error);
+    if (msg.includes('Execution context was destroyed')) {
+      return { found: false, fireLatencyMs: null, error: 'context-destroyed' };
+    }
+    throw error;
+  }
+}
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const agentDir = path.dirname(__filename);
+
+// === [AGENT] index.js starting (cleaned up) ===
 const app = express();
+
 app.use(cors());
 app.use(express.json());
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'fairway-sniper-agent' });
+});
+
+// Warm-up endpoint for Railway cold-start mitigation
+app.get('/api/warm', (req, res) => {
+  res.json({ status: 'warm', timestamp: new Date().toISOString() });
+});
+
+// Debug endpoint for warm session status (must be after app is defined)
+app.get('/api/warm-status', (req, res) => {
+  res.json(warmSession.getWarmStatus());
+});
+
+// Self-check endpoint for diagnostics
+app.get('/api/self-check', (req, res) => {
+  res.json({
+    file: __filename,
+    cwd: process.cwd(),
+    routes: listRegisteredRoutes(),
+    time: new Date().toISOString(),
+  });
+});
+
+// Fetch available tee times for a single date
+app.post('/api/fetch-tee-times', async (req, res) => {
+  let browser;
+  try {
+    const { date, username, password, club, reuseBrowser = true, includeUnavailable = false } = req.body || {};
+    if (!date || !username || !password) {
+      return res.status(400).json({ success: false, error: 'Missing date/username/password' });
+    }
+
+    let page;
+    if (reuseBrowser) {
+      page = await warmSession.getWarmPage(date, username, password);
+    } else {
+      browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+      const context = await browser.newContext();
+      page = await context.newPage();
+      await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+    }
+
+    await navigateToTeeSheet(page, date, false);
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(300);
+    if (!pageMatchesDate(page, new Date(date))) {
+      if (browser) await browser.close();
+      return res.json({ success: true, date, count: 0, times: [], slots: [] });
+    }
+    const { times, slots } = await scrapeAvailableTimes(page, { includeUnavailable });
+
+    if (browser) await browser.close();
+    return res.json({ success: true, date, count: times.length, times, slots });
+  } catch (error) {
+    if (browser) await browser.close().catch(() => {});
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Fetch available tee times across a range of days
+app.post('/api/fetch-tee-times-range', async (req, res) => {
+  let browser;
+  try {
+    const { startDate, days = 5, username, password, club, reuseBrowser = true } = req.body || {};
+    if (!startDate || !username || !password) {
+      return res.status(400).json({ success: false, error: 'Missing startDate/username/password' });
+    }
+
+    const start = new Date(startDate);
+    if (Number.isNaN(start.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid startDate' });
+    }
+
+    let page;
+    if (reuseBrowser) {
+      page = await warmSession.getWarmPage(start, username, password);
+    } else {
+      browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+      const context = await browser.newContext();
+      page = await context.newPage();
+      await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
+    }
+
+    const daysInt = Math.max(1, Math.min(14, Number(days) || 5));
+    const results = [];
+    for (let i = 0; i < daysInt; i++) {
+      const target = new Date(start);
+      target.setDate(start.getDate() + i);
+      await navigateToTeeSheet(page, target, false);
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(300);
+      if (!pageMatchesDate(page, target)) {
+        results.push({
+          date: target.toISOString().slice(0, 10),
+          times: [],
+          slots: [],
+        });
+        continue;
+      }
+      const { times, slots } = await scrapeAvailableTimes(page);
+      results.push({
+        date: target.toISOString().slice(0, 10),
+        times,
+        slots,
+      });
+    }
+
+    if (browser) await browser.close();
+    return res.json({ success: true, days: results });
+  } catch (error) {
+    if (browser) await browser.close().catch(() => {});
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Immediate booking endpoint (Normal mode)
+app.post('/api/book-now', async (req, res) => {
+  try {
+    const { username, password, targetDate, preferredTimes, players = [], partySize, pushToken } = req.body || {};
+    if (!username || !password || !targetDate) {
+      return res.status(400).json({ success: false, error: 'Missing username/password/targetDate' });
+    }
+
+    const warmPage = await warmSession.getWarmPage(targetDate, username, password);
+    const result = await runBooking({
+      jobId: `book-now-${Date.now()}`,
+      ownerUid: 'local',
+      loginUrl: CONFIG.CLUB_LOGIN_URL,
+      username,
+      password,
+      preferredTimes: Array.isArray(preferredTimes) ? preferredTimes : [],
+      targetFireTime: Date.now() + 500,
+      targetPlayDate: targetDate,
+      players: Array.isArray(players) ? players : [],
+      partySize,
+      slotsData: [],
+      warmPage,
+      useReleaseObserver: false,
+      pushToken,
+    });
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Player directory endpoint for Flutter app
+app.post('/api/brs/player-directory', async (req, res) => {
+  try {
+    const { username } = req.body || {};
+    const analysisPath = path.join(agentDir, 'inspection-output', 'form-analysis.json');
+    const bookingFormPath = path.join(agentDir, 'inspection-output', 'booking-form.html');
+
+    const normalizeOptLabel = (label) => String(label || '').trim().toLowerCase();
+    const buildPlayer = (value, text) => ({
+      name: String(text || '').trim(),
+      id: String(value || '').trim(),
+      type: String(value || '').trim() === '-2' ? 'guest' : 'member',
+    });
+
+    const parseOptions = (block) => {
+      const optionRegex = /<option[^>]*value="([^"]*)"[^>]*>([^<]*)<\/option>/gi;
+      const list = [];
+      let opt;
+      while ((opt = optionRegex.exec(block)) !== null) {
+        const value = opt[1];
+        const text = opt[2];
+        if (!value || !text) continue;
+        if (String(value).trim() === '') continue;
+        if (String(text).toLowerCase().includes('start typing')) continue;
+        list.push(buildPlayer(value, text));
+      }
+      return list;
+    };
+
+    let categories = [];
+    let players = [];
+    let currentUser = null;
+
+    if (fs.existsSync(bookingFormPath)) {
+      const html = await fs.promises.readFile(bookingFormPath, 'utf8');
+      const currentMemberMatch = html.match(
+        /id="current-member-id"[^>]*data-member-id="([^"]+)"/i
+      );
+      const currentMemberId = currentMemberMatch ? String(currentMemberMatch[1]).trim() : null;
+
+      const selectMatch =
+        html.match(
+          /<select[^>]*id="member_booking_form_player_3"[^>]*>([\s\S]*?)<\/select>/i
+        ) ||
+        html.match(
+          /<select[^>]*id="member_booking_form_player_4"[^>]*>([\s\S]*?)<\/select>/i
+        );
+
+      if (selectMatch) {
+        const selectHtml = selectMatch[1];
+        const optgroupRegex = /<optgroup[^>]*label="([^"]+)"[^>]*>([\s\S]*?)<\/optgroup>/gi;
+        let groupMatch;
+        const groupCategories = [];
+
+        while ((groupMatch = optgroupRegex.exec(selectHtml)) !== null) {
+          const label = groupMatch[1];
+          const block = groupMatch[2];
+          const groupPlayers = parseOptions(block);
+          if (groupPlayers.length === 0) continue;
+
+          const lower = normalizeOptLabel(label);
+          let name = String(label).trim();
+          if (lower.includes('budd')) name = 'You and your buddies';
+          else if (lower.includes('general')) name = 'Guests';
+          else if (lower.includes('other')) name = 'Members';
+          else if (lower.includes('member')) name = 'Members';
+
+          groupCategories.push({ name, players: groupPlayers });
+          players = players.concat(groupPlayers);
+        }
+
+        if (groupCategories.length > 0) {
+          categories = groupCategories;
+          if (currentMemberId) {
+            currentUser = players.find((p) => p.id === currentMemberId) || null;
+          }
+        }
+      }
+    }
+
+    if (categories.length === 0) {
+      if (!fs.existsSync(analysisPath)) {
+        return res.status(404).json({ success: false, error: 'player-directory-not-found' });
+      }
+
+      const raw = await fs.promises.readFile(analysisPath, 'utf8');
+      const data = JSON.parse(raw);
+      const selects = Array.isArray(data?.selectElements) ? data.selectElements : [];
+      let options = [];
+      for (const sel of selects) {
+        if (sel?.id && String(sel.id).includes('member_booking_form_player_')) {
+          const opts = Array.isArray(sel.options) ? sel.options : [];
+          if (opts.length > options.length) options = opts;
+        }
+      }
+
+      players = options
+        .filter((o) => o && o.value !== '' && o.text)
+        .map((o) => buildPlayer(o.value, o.text));
+
+      currentUser = players.find((p) => p.id === String(username)) || null;
+      const guests = players.filter((p) => p.type === 'guest');
+      const members = players.filter((p) => p.type === 'member' && p.id !== currentUser?.id);
+
+      categories = [];
+      if (currentUser) {
+        categories.push({
+          name: 'You',
+          players: [currentUser],
+        });
+      }
+      if (guests.length > 0) {
+        categories.push({
+          name: 'Guests',
+          players: guests,
+        });
+      }
+      categories.push({
+        name: 'Members',
+        players: members,
+      });
+    } else {
+      const guests = players.filter((p) => p.type === 'guest');
+      const members = players.filter((p) => p.type === 'member');
+      const buddies = categories
+        .filter((c) => normalizeOptLabel(c.name).includes('budd'))
+        .flatMap((c) => c.players)
+        .filter((p) => !currentUser || p.id !== currentUser.id);
+
+      const finalCategories = [];
+      if (currentUser) {
+        finalCategories.push({ name: 'You', players: [currentUser] });
+      }
+      if (buddies.length > 0) {
+        finalCategories.push({ name: 'You and your buddies', players: buddies });
+      }
+      if (guests.length > 0) {
+        finalCategories.push({ name: 'Guests', players: guests });
+      }
+      if (members.length > 0) {
+        finalCategories.push({ name: 'Members', players: members });
+      }
+      categories = finalCategories;
+    }
+
+    return res.json({
+      success: true,
+      count: players.length,
+      categories,
+      currentUserName: currentUser?.name ?? null,
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Global safety nets to keep the process from exiting silently
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED_REJECTION', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT_EXCEPTION', err);
+});
+
+
+
+
+
+
+
+// ========================================
+// FIREBASE ADMIN INIT (optional)
+// ========================================
+
+let db = null;
+
+function initFirebaseAdmin() {
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+  if (!projectId || !clientEmail || !privateKey) {
+    console.log(
+      '⚠️ Firebase Admin not configured. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY to enable DB logging.',
+    );
+    return;
+  }
+
+  try {
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId,
+          clientEmail,
+          privateKey: privateKey.replace(/\\n/g, '\n'),
+        }),
+      });
+    }
+    db = admin.firestore();
+    console.log('✅ Firebase Admin initialized');
+  } catch (error) {
+    console.error('❌ Firebase Admin init failed:', error);
+  }
+}
 
 // ========================================
 // CONFIGURATION FROM ENVIRONMENT VARIABLES
@@ -23,10 +457,215 @@ const CONFIG = {
   BRS_USERNAME: process.env.BRS_USERNAME,
   BRS_PASSWORD: process.env.BRS_PASSWORD,
   CAPTCHA_API_KEY: process.env.CAPTCHA_API_KEY || '',
+  SNIPER_RELEASE_WATCH_MS: Number.parseInt(process.env.SNIPER_RELEASE_WATCH_MS || '8000', 10),
+  SNIPER_RELEASE_RETRY_COUNT: Number.parseInt(process.env.SNIPER_RELEASE_RETRY_COUNT || '2', 10),
+  SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS: Number.parseInt(
+    process.env.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS || '750',
+    10,
+  ),
+  SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
+  SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '10', 10),
   DRY_RUN: process.argv.includes('--dry-run'),
+  TEST_MODE: process.env.TEST_MODE === 'true',
+  // Railway cold-start mitigation
+  WARM_UP_WINDOW_MINUTES: Number.parseInt(process.env.WARM_UP_WINDOW_MINUTES || '5', 10),
+  WARM_UP_TRIGGER_MINUTES: Number.parseInt(process.env.WARM_UP_TRIGGER_MINUTES || '3', 10),
+  WARM_UP_POLL_INTERVAL_MS: Number.parseInt(process.env.WARM_UP_POLL_INTERVAL_MS || '30000', 10),
+  AGENT_URL: process.env.AGENT_URL || 'https://fairwaysniper-production.up.railway.app',
 };
 
+initFirebaseAdmin();
 
+function getGitHash() {
+  try {
+    const envHash = process.env.GIT_COMMIT || process.env.GIT_SHA;
+    if (envHash) return String(envHash).slice(0, 12);
+    return execSync('git rev-parse --short HEAD', {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+function listRegisteredRoutes() {
+  const routes = new Set();
+  const stack = app?._router?.stack || [];
+  for (const layer of stack) {
+    if (layer?.route?.path) {
+      const methods = Object.keys(layer.route.methods || {})
+        .map((m) => m.toUpperCase())
+        .join(',');
+      routes.add(`${methods} ${layer.route.path}`);
+    } else if (layer?.name === 'router' && layer?.handle?.stack) {
+      for (const sub of layer.handle.stack) {
+        if (sub?.route?.path) {
+          const methods = Object.keys(sub.route.methods || {})
+            .map((m) => m.toUpperCase())
+            .join(',');
+          routes.add(`${methods} ${sub.route.path}`);
+        }
+      }
+    }
+  }
+  return Array.from(routes.values()).sort();
+}
+
+function logStartupBanner(port) {
+  const expected = [
+    'GET /api/health',
+    'GET /api/jobs/:jobId',
+    'POST /api/sniper-test',
+  ];
+  console.log('='.repeat(60));
+  console.log('STARTUP OK');
+  console.log(`File: ${__filename}`);
+  console.log(`CWD: ${process.cwd()}`);
+  console.log(`Node: ${process.version}`);
+  console.log(`Git: ${getGitHash()}`);
+  console.log(`LISTENING :${port}`);
+  console.log('Routes loaded (expected):');
+  expected.forEach((r) => console.log(`  - ${r}`));
+  const actual = listRegisteredRoutes();
+  console.log('Routes loaded (actual snapshot):');
+  actual.forEach((r) => console.log(`  - ${r}`));
+  console.log('='.repeat(60));
+}
+
+// ========================================
+// IN-MEMORY JOB SCHEDULER (sniper test)
+// ========================================
+
+const JOB_MAX_QUEUE = 20;
+const jobStore = new Map();
+const jobLogPath = path.join(agentDir, 'agent_detached.log');
+
+function logJobEvent(jobId, message) {
+  const line = `[${new Date().toISOString()}] [JOB ${jobId}] ${message}\n`;
+  console.log(`[JOB ${jobId}] ${message}`);
+  fs.promises.appendFile(jobLogPath, line).catch(() => {});
+}
+
+function getJob(jobId) {
+  return jobStore.get(jobId) || null;
+}
+
+function setJob(jobId, patch) {
+  const prev = jobStore.get(jobId) || {};
+  const next = {
+    ...prev,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  jobStore.set(jobId, next);
+  return next;
+}
+
+function parseFireTime(minutes, fireTimeUtc) {
+  if (fireTimeUtc) {
+    const t = new Date(fireTimeUtc).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  const mins = Number.isFinite(Number(minutes)) ? Number(minutes) : 4;
+  return Date.now() + mins * 60 * 1000;
+}
+
+async function runSniperJob(jobId, payload) {
+  const {
+    username,
+    password,
+    targetDate,
+    preferredTimes,
+    players = [],
+    partySize,
+    fireTimeUtc,
+    minutes,
+  } = payload;
+
+  const fireTime = parseFireTime(minutes, fireTimeUtc);
+  setJob(jobId, {
+    status: 'queued',
+    scheduledFor: new Date(fireTime).toISOString(),
+    payload: { targetDate, preferredTimes, players, partySize },
+  });
+
+  const delayMs = Math.max(0, fireTime - Date.now());
+  logJobEvent(jobId, `Scheduled for ${new Date(fireTime).toISOString()} (in ${delayMs}ms)`);
+
+  setTimeout(async () => {
+    try {
+      setJob(jobId, { status: 'running', startedAt: new Date().toISOString() });
+      logJobEvent(jobId, 'Starting sniper job');
+
+      const warmPage = await warmSession.getWarmPage(targetDate, username, password);
+
+      const result = await runBooking({
+        jobId,
+        ownerUid: 'sniper-test',
+        loginUrl: CONFIG.CLUB_LOGIN_URL,
+        username,
+        password,
+        preferredTimes: Array.isArray(preferredTimes) ? preferredTimes : [],
+        targetFireTime: fireTime,
+        targetPlayDate: targetDate,
+        players,
+        partySize,
+        slotsData: [],
+        warmPage,
+        useReleaseObserver: false,
+      });
+
+      setJob(jobId, {
+        status: result?.success ? 'success' : 'failed',
+        finishedAt: new Date().toISOString(),
+        result,
+      });
+      logJobEvent(jobId, `Completed with status ${result?.success ? 'success' : 'failed'}`);
+    } catch (error) {
+      setJob(jobId, {
+        status: 'failed',
+        finishedAt: new Date().toISOString(),
+        error: error?.message || String(error),
+      });
+      logJobEvent(jobId, `Failed: ${error?.message || error}`);
+    }
+  }, delayMs);
+}
+
+// Job status endpoint
+app.get('/api/jobs/:jobId', (req, res) => {
+  const jobId = req.params.jobId;
+  const job = getJob(jobId);
+  if (!job) return res.status(404).json({ error: 'job-not-found' });
+  res.json(job);
+});
+
+// Sniper test endpoint
+app.post('/api/sniper-test', async (req, res) => {
+  try {
+    if (jobStore.size >= JOB_MAX_QUEUE) {
+      return res.status(429).json({ error: 'job-queue-full' });
+    }
+    const { username, password, targetDate, preferredTimes, players, partySize, minutes, fireTimeUtc } = req.body || {};
+    if (!username || !password || !targetDate) {
+      return res.status(400).json({ error: 'Missing required fields: username, password, targetDate' });
+    }
+    const jobId = `sniper-${Date.now()}`;
+    setJob(jobId, { status: 'queued', createdAt: new Date().toISOString() });
+    await runSniperJob(jobId, { username, password, targetDate, preferredTimes, players, partySize, minutes, fireTimeUtc });
+    const job = getJob(jobId);
+    res.json({ jobId, scheduledFor: job?.scheduledFor, status: job?.status });
+  } catch (error) {
+    res.status(500).json({ error: error?.message || String(error) });
+  }
+});
+
+function getLondonTimeString(date) {
+  return DateTime.fromJSDate(date).setZone(CONFIG.TZ_LONDON).toISO();
+}
 
 async function fsAddRun(jobId, ownerUid, startedUtc, notes) {
   if (!db) return null;
@@ -63,6 +702,541 @@ async function fsFinishRun(runId, resultObject) {
     console.log(`Run ${runId} finished with result: ${resultObject.result}`);
   } catch (error) {
     console.error('Error finishing run:', error);
+  }
+}
+
+async function fsUpdateJob(jobId, patch) {
+  if (!db || !jobId) return;
+  try {
+    await db
+      .collection('jobs')
+      .doc(jobId)
+      .update({
+        ...patch,
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+  } catch (error) {
+    console.error('Error updating job:', error);
+  }
+}
+
+async function fsGetActiveSniperJobs(limit = 5) {
+  if (!db) return [];
+  try {
+    const snapshot = await db
+      .collection('jobs')
+      .where('status', '==', 'active')
+      .where('mode', '==', 'sniper')
+      .orderBy('created_at', 'asc')
+      .limit(limit)
+      .get();
+    if (snapshot.empty) return [];
+    return snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+  } catch (error) {
+    console.error('Error fetching active sniper jobs:', error);
+    return [];
+  }
+}
+
+const JOBS_COLLECTION = 'jobs';
+const READY_JOB_STATUSES = ['active', 'queued', 'accepted', 'pending'];
+const RUNNER_POLL_MS = 2000;
+const AGENT_ID = `${os.hostname()}:${process.pid}`;
+const jobTimers = new Map();
+
+function makeRunId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function getJobStatus(job) {
+  const raw = job?.status || job?.state || '';
+  return String(raw || '').toLowerCase();
+}
+
+function isReadyJob(job) {
+  if (!job) return false;
+  const status = getJobStatus(job);
+  const state = String(job.state || '').toLowerCase();
+  const mode = String(job.mode || job.bookingMode || '').toLowerCase();
+  if (mode && mode !== 'sniper') return false;
+  if (['running', 'finished', 'error'].includes(state)) return false;
+  return READY_JOB_STATUSES.includes(status);
+}
+
+function getFireTimeFromJob(job) {
+  return (
+    toDateMaybe(job.fireTimeUtc) ||
+    toDateMaybe(job.fire_time_utc) ||
+    toDateMaybe(job.release_window_start) ||
+    toDateMaybe(job.next_fire_time_utc) ||
+    toDateMaybe(job.nextFireTimeUtc)
+  );
+}
+
+function resolveTargetPlayDate(job) {
+  const direct = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+  if (direct) return direct;
+
+  const targetDay = (job.target_day || job.targetDay || '').toString().trim().toLowerCase();
+  const tz = job.tz || job.timezone || CONFIG.TZ_LONDON;
+  const dayMap = {
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+    sunday: 7,
+  };
+  const targetWeekday = dayMap[targetDay];
+  if (!targetWeekday) return null;
+
+  const now = DateTime.now().setZone(tz).startOf('day');
+  let candidate = now;
+  const daysAhead = (targetWeekday - now.weekday + 7) % 7;
+  if (daysAhead === 0) {
+    candidate = now.plus({ days: 7 });
+  } else {
+    candidate = now.plus({ days: daysAhead });
+  }
+  return candidate.toJSDate();
+}
+
+async function fsClaimSniperJob(jobId) {
+  if (!db) return null;
+  const ref = db.collection(JOBS_COLLECTION).doc(jobId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
+      const data = snap.data() || {};
+      if (!isReadyJob(data)) return null;
+      const existingClaim = data.claimed_by || data.claimedBy || null;
+      if (existingClaim && existingClaim !== AGENT_ID) return null;
+      const runId = makeRunId();
+      tx.update(ref, {
+        status: 'running',
+        state: 'running',
+        claimed_at: admin.firestore.FieldValue.serverTimestamp(),
+        claimed_by: AGENT_ID,
+        run_id: runId,
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { id: snap.id, ...data, run_id: runId };
+    });
+  } catch (error) {
+    console.error('Error claiming job:', error);
+    return null;
+  }
+}
+
+async function markJobError(jobId, message) {
+  await fsUpdateJob(jobId, {
+    status: 'error',
+    state: 'error',
+    error_message: message,
+    finished_at: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function scheduleClaimedJob(job) {
+  const jobId = job.id;
+  if (!jobId) return;
+  if (jobTimers.has(jobId)) return;
+
+  const targetPlayDate = resolveTargetPlayDate(job);
+  if (!targetPlayDate) {
+    await markJobError(jobId, 'missing-target-play-date');
+    return;
+  }
+
+  const fireTime = getFireTimeFromJob(job) || computeNextFireUTC(
+    job.release_day || job.releaseDay,
+    job.release_time_local || job.releaseTimeLocal,
+    job.tz || job.timezone || CONFIG.TZ_LONDON,
+  );
+
+  const fireMs = fireTime?.getTime?.() ? fireTime.getTime() : null;
+  if (!fireMs || Number.isNaN(fireMs)) {
+    await markJobError(jobId, 'missing-fire-time');
+    return;
+  }
+
+  const now = Date.now();
+  const delayMs = Math.max(0, fireMs - now);
+  const scheduleAt = new Date(fireMs);
+
+  console.log(`[RUNNER] Fire time resolved for ${jobId}: ${scheduleAt.toISOString()} (in ${delayMs}ms)`);
+
+  await fsUpdateJob(jobId, {
+    scheduled_for: admin.firestore.Timestamp.fromDate(scheduleAt),
+    warm_state: 'warming',
+  });
+
+  let warmPage = null;
+  try {
+    const username = job.brs_email || job.brsEmail || job.username;
+    const password = job.brs_password || job.brsPassword || job.password;
+    if (!username || !password) {
+      await markJobError(jobId, 'missing-credentials');
+      return;
+    }
+    console.log(`[RUNNER] Warm start ${jobId}`);
+    warmPage = await warmSession.getWarmPage(targetPlayDate, username, password);
+    await fsUpdateJob(jobId, { warm_state: 'warmed' });
+    console.log(`[RUNNER] Warm success ${jobId}`);
+  } catch (error) {
+    await fsUpdateJob(jobId, { warm_state: 'warm_error', warm_error: error?.message || String(error) });
+    console.log(`[RUNNER] Warm fail ${jobId}: ${error?.message || error}`);
+  }
+
+  console.log(`[RUNNER] Scheduling run for ${jobId} in ${delayMs}ms`);
+  const timeoutId = setTimeout(async () => {
+    jobTimers.delete(jobId);
+    try {
+      const ownerUid = job.ownerUid || job.owner_uid || 'unknown';
+      const username = job.brs_email || job.brsEmail || job.username;
+      const password = job.brs_password || job.brsPassword || job.password;
+      const preferredTimes = Array.isArray(job.preferred_times)
+        ? job.preferred_times
+        : Array.isArray(job.preferredTimes)
+          ? job.preferredTimes
+          : [];
+      const players = Array.isArray(job.players) ? job.players : [];
+      const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
+      const pushToken = job.push_token || job.pushToken;
+      const dryRun = job.dry_run === true || job.dryRun === true;
+
+      console.log(`[RUNNER] runBooking start ${jobId}`);
+      const result = await runBooking({
+        jobId,
+        ownerUid,
+        loginUrl: CONFIG.CLUB_LOGIN_URL,
+        username,
+        password,
+        preferredTimes,
+        targetFireTime: fireMs,
+        targetPlayDate: targetPlayDate,
+        players,
+        partySize,
+        slotsData: [],
+        warmPage,
+        useReleaseObserver: true,
+        pushToken,
+        dryRun,
+      });
+
+      console.log(`[RUNNER] runBooking finished ${jobId} booked=${result?.bookedTime || 'n/a'}`);
+      const isSuccess = result?.success === true;
+      await fsUpdateJob(jobId, {
+        status: isSuccess ? 'finished' : 'error',
+        state: isSuccess ? 'finished' : 'error',
+        result: result?.result || (isSuccess ? 'success' : 'failed'),
+        booked_time: result?.bookedTime || null,
+        finished_at: admin.firestore.FieldValue.serverTimestamp(),
+        error_message: isSuccess ? null : result?.error || 'clicked but no confirmation',
+        click_delta_ms: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
+        verification_url: result?.verification_url ?? result?.verificationUrl ?? null,
+        verification_signal: result?.verification_signal ?? result?.verificationSignal ?? null,
+        booking_links_count_after_click:
+          result?.booking_links_count_after_click ?? result?.bookingLinksCountAfterClick ?? null,
+        snapshot_path: result?.snapshotPath ?? result?.snapshot_path ?? null,
+        release_detect_delta_ms:
+          result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
+      });
+    } catch (error) {
+      console.log(`[RUNNER] runBooking error ${jobId}: ${error?.message || error}`);
+      await markJobError(jobId, error?.message || String(error));
+    }
+  }, delayMs);
+
+  jobTimers.set(jobId, timeoutId);
+}
+
+async function handleReadyJob(job) {
+  if (!job?.id) return;
+  console.log(`[RUNNER] Job detected ${job.id}`);
+  const claimed = await fsClaimSniperJob(job.id);
+  if (!claimed) return;
+  console.log(`[RUNNER] Job claimed ${job.id} run_id=${claimed.run_id || 'n/a'}`);
+  await scheduleClaimedJob({ ...job, ...claimed });
+}
+
+async function resumeRunningJobs() {
+  if (!db) return;
+  try {
+    const snapshot = await db
+      .collection(JOBS_COLLECTION)
+      .where('status', '==', 'running')
+      .where('claimed_by', '==', AGENT_ID)
+      .get();
+    if (snapshot.empty) return;
+
+    const now = Date.now();
+    for (const doc of snapshot.docs) {
+      const job = { id: doc.id, ...doc.data() };
+      const fireTime = getFireTimeFromJob(job);
+      const fireMs = fireTime?.getTime?.() ? fireTime.getTime() : null;
+      if (fireMs && fireMs > now) {
+        await scheduleClaimedJob(job);
+      } else {
+        await markJobError(job.id, 'agent restart during run');
+      }
+    }
+  } catch (error) {
+    console.error('Error resuming running jobs:', error);
+  }
+}
+
+// ========================================
+// RAILWAY COLD-START MITIGATION
+// ========================================
+
+async function warmUpSchedulerTick() {
+  if (!db) return;
+  
+  try {
+    const now = Date.now();
+    const windowStart = now;
+    const windowEnd = now + CONFIG.WARM_UP_WINDOW_MINUTES * 60 * 1000;
+    
+    // Query jobs with fireTime in the next 5 minutes
+    const snapshot = await db
+      .collection('jobs')
+      .where('mode', '==', 'sniper')
+      .where('status', 'in', ['active', 'ready', 'claimed', 'running'])
+      .get();
+    
+    if (snapshot.empty) return;
+    
+    for (const doc of snapshot.docs) {
+      const job = { id: doc.id, ...doc.data() };
+      const fireTime = getFireTimeFromJob(job);
+      if (!fireTime) continue;
+      
+      const fireMs = fireTime.getTime();
+      const minutesUntilFire = (fireMs - now) / 60000;
+      
+      // Check if within warm-up window and trigger threshold
+      if (minutesUntilFire > 0 && minutesUntilFire <= CONFIG.WARM_UP_WINDOW_MINUTES) {
+        const warmedAt = job.warmed_at || job.warmedAt;
+        const alreadyWarmed = warmedAt && (now - toDateMaybe(warmedAt)?.getTime()) < 5 * 60 * 1000;
+        
+        if (!alreadyWarmed && minutesUntilFire <= CONFIG.WARM_UP_TRIGGER_MINUTES) {
+          const runId = job.run_id || job.runId || 'pending';
+          console.log(`[WARM-UP] 🔥 Job detected: ${job.id} | runId: ${runId} | fireTime: ${fireTime.toISOString()} | T-${minutesUntilFire.toFixed(2)}min`);
+          
+          // Self-ping to wake Railway service
+          const pingStart = Date.now();
+          try {
+            const warmUrl = `${CONFIG.AGENT_URL}/api/warm`;
+            console.log(`[WARM-UP] 📡 Warm ping start: ${warmUrl}`);
+            const response = await fetch(warmUrl, { 
+              method: 'GET',
+              signal: AbortSignal.timeout(5000)
+            });
+            const pingMs = Date.now() - pingStart;
+            
+            if (response.ok) {
+              console.log(`[WARM-UP] ✅ Warm ping success (${pingMs}ms)`);
+            } else {
+              console.warn(`[WARM-UP] ⚠️ Warm ping returned ${response.status} (${pingMs}ms)`);
+            }
+          } catch (fetchErr) {
+            const pingMs = Date.now() - pingStart;
+            console.error(`[WARM-UP] ❌ Warm ping failed (${pingMs}ms):`, fetchErr.message);
+          }
+          
+          // Optionally preload tee sheet (warm browser session)
+          const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+          const username = job.brs_email || job.brsEmail || job.username;
+          const password = job.brs_password || job.brsPassword || job.password;
+          
+          if (targetPlayDate && username && password) {
+            const preloadStart = Date.now();
+            try {
+              console.log(`[WARM-UP] 🌐 Browser preload start for ${targetPlayDate.toISOString().slice(0, 10)}`);
+              await warmSession.getWarmPage(targetPlayDate, username, password);
+              const preloadMs = Date.now() - preloadStart;
+              console.log(`[WARM-UP] ✅ Browser preload complete (${preloadMs}ms)`);
+            } catch (warmErr) {
+              const preloadMs = Date.now() - preloadStart;
+              console.warn(`[WARM-UP] ⚠️ Browser preload failed (${preloadMs}ms):`, warmErr.message);
+            }
+          }
+          
+          // Mark as warmed in Firestore
+          await fsUpdateJob(job.id, {
+            warmed_at: admin.firestore.FieldValue.serverTimestamp()
+          });
+          console.log(`[WARM-UP] ✅ Job ${job.id} marked as warmed`);
+        } else if (alreadyWarmed) {
+          console.log(`[WARM-UP] ⏭️ Job ${job.id} already warmed (T-${minutesUntilFire.toFixed(2)}min)`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[WARM-UP] ❌ Scheduler tick error:', error.message);
+  }
+}
+
+function startWarmUpScheduler() {
+  if (!db) {
+    console.log('[WARM-UP] Firebase Admin not configured; warm-up scheduler disabled');
+    return;
+  }
+  
+  console.log(`[WARM-UP] Scheduler started (poll every ${CONFIG.WARM_UP_POLL_INTERVAL_MS / 1000}s, trigger at T-${CONFIG.WARM_UP_TRIGGER_MINUTES}min)`);
+  
+  // Run initial tick
+  warmUpSchedulerTick().catch((e) => console.error('[WARM-UP] Initial tick error:', e.message));
+  
+  // Schedule recurring ticks
+  setInterval(() => {
+    warmUpSchedulerTick().catch((e) => console.error('[WARM-UP] Tick error:', e.message));
+  }, CONFIG.WARM_UP_POLL_INTERVAL_MS).unref?.();
+}
+
+function startSniperRunner() {
+  if (!db) {
+    console.log('[RUNNER] Firebase Admin not configured; runner disabled');
+    return;
+  }
+  console.log('[RUNNER] Sniper job runner started');
+  resumeRunningJobs().catch((e) => console.error('[RUNNER] resume error:', e.message));
+
+  const query = db
+    .collection(JOBS_COLLECTION)
+    .where('mode', '==', 'sniper')
+    .where('status', 'in', READY_JOB_STATUSES);
+
+  try {
+    query.onSnapshot((snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added' || change.type === 'modified') {
+          const job = { id: change.doc.id, ...change.doc.data() };
+          if (isReadyJob(job)) {
+            handleReadyJob(job).catch((e) => console.error('[RUNNER] job error:', e.message));
+          }
+        }
+      });
+    }, (err) => {
+      console.error('[RUNNER] onSnapshot error:', err?.message || err);
+    });
+  } catch (error) {
+    console.error('[RUNNER] onSnapshot unavailable, falling back to polling:', error?.message || error);
+    setInterval(() => {
+      fsGetActiveSniperJobs(10)
+        .then((jobs) => jobs.filter(isReadyJob).forEach((job) => handleReadyJob(job)))
+        .catch((e) => console.error('[RUNNER] poll error:', e.message));
+    }, RUNNER_POLL_MS).unref?.();
+  }
+}
+
+function toDateMaybe(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (value.toDate) return value.toDate();
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+async function runScheduledJob(job) {
+  const jobId = job.id;
+  const ownerUid = job.ownerUid || job.owner_uid || 'unknown';
+  const username = job.brs_email || job.brsEmail || job.username;
+  const password = job.brs_password || job.brsPassword || job.password;
+  const preferredTimes = Array.isArray(job.preferred_times)
+    ? job.preferred_times
+    : Array.isArray(job.preferredTimes)
+      ? job.preferredTimes
+      : [];
+  const players = Array.isArray(job.players) ? job.players : [];
+  const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
+  const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+  const pushToken = job.push_token || job.pushToken;
+
+  if (!username || !password || !targetPlayDate) {
+    await fsUpdateJob(jobId, { status: 'failed', last_error: 'missing-credentials-or-target-date' });
+    return;
+  }
+
+  await fsUpdateJob(jobId, { status: 'running', started_at: admin.firestore.FieldValue.serverTimestamp() });
+
+  try {
+    const warmPage = await warmSession.getWarmPage(targetPlayDate, username, password);
+    const fireTime = Date.now();
+
+    const result = await runBooking({
+      jobId,
+      ownerUid,
+      loginUrl: CONFIG.CLUB_LOGIN_URL,
+      username,
+      password,
+      preferredTimes,
+      targetFireTime: fireTime,
+      targetPlayDate: targetPlayDate,
+      players,
+      partySize,
+      slotsData: [],
+      warmPage,
+      useReleaseObserver: false,
+      pushToken,
+    });
+
+    await fsUpdateJob(jobId, {
+      status: result?.success ? 'completed' : 'failed',
+      last_result: result?.result || 'failed',
+      last_notes: result?.notes || null,
+      finished_at: admin.firestore.FieldValue.serverTimestamp(),
+      next_fire_time_utc: null,
+    });
+  } catch (error) {
+    await fsUpdateJob(jobId, {
+      status: 'failed',
+      last_error: error?.message || String(error),
+      finished_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+}
+
+async function schedulerTick() {
+  const jobs = await fsGetActiveSniperJobs(5);
+  if (!jobs.length) return;
+
+  const now = Date.now();
+  for (const job of jobs) {
+    const nextFire = toDateMaybe(job.next_fire_time_utc) || toDateMaybe(job.nextFireTimeUtc);
+    const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+
+    let fireTime = nextFire;
+    if (!fireTime) {
+      try {
+        fireTime = computeNextFireUTC(job.release_day || job.releaseDay, job.release_time_local || job.releaseTimeLocal, job.tz || job.timezone || CONFIG.TZ_LONDON);
+        await fsUpdateJob(job.id, {
+          next_fire_time_utc: admin.firestore.Timestamp.fromDate(fireTime),
+        });
+      } catch (e) {
+        await fsUpdateJob(job.id, { status: 'failed', last_error: `invalid-release-window: ${e.message}` });
+        continue;
+      }
+    }
+
+    if (!fireTime || !targetPlayDate) continue;
+    if (fireTime.getTime() <= now + 5000) {
+      await runScheduledJob(job);
+    }
+  }
+}
+
+let schedulerRunning = false;
+if (process.env.AGENT_RUN_MAIN === 'true') {
+  console.log('[SCHEDULER] Background scheduler enabled');
+  if (!schedulerRunning) {
+    schedulerRunning = true;
+    startSniperRunner();
+    startWarmUpScheduler();
   }
 }
 
@@ -137,26 +1311,14 @@ async function waitForTeeSheet(page, timeout = 30000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     await acceptCookies(page);
-
-    const dateHeader = page
-      .locator('button', {
-        hasText: /JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC/i,
-      })
-      .first();
-    const anyTime = page
-      .locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/')
-      .first();
-    const anyAction = page
-      .locator(
-        'button:has-text("Book"), a:has-text("Book"), [role="button"]:has-text("Book")',
-      )
-      .first();
-
+    // Succeed as soon as tee sheet rows/times render (do NOT require booking links)
+    const dateHeader = page.locator('button', { hasText: /JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC/i }).first();
+    const anyTime = page.locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/').first();
+    const anyRow = page.locator('tr').first();
     if (await dateHeader.isVisible().catch(() => false)) return true;
     if (await anyTime.isVisible().catch(() => false)) return true;
-    if (await anyAction.isVisible().catch(() => false)) return true;
-
-    await page.waitForTimeout(300);
+    if (await anyRow.isVisible().catch(() => false)) return true;
+    await page.waitForTimeout(200);
   }
   throw new Error('Tee sheet not detected within timeout');
 }
@@ -198,9 +1360,23 @@ function teeSheetUrlForDate(date) {
   return `https://members.brsgolf.com/galgorm/tee-sheet/1/${y}/${m}/${day}`;
 }
 
-async function navigateToTeeSheet(page, date) {
+function pageMatchesDate(page, date) {
+  try {
+    const d = date instanceof Date ? date : new Date(date);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const needle = `/${y}/${m}/${day}`;
+    const url = page?.url?.() || '';
+    return typeof url === 'string' && url.includes(needle);
+  } catch {
+    return false;
+  }
+}
+
+async function navigateToTeeSheet(page, date, allowHop = true) {
   const baseDate = date instanceof Date ? date : new Date(date);
-  const maxHops = 2; // try today and next 2 days if sheet is empty
+  const maxHops = allowHop ? 2 : 0; // avoid hopping for availability scans
 
   for (let i = 0; i <= maxHops; i++) {
     const target = new Date(baseDate);
@@ -212,13 +1388,473 @@ async function navigateToTeeSheet(page, date) {
 
     try {
       await waitForTeeSheet(page, 15000);
-      return;
+      return target;
     } catch (e) {
       console.log(`   ⚠️ Tee sheet not ready on hop ${i}: ${e.message}`);
     }
   }
 
   throw new Error('No tee sheet detected after several day hops');
+}
+
+async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  const bookableMap = new Map();
+  const timeRegex = /\b(\d{1,2}:\d{2})\b/;
+  const roots = [page];
+
+  const extractFromButton = async (handle) => {
+    try {
+      return await page.evaluate((btn) => {
+        const timeRegex = /\b(\d{1,2}:\d{2})\b/;
+        const ignore = [
+          'member',
+          'format',
+          'holes',
+          'back',
+          'nine',
+          'only',
+          'tee',
+          'unavailable',
+          'book now',
+        ];
+        const isName = (text) => {
+          const t = text.trim();
+          if (!t) return false;
+          const lower = t.toLowerCase();
+          if (ignore.some((w) => lower.includes(w))) return false;
+          if (/\d/.test(t)) return false;
+          const commaName = /^[A-Za-z][A-Za-z'\-]+,\s*[A-Za-z][A-Za-z'\-\.]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)*$/.test(t);
+          const spaceName = /^[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)+$/.test(t);
+          return commaName || spaceName;
+        };
+        const normalizeName = (name) => {
+          const trimmed = name.trim();
+          if (!trimmed) return '';
+          let normalized = trimmed;
+          if (normalized.includes(',')) {
+            const parts = normalized.split(',');
+            const last = parts[0].trim();
+            const rest = parts.slice(1).join(' ').trim();
+            normalized = `${rest} ${last}`.trim();
+          }
+          normalized = normalized.replace(/\./g, ' ');
+          const tokens = normalized.split(/\s+/).filter(Boolean);
+          if (tokens.length >= 2) {
+            const filtered = tokens.filter((token, idx) => {
+              if (idx === 0 || idx === tokens.length - 1) return true;
+              return token.length > 1;
+            });
+            return filtered.join(' ').toLowerCase();
+          }
+          return normalized.toLowerCase();
+        };
+
+        const extractNames = (text) => {
+          const matches = text.match(/\b[A-Z][a-zA-Z'\-]+(?:,\s*[A-Z][a-zA-Z'\-\.]+(?:\s+[A-Z][a-zA-Z'\-\.]+)*)?\b|\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-\.]+){1,3}\b/g) || [];
+          return matches
+            .map((m) => m.trim())
+            .filter((m) => isName(m));
+        };
+
+        const extractOpenFromText = (text) => {
+          if (!text) return { open: null, total: null };
+          const fraction = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+          if (fraction) {
+            return {
+              open: parseInt(fraction[1], 10),
+              total: parseInt(fraction[2], 10),
+            };
+          }
+          const openMatch = text.match(/\b(?:only\s*)?(\d+)\s*(?:spaces?|slots?|spots?)\s*(?:left|open|available)?\b/i);
+          if (openMatch) {
+            return { open: parseInt(openMatch[1], 10), total: null };
+          }
+          return { open: null, total: null };
+        };
+
+        const extractBookedFromText = (text) => {
+          if (!text) return { booked: null, total: null };
+          const bookedOf = text.match(/\b(\d+)\s*of\s*(\d+)\s*booked\b/i);
+          if (bookedOf) {
+            return {
+              booked: parseInt(bookedOf[1], 10),
+              total: parseInt(bookedOf[2], 10),
+            };
+          }
+          const bookedMatch = text.match(/\b(\d+)\s*(?:players?)\s*booked\b/i);
+          if (bookedMatch) {
+            return { booked: parseInt(bookedMatch[1], 10), total: null };
+          }
+          return { booked: null, total: null };
+        };
+
+        const attrInt = (el, keys) => {
+          if (!el || !el.getAttribute) return null;
+          for (const key of keys) {
+            const val = el.getAttribute(key);
+            if (val !== null && val !== '') {
+              const n = parseInt(String(val), 10);
+              if (!Number.isNaN(n)) return n;
+            }
+          }
+          return null;
+        };
+
+        const attrIntFromTree = (root, keys) => {
+          if (!root || !root.querySelector) return null;
+          for (const key of keys) {
+            const node = root.querySelector(`[${key}]`);
+            if (node) {
+              const n = attrInt(node, [key]);
+              if (n !== null) return n;
+            }
+          }
+          return null;
+        };
+
+        const stripToPlayers = (text) => {
+          if (!text) return '';
+          const formatIndex = text.search(/\bformat\b/i);
+          if (formatIndex >= 0) return text.slice(formatIndex);
+          const holeIndex = text.search(/\b(?:\d+\s*holes?|holes?|back\s+nine|front\s+nine|nine\s+only)\b/i);
+          if (holeIndex >= 0) return text.slice(holeIndex);
+          return text;
+        };
+
+        let container = btn.closest('tr, .tee-row, .slot-row, .timeslot, .slot, .availability, li, section, div');
+        let hops = 0;
+        let best = null;
+        let bestNode = null;
+        let bestNames = 0;
+        while (container && hops < 8) {
+          const text = (container.textContent || '').replace(/\s+/g, ' ').trim();
+          if (timeRegex.test(text)) {
+            const playerText = stripToPlayers(text);
+            const names = extractNames(playerText);
+            const normalizedNames = names.map(normalizeName).filter(Boolean);
+            const uniqueNames = Array.from(new Set(normalizedNames));
+            if (uniqueNames.length > bestNames) {
+              bestNames = uniqueNames.length;
+              best = { text, names: uniqueNames };
+              bestNode = container;
+            }
+          }
+          container = container.parentElement;
+          hops++;
+        }
+
+        if (!best) return null;
+        const match = best.text.match(timeRegex);
+        if (!match) return null;
+        const time = match[1];
+
+        const playerText = stripToPlayers(best.text || '');
+        const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
+        const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
+        const textCounts = extractOpenFromText(best.text || '');
+        const textBooked = extractBookedFromText(best.text || '');
+        const scope = bestNode || container || document;
+        const bookedNodes = Array.from(scope.querySelectorAll('[data-booked]'));
+        const bookedCount = bookedNodes.filter((el) => {
+          const val = String(el.getAttribute('data-booked') || '').toLowerCase();
+          return val === '1' || val === 'true';
+        }).length;
+
+        const openKeys = [
+          'data-open-slots',
+          'data-open',
+          'data-available',
+          'data-spaces',
+          'data-spaces-available',
+        ];
+        const totalKeys = [
+          'data-total-slots',
+          'data-total',
+          'data-capacity',
+          'data-players',
+          'data-max-players',
+          'data-bookable-players-number',
+        ];
+        const bookedKeys = [
+          'data-booked',
+          'data-players-booked',
+          'data-booked-count',
+        ];
+
+        const explicitTotal =
+          attrInt(scope, totalKeys) ?? attrIntFromTree(scope, totalKeys) ?? textCounts.total ?? textBooked.total;
+        const explicitOpen =
+          attrInt(scope, openKeys) ?? attrIntFromTree(scope, openKeys) ?? textCounts.open;
+        const explicitBooked =
+          attrInt(scope, bookedKeys) ?? attrIntFromTree(scope, bookedKeys) ?? textBooked.booked;
+
+        const totalSlots =
+          explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
+        const filled = explicitBooked !== null
+          ? explicitBooked
+          : explicitOpen !== null && totalSlots !== null
+            ? Math.max(0, totalSlots - explicitOpen)
+            : bookedNodes.length > 0
+              ? bookedCount
+              : Math.min(4, Math.max(best.names.length, memberCount + guestCount));
+        const openSlots = explicitOpen !== null
+          ? explicitOpen
+          : totalSlots !== null
+            ? Math.max(0, totalSlots - filled)
+            : null;
+        return { time, status: 'bookable', openSlots, totalSlots };
+      }, handle);
+    } catch {
+      return null;
+    }
+  };
+
+  const collectRows = async (root) => {
+    try {
+      const timeHandles = await root
+        .locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/')
+        .elementHandles();
+
+      for (const handle of timeHandles) {
+        const row = await handle.evaluate((timeEl, opts) => {
+          const { includeUnavailable } = opts || {};
+          const timeRegex = /\b(\d{1,2}:\d{2})\b/;
+          const ignore = [
+            'member',
+            'format',
+            'holes',
+            'back',
+            'nine',
+            'only',
+            'tee',
+            'unavailable',
+            'book now',
+          ];
+
+          const isName = (text) => {
+            const t = text.trim();
+            if (!t) return false;
+            const lower = t.toLowerCase();
+            if (ignore.some((w) => lower.includes(w))) return false;
+            if (/\d/.test(t)) return false;
+            const commaName = /^[A-Za-z][A-Za-z'\-]+,\s*[A-Za-z][A-Za-z'\-\.]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)*$/.test(t);
+            const spaceName = /^[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)+$/.test(t);
+            return commaName || spaceName;
+          };
+
+          const normalizeName = (name) => {
+            const trimmed = name.trim();
+            if (!trimmed) return '';
+            let normalized = trimmed;
+            if (normalized.includes(',')) {
+              const parts = normalized.split(',');
+              const last = parts[0].trim();
+              const rest = parts.slice(1).join(' ').trim();
+              normalized = `${rest} ${last}`.trim();
+            }
+            normalized = normalized.replace(/\./g, ' ');
+            const tokens = normalized.split(/\s+/).filter(Boolean);
+            if (tokens.length >= 2) {
+              const filtered = tokens.filter((token, idx) => {
+                if (idx === 0 || idx === tokens.length - 1) return true;
+                return token.length > 1;
+              });
+              return filtered.join(' ').toLowerCase();
+            }
+            return normalized.toLowerCase();
+          };
+
+          const extractNames = (text) => {
+            const matches =
+              text.match(/\b[A-Z][a-zA-Z'\-]+(?:,\s*[A-Z][a-zA-Z'\-\.]+(?:\s+[A-Z][a-zA-Z'\-\.]+)*)?\b|\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-\.]+){1,3}\b/g) || [];
+            return matches.map((m) => m.trim()).filter((m) => isName(m));
+          };
+
+          const extractOpenFromText = (text) => {
+            if (!text) return { open: null, total: null };
+            const fraction = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+            if (fraction) {
+              return {
+                open: parseInt(fraction[1], 10),
+                total: parseInt(fraction[2], 10),
+              };
+            }
+            const openMatch = text.match(/\b(?:only\s*)?(\d+)\s*(?:spaces?|slots?|spots?)\s*(?:left|open|available)?\b/i);
+            if (openMatch) {
+              return { open: parseInt(openMatch[1], 10), total: null };
+            }
+            return { open: null, total: null };
+          };
+
+          const extractBookedFromText = (text) => {
+            if (!text) return { booked: null, total: null };
+            const bookedOf = text.match(/\b(\d+)\s*of\s*(\d+)\s*booked\b/i);
+            if (bookedOf) {
+              return {
+                booked: parseInt(bookedOf[1], 10),
+                total: parseInt(bookedOf[2], 10),
+              };
+            }
+            const bookedMatch = text.match(/\b(\d+)\s*(?:players?)\s*booked\b/i);
+            if (bookedMatch) {
+              return { booked: parseInt(bookedMatch[1], 10), total: null };
+            }
+            return { booked: null, total: null };
+          };
+
+          const stripToPlayers = (text) => {
+            if (!text) return '';
+            const formatIndex = text.search(/\bformat\b/i);
+            if (formatIndex >= 0) return text.slice(formatIndex);
+            const holeIndex = text.search(/\b(?:\d+\s*holes?|holes?|back\s+nine|front\s+nine|nine\s+only)\b/i);
+            if (holeIndex >= 0) return text.slice(holeIndex);
+            return text;
+          };
+
+          const attrInt = (el, keys) => {
+            if (!el || !el.getAttribute) return null;
+            for (const key of keys) {
+              const val = el.getAttribute(key);
+              if (val !== null && val !== '') {
+                const n = parseInt(String(val), 10);
+                if (!Number.isNaN(n)) return n;
+              }
+            }
+            return null;
+          };
+
+          const attrIntFromTree = (root, keys) => {
+            if (!root || !root.querySelector) return null;
+            for (const key of keys) {
+              const node = root.querySelector(`[${key}]`);
+              if (node) {
+                const n = attrInt(node, [key]);
+                if (n !== null) return n;
+              }
+            }
+            return null;
+          };
+
+          const findRow = (el) => {
+            let node = el;
+            let hops = 0;
+            let best = null;
+            while (node && hops < 8) {
+              const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+              if (timeRegex.test(text)) {
+                best = node;
+                if (node.matches && node.matches('tr, .tee-row, .slot-row, .timeslot, .slot, .availability, [role="row"]')) {
+                  return node;
+                }
+              }
+              node = node.parentElement;
+              hops++;
+            }
+            return best;
+          };
+
+          const row = findRow(timeEl);
+          if (!row) return null;
+          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          const match = text.match(timeRegex);
+          if (!match) return null;
+          const time = match[1];
+
+          const buttons = Array.from(row.querySelectorAll('button, a, [role="button"]'));
+          const hasBook = buttons.some((b) => /\bbook( now)?\b/i.test(b.textContent || ''));
+          if (!hasBook && !includeUnavailable) return null;
+
+          const playerText = stripToPlayers(text || '');
+          const names = extractNames(playerText);
+          const normalizedNames = names.map(normalizeName).filter(Boolean);
+          const uniqueNames = Array.from(new Set(normalizedNames));
+          const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
+          const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
+          const textCounts = extractOpenFromText(text || '');
+          const textBooked = extractBookedFromText(text || '');
+          const bookedNodes = Array.from(row.querySelectorAll('[data-booked]'));
+          const bookedCount = bookedNodes.filter((el) => {
+            const val = String(el.getAttribute('data-booked') || '').toLowerCase();
+            return val === '1' || val === 'true';
+          }).length;
+
+          const openKeys = [
+            'data-open-slots',
+            'data-open',
+            'data-available',
+            'data-spaces',
+            'data-spaces-available',
+          ];
+          const totalKeys = [
+            'data-total-slots',
+            'data-total',
+            'data-capacity',
+            'data-players',
+            'data-max-players',
+            'data-bookable-players-number',
+          ];
+          const bookedKeys = [
+            'data-booked',
+            'data-players-booked',
+            'data-booked-count',
+          ];
+
+          const explicitTotal =
+            attrInt(row, totalKeys) ?? attrIntFromTree(row, totalKeys) ?? textCounts.total ?? textBooked.total;
+          const explicitOpen =
+            attrInt(row, openKeys) ?? attrIntFromTree(row, openKeys) ?? textCounts.open;
+          const explicitBooked =
+            attrInt(row, bookedKeys) ?? attrIntFromTree(row, bookedKeys) ?? textBooked.booked;
+
+          const totalSlots =
+            explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
+          const filled = explicitBooked !== null
+            ? explicitBooked
+            : explicitOpen !== null && totalSlots !== null
+              ? Math.max(0, totalSlots - explicitOpen)
+              : bookedNodes.length > 0
+                ? bookedCount
+                : Math.min(4, Math.max(uniqueNames.length, memberCount + guestCount));
+          const openSlots = explicitOpen !== null
+            ? explicitOpen
+            : totalSlots !== null
+              ? Math.max(0, totalSlots - filled)
+              : null;
+
+          const status = hasBook ? 'bookable' : 'unavailable';
+          return { time, status, openSlots, totalSlots };
+        }, handle, { includeUnavailable });
+
+        if (!row) continue;
+        const time = String(row.time || '').padStart(5, '0');
+        if (!bookableMap.has(time)) {
+          bookableMap.set(time, row);
+        }
+      }
+    } catch (e) {
+      return;
+    }
+  };
+
+  // Scroll through the page to capture virtualized lists
+  const scrollSteps = 10;
+  const scrollBy = 900;
+  for (let i = 0; i < scrollSteps; i++) {
+    await collectRows(page);
+    await page.evaluate((y) => window.scrollTo(0, y), i * scrollBy).catch(() => {});
+    await page.waitForTimeout(250);
+  }
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+
+  const times = Array.from(bookableMap.keys()).sort();
+  const slots = Array.from(bookableMap.values());
+
+  if (times.length === 0) {
+    return { times: [], slots: [] };
+  }
+
+  return { times, slots };
 }
 
 // ========================================
@@ -239,21 +1875,32 @@ function escapeRegex(str) {
  * @param {number} openSlots - Number of available slots (1-4)
  * @returns {Promise<{filled: string[], skippedReason?: string, confirmationText?: string}>}
  */
-async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
+async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun = false) {
   const result = {
     filled: [],
     skippedReason: null,
     confirmationText: null,
   };
 
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page
+    .waitForSelector('#member_booking_form_confirm_booking, form[name="member_booking_form"]', {
+      timeout: 8000,
+    })
+    .catch(() => {});
+
   // Only try to fill as many players as slots permit (max 3 additional players = slots 2, 3, 4)
   const playersToFill = players.slice(0, Math.min(openSlots, 3));
 
-  console.log(`  👥 Attempting to fill ${playersToFill.length} player(s) (${openSlots} slot(s) available)...`);
+  console.log(
+    `  👥 Attempting to fill ${playersToFill.length} player(s) (${openSlots} slot(s) available)...`,
+  );
 
   // If no additional players needed, skip directly to confirmation
   if (playersToFill.length === 0 && openSlots > 0) {
-    console.log(`  ℹ️ Only logged-in user (Player 1) needed. Skipping player selection.`);
+    console.log(
+      `  ℹ️ Only logged-in user (Player 1) needed. Skipping player selection.`,
+    );
     result.skippedReason = 'logged-in-user-only';
   } else if (playersToFill.length === 0) {
     console.log(`  ℹ️ No players provided. Skipping player selection.`);
@@ -276,11 +1923,15 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
         if (await selectElem.count()) {
           try {
             await selectElem.selectOption({ value: playerName });
-            console.log(`    ✅ Player ${playerNum}: ${playerName} (select by id)`);
+            console.log(
+              `    ✅ Player ${playerNum}: ${playerName} (select by id)`,
+            );
             result.filled.push(playerName);
             filled = true;
           } catch (e) {
-            console.log(`    ℹ️ Strategy 0 (select by id) failed: ${e.message.substring(0, 50)}`);
+            console.log(
+              `    ℹ️ Strategy 0 (select by id) failed: ${e.message.substring(0, 50)}`,
+            );
           }
         }
       }
@@ -289,23 +1940,31 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
       if (!filled) {
         let combobox = null;
         try {
-          combobox = page.getByRole('combobox', {
-            name: new RegExp(`player\\s*${playerNum}`, 'i'),
-          }).first();
+          combobox = page
+            .getByRole('combobox', {
+              name: new RegExp(`player\\s*${playerNum}`, 'i'),
+            })
+            .first();
 
-          const isVisible = await combobox.isVisible({ timeout: 2000 }).catch(() => false);
+          const isVisible = await combobox
+            .isVisible({ timeout: 2000 })
+            .catch(() => false);
           if (isVisible) {
             await combobox.click();
             await page.waitForTimeout(300);
 
             // Try to select by option role
-            const option = page.getByRole('option', {
-              name: new RegExp(escapeRegex(playerName), 'i'),
-            }).first();
+            const option = page
+              .getByRole('option', {
+                name: new RegExp(escapeRegex(playerName), 'i'),
+              })
+              .first();
 
             if ((await option.count()) > 0) {
               await option.click();
-              console.log(`    ✅ Player ${playerNum}: ${playerName} (combobox role)`);
+              console.log(
+                `    ✅ Player ${playerNum}: ${playerName} (combobox role)`,
+              );
               result.filled.push(playerName);
               filled = true;
             } else {
@@ -314,48 +1973,66 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
               await page.keyboard.type(playerName, { delay: 30 });
               await page.waitForTimeout(400);
 
-              const searchResult = page.getByRole('option', {
-                name: new RegExp(escapeRegex(playerName), 'i'),
-              }).first();
+              const searchResult = page
+                .getByRole('option', {
+                  name: new RegExp(escapeRegex(playerName), 'i'),
+                })
+                .first();
 
               if ((await searchResult.count()) > 0) {
                 await searchResult.click();
-                console.log(`    ✅ Player ${playerNum}: ${playerName} (typed search)`);
+                console.log(
+                  `    ✅ Player ${playerNum}: ${playerName} (typed search)`,
+                );
                 result.filled.push(playerName);
                 filled = true;
               } else {
-                console.log(`    ⚠️ Player ${playerNum}: No match for "${playerName}"`);
+                console.log(
+                  `    ⚠️ Player ${playerNum}: No match for "${playerName}"`,
+                );
               }
             }
           }
         } catch (e) {
           // Strategy A failed, try next
-          console.log(`    ℹ️ Strategy A (getByRole combobox) failed: ${e.message.substring(0, 50)}`);
+          console.log(
+            `    ℹ️ Strategy A (getByRole combobox) failed: ${e.message.substring(0, 50)}`,
+          );
         }
       }
 
       // Strategy B: Try getByLabel
       if (!filled) {
         try {
-          const label = page.getByLabel(new RegExp(`player\\s*${playerNum}`, 'i')).first();
-          const isVisible = await label.isVisible({ timeout: 2000 }).catch(() => false);
+          const label = page
+            .getByLabel(new RegExp(`player\\s*${playerNum}`, 'i'))
+            .first();
+          const isVisible = await label
+            .isVisible({ timeout: 2000 })
+            .catch(() => false);
 
           if (isVisible) {
             await label.selectOption({ label: playerName }).catch(async () => {
               // If selectOption fails, try clicking and then option selection
               await label.click();
               await page.waitForTimeout(300);
-              const option = page.getByRole('option', {
-                name: new RegExp(escapeRegex(playerName), 'i'),
-              }).first();
+              const option = page
+                .getByRole('option', {
+                  name: new RegExp(escapeRegex(playerName), 'i'),
+                })
+                .first();
               await option.click();
             });
-            console.log(`    ✅ Player ${playerNum}: ${playerName} (getByLabel)`);
+            console.log(
+              `    ✅ Player ${playerNum}: ${playerName} (getByLabel)`,
+            );
             result.filled.push(playerName);
             filled = true;
           }
         } catch (e) {
-          console.log(`    ℹ️ Strategy B (getByLabel) failed: ${e.message.substring(0, 50)}`);
+          console.log(
+            `    ℹ️ Strategy B (getByLabel) failed: ${e.message.substring(0, 50)}`,
+          );
         }
       }
 
@@ -369,20 +2046,29 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
             const container = containers.nth(c);
             const text = await container.innerText().catch(() => '');
 
-            if (text.includes(`Player ${playerNum}`) || text.includes(`player ${playerNum}`)) {
-              const comboboxInContainer = container.locator('[role="combobox"]').first();
+            if (
+              text.includes(`Player ${playerNum}`) ||
+              text.includes(`player ${playerNum}`)
+            ) {
+              const comboboxInContainer = container
+                .locator('[role="combobox"]')
+                .first();
 
               if ((await comboboxInContainer.count()) > 0) {
                 await comboboxInContainer.click();
                 await page.waitForTimeout(300);
 
-                const option = page.getByRole('option', {
-                  name: new RegExp(escapeRegex(playerName), 'i'),
-                }).first();
+                const option = page
+                  .getByRole('option', {
+                    name: new RegExp(escapeRegex(playerName), 'i'),
+                  })
+                  .first();
 
                 if ((await option.count()) > 0) {
                   await option.click();
-                  console.log(`    ✅ Player ${playerNum}: ${playerName} (container search)`);
+                  console.log(
+                    `    ✅ Player ${playerNum}: ${playerName} (container search)`,
+                  );
                   result.filled.push(playerName);
                   filled = true;
                   break;
@@ -391,12 +2077,16 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
             }
           }
         } catch (e) {
-          console.log(`    ℹ️ Strategy C (container search) failed: ${e.message.substring(0, 50)}`);
+          console.log(
+            `    ℹ️ Strategy C (container search) failed: ${e.message.substring(0, 50)}`,
+          );
         }
       }
 
       if (!filled) {
-        console.log(`    ⚠️ Player ${playerNum} field not found or player not selectable`);
+        console.log(
+          `    ⚠️ Player ${playerNum} field not found or player not selectable`,
+        );
         // Do not fail the booking; this is expected when openSlots < required players
       }
     } catch (error) {
@@ -404,25 +2094,40 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
     }
   }
 
+  if (dryRun) {
+    console.log('  💤 Dry-run enabled: skipping Create Booking click');
+    result.confirmationText = 'dry-run-no-confirm';
+    return result;
+  }
+
   // Now click Confirm button
   console.log(`  🎯 Clicking Confirm button...`);
 
   try {
     // Strategy 1: getByRole button with confirm text
-    let confirmBtn = page.getByRole('button', {
-      name: /confirm|book|complete|finish|final|create.*booking|proceed/i,
-    }).first();
+    let confirmBtn = page
+      .locator('#member_booking_form_confirm_booking')
+      .first();
 
-    let btnVisible = await confirmBtn.isVisible({ timeout: 3000 }).catch(() => false);
+    let btnVisible = await confirmBtn
+      .isVisible({ timeout: 3000 })
+      .catch(() => false);
 
     // Strategy 2: Fallback locators
     if (!btnVisible) {
-      confirmBtn = page.locator('button:has-text("Confirm"), button:has-text("Book"), button:has-text("Complete")').first();
-      btnVisible = await confirmBtn.isVisible({ timeout: 2000 }).catch(() => false);
+      confirmBtn = page
+        .locator(
+          'button#member_booking_form_confirm_booking, form[name="member_booking_form"] button[type="submit"], button:has-text("Create Booking"), button:has-text("Confirm"), button:has-text("Book"), button:has-text("Complete")',
+        )
+        .first();
+      btnVisible = await confirmBtn
+        .isVisible({ timeout: 2000 })
+        .catch(() => false);
     }
 
     if (btnVisible) {
-      await confirmBtn.click({ timeout: 5000 });
+      await confirmBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await confirmBtn.click({ timeout: 5000, force: true });
       console.log(`    ✅ Confirm button clicked`);
 
       // Wait for navigation/response
@@ -442,7 +2147,9 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
       for (const pattern of successPatterns) {
         try {
           const element = page.getByText(pattern).first();
-          const isVisible = await element.isVisible({ timeout: 2000 }).catch(() => false);
+          const isVisible = await element
+            .isVisible({ timeout: 2000 })
+            .catch(() => false);
 
           if (isVisible) {
             const confirmText = await element.textContent().catch(() => '');
@@ -457,10 +2164,16 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
 
       // Fallback: Check if we're now on a bookings list page
       try {
-        const bookingsHeading = page.getByText(/my.*bookings|your.*bookings|booked.*tee/i).first();
+        const bookingsHeading = page
+          .getByText(/my.*bookings|your.*bookings|booked.*tee/i)
+          .first();
         if ((await bookingsHeading.count()) > 0) {
-          const headingText = await bookingsHeading.textContent().catch(() => '');
-          console.log(`    ✅ Success detected (bookings page): "${headingText}"`);
+          const headingText = await bookingsHeading
+            .textContent()
+            .catch(() => '');
+          console.log(
+            `    ✅ Success detected (bookings page): "${headingText}"`,
+          );
           result.confirmationText = headingText;
           return result;
         }
@@ -468,7 +2181,9 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
         // Not a bookings page
       }
 
-      console.log(`    ⚠️ No success confirmation message detected, but confirm clicked`);
+      console.log(
+        `    ⚠️ No success confirmation message detected, but confirm clicked`,
+      );
       result.confirmationText = 'confirm-clicked-no-confirmation-text';
       return result;
     } else {
@@ -483,49 +2198,90 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
   }
 }
 
-async function tryBookTime(page, time, players = [], openSlots = 3) {
-  // Wait for tee sheet to be fully loaded
+async function tryBookTime(
+  page,
+  time,
+  players = [],
+  openSlots = 3,
+  cachedLocator = null,
+  targetFireTime = Date.now(),
+  jobId = null,
+) {
+  // Wait for tee sheet rows to exist
   console.log(`  ⏳ Waiting for tee sheet to load...`);
   await page.waitForSelector('tr', { timeout: 10000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
-  // Find all table rows
-  const rows = page.locator('tr');
-  const rowCount = await rows.count();
+  const hhmm = normalizeTimeToHHMM(time);
+  if (!hhmm || hhmm.length !== 4) {
+    console.log(`  ❌ Invalid time format: "${time}"`);
+    return { booked: false, error: 'invalid-time-format' };
+  }
+  const fallbackLocator = page
+    .locator(`a[href*="/bookings/book/${hhmm}"]`)
+    .first();
+  const bookButton = cachedLocator || fallbackLocator;
 
-  console.log(`  🔍 Scanning ${rowCount} rows for time ${time}...`);
+  if ((await bookButton.count()) === 0) {
+    const timeLabel = `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`;
+    console.log(`  ⚠️ No booking link found for ${time}. Trying row scan for ${timeLabel}...`);
 
-  let bookButton = null;
+    const rowCandidates = page.locator(
+      '.tee-row, .slot-row, .timeslot, .slot, .availability, tr',
+    );
+    const row = rowCandidates.filter({ hasText: timeLabel }).first();
+    if ((await row.count()) === 0) {
+      console.log(`  ⚠️ No row found for ${timeLabel}`);
+      return { booked: false, error: 'no-booking-button-found' };
+    }
 
-  // Scan rows to find the one with the matching time
-  for (let i = 0; i < rowCount; i++) {
-    const row = rows.nth(i);
-    const rowText = await row.innerText().catch(() => '');
+    const rowBookButton = row
+      .locator(
+        'button:has-text("Book"), a:has-text("Book"), [role="button"]:has-text("Book")',
+      )
+      .first();
 
-    // Check if this row contains the target time
-    if (rowText.includes(time)) {
-      console.log(`  ✅ Found row with time ${time}`);
+    if ((await rowBookButton.count()) === 0) {
+      console.log(`  ⚠️ No Book action found in row for ${timeLabel}`);
+      return { booked: false, error: 'no-booking-button-found' };
+    }
 
-      // Look for Book button in this row
-      const bookBtn = row
-        .locator(':is(button,a,[role="button"])')
-        .filter({ hasText: /\bbook(\s+now)?\b/i })
-        .first();
+    console.log(`  📍 Clicking Book action for ${timeLabel} (row scan)...`);
+    const clickTime = Date.now();
+    await rowBookButton.click({ timeout: 2000 }).catch(() => {});
+    console.log(`[FIRE] Click executed at: ${new Date(clickTime).toISOString()}`);
+    console.log(`[FIRE] Delta ms: ${clickTime - targetFireTime}ms`);
+    await page.waitForTimeout(2000);
 
-      if ((await bookBtn.count()) > 0) {
-        bookButton = bookBtn;
-        break;
-      }
+    const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
+    return {
+      booked:
+        confirmResult.confirmationText !== null &&
+        confirmResult.confirmationText !== 'confirm-button-not-found',
+      playersFilled: confirmResult.filled,
+      playersRequested: players.slice(0, Math.min(openSlots, 3)),
+      confirmationText: confirmResult.confirmationText,
+      skippedReason: confirmResult.skippedReason,
+      error:
+        confirmResult.confirmationText === 'confirm-button-not-found'
+          ? 'confirm-button-not-found'
+          : null,
+    };
+  }
+
+  const clickDeltaMs = Date.now() - targetFireTime;
+  console.log(`[SNIPER] FIRE CLICK DELTA: ${clickDeltaMs}ms`);
+  if (clickDeltaMs > 250) {
+    console.log('⚠️ FIRE DELTA TOO HIGH');
+    if (jobId) {
+      logJobEvent(jobId, `⚠️ FIRE DELTA TOO HIGH (${clickDeltaMs}ms)`);
     }
   }
-
-  if (!bookButton) {
-    console.log(`  ⚠️ No booking button found for ${time}`);
-    return { booked: false, error: 'no-booking-button-found' };
-  }
-
   console.log(`  📍 Clicking booking button for ${time}...`);
-  await bookButton.click({ timeout: 8000 }).catch(() => {});
+  const clickTime = Date.now();
+  await bookButton.click({ timeout: 2000 }).catch(() => {});
+  console.log(`[FIRE] Click executed at: ${new Date(clickTime).toISOString()}`);
+  console.log(`[FIRE] Delta ms: ${clickTime - targetFireTime}ms`);
   await page.waitForTimeout(2000); // Wait for booking form to load
 
   // Add dialog handler to avoid freezes
@@ -534,14 +2290,39 @@ async function tryBookTime(page, time, players = [], openSlots = 3) {
   // Call the unified player selection and confirmation helper
   const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
 
-  // Return detailed result
+  console.log('  ✅ Clicked booking link');
+  console.log('  🔍 Verification started...');
+  const verification = await verifyBookingConfirmation(page, time, 10000);
+  const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
+  if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
+    verification.confirmed = false;
+    verification.verificationSignal = 'players-missing';
+  }
+  console.log(`  🔍 Verification: URL=${verification.verificationUrl}`);
+  if (verification.confirmed) {
+    console.log(`  ✅ Verification success: ${verification.verificationSignal}`);
+  } else {
+    console.log('  ❌ Verification failed: no confirmation within 10s');
+  }
+
   return {
-    booked: confirmResult.confirmationText !== null && confirmResult.confirmationText !== 'confirm-button-not-found',
+    booked:
+      verification.confirmed &&
+      confirmResult.confirmationText !== 'confirm-button-not-found',
     playersFilled: confirmResult.filled,
     playersRequested: players.slice(0, Math.min(openSlots, 3)),
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
-    error: confirmResult.confirmationText === 'confirm-button-not-found' ? 'confirm-button-not-found' : null,
+    verificationSignal: verification.verificationSignal,
+    verificationUrl: verification.verificationUrl,
+    bookingLinksCountAfterClick: verification.bookingLinksCountAfterClick,
+    clickDeltaMs,
+    error:
+      !verification.confirmed
+        ? 'clicked-but-no-confirmation'
+        : confirmResult.confirmationText === 'confirm-button-not-found'
+          ? 'confirm-button-not-found'
+          : null,
   };
 }
 
@@ -591,6 +2372,199 @@ function computeNextFireUTC(
 // BOOKING AUTOMATION LOGIC
 // ========================================
 
+async function executeReleaseBooking(
+  page,
+  locator,
+  additionalPlayers,
+  openSlots,
+  fireTime,
+  jobId,
+  dryRun = false,
+  skipClick = false,
+  clickDeltaOverride = null,
+) {
+  // Click already executed in page context (skipClick=true for release mode)
+  // clickDeltaOverride contains the fireLatencyMs from MutationObserver
+  const fireLatencyMs = clickDeltaOverride;
+  
+  // TEST_MODE: return early with validation metrics (skip player fill)
+  if (CONFIG.TEST_MODE) {
+    console.log(`[TEST_MODE] ✅ Validation complete - skipping player fill and confirmation`);
+    return { 
+      booked: false, 
+      confirmationText: 'TEST_MODE_VALIDATION_ONLY', 
+      playersFilled: [], 
+      clickDeltaMs: fireLatencyMs 
+    };
+  }
+  
+  // Always run the normal booking flow to fill players (if any) and confirm
+  const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun);
+  const playersFilled = confirmResult.filled || [];
+  // Wait for confirmation
+  let confirmationText = confirmResult.confirmationText || '';
+  let booked = false;
+  try {
+    const conf = await page.locator('text=/Booking confirmed|Booking Successful|Reservation Complete/i').first();
+    await conf.waitFor({ state: 'visible', timeout: 5000 });
+    confirmationText = await conf.textContent();
+    booked = true;
+  } catch {
+    // fallback to whatever confirmResult gave
+    booked =
+      confirmationText &&
+      !['confirm-button-not-found', 'confirm-clicked-no-confirmation-text'].includes(
+        confirmationText,
+      );
+  }
+  return { booked, confirmationText, playersFilled, clickDeltaMs: fireLatencyMs };
+}
+
+async function verifyBookingConfirmation(page, timeLabel, timeoutMs = 10000) {
+  const start = Date.now();
+  const textLocator = page
+    .locator(
+      'text=/Booking confirmed|Booking Successful|Reservation Complete|Booking complete|Successfully booked|Thank\s+you|Reference\s+number/i',
+    )
+    .first();
+  const bookingsHeading = page
+    .getByText(/my.*bookings|your.*bookings|booked.*tee/i)
+    .first();
+
+  const bookingFormNotice = page
+    .locator('text=/Booking Details|complete your booking|minutes to complete your booking/i')
+    .first();
+
+  let verificationSignal = null;
+  let verificationUrl = page.url();
+
+  while (Date.now() - start < timeoutMs) {
+    verificationUrl = page.url();
+    if (await textLocator.isVisible().catch(() => false)) {
+      verificationSignal = 'text';
+      break;
+    }
+
+    if (await bookingsHeading.isVisible().catch(() => false)) {
+      const urlNow = page.url();
+      if (!urlNow.includes('/bookings/book/')) {
+        verificationSignal = 'bookings-page';
+        break;
+      }
+    }
+
+    if (await bookingFormNotice.isVisible().catch(() => false)) {
+      verificationSignal = 'booking-form';
+    }
+
+    const rowConfirmed = await page
+      .evaluate((label) => {
+        const timeLabel = String(label || '').trim();
+        if (!timeLabel) return false;
+        const rows = Array.from(
+          document.querySelectorAll(
+            'tr, .tee-row, .slot-row, .timeslot, .slot, .availability, [role="row"]',
+          ),
+        );
+        for (const row of rows) {
+          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!text.includes(timeLabel)) continue;
+          const hasBookLink = row.querySelector('a[href*="/bookings/book"]');
+          const buttonText = (row.querySelector('button,[role="button"]')?.textContent || '').toLowerCase();
+          const hasBookButton = buttonText.includes('book');
+          const hasBook = !!hasBookLink || hasBookButton;
+          if (!hasBook && /(unavailable|booked|reserved|full)/i.test(text)) return true;
+        }
+        return false;
+      }, timeLabel)
+      .catch(() => false);
+
+    if (rowConfirmed) {
+      verificationSignal = 'row-unavailable';
+      break;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  const bookingLinksCountAfterClick = await page
+    .locator('a[href*="/bookings/book"]')
+    .count()
+    .catch(() => null);
+
+  const confirmed = ['text', 'bookings-page'].includes(verificationSignal);
+  return {
+    confirmed,
+    verificationSignal,
+    verificationUrl,
+    bookingLinksCountAfterClick,
+  };
+}
+
+async function saveHtmlSnapshot(page, label) {
+  try {
+    const outDir = path.join(agentDir, 'output');
+    await fs.promises.mkdir(outDir, { recursive: true });
+    const safe = String(label || 'booking').replace(/[^a-z0-9_-]/gi, '_');
+    const fileName = `${safe}-after-click-${Date.now()}.html`;
+    const filePath = path.join(outDir, fileName);
+    const html = await page.content();
+    await fs.promises.writeFile(filePath, html, 'utf8');
+    return filePath;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTimeToHHMM(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (!digits) return '';
+  return digits.padStart(4, '0').slice(-4);
+}
+
+function timeToMinutes(value) {
+  const hhmm = normalizeTimeToHHMM(value);
+  if (!hhmm || hhmm.length !== 4) return null;
+  const hours = Number.parseInt(hhmm.slice(0, 2), 10);
+  const mins = Number.parseInt(hhmm.slice(2), 10);
+  if (Number.isNaN(hours) || Number.isNaN(mins)) return null;
+  if (hours < 0 || hours > 23 || mins < 0 || mins > 59) return null;
+  return hours * 60 + mins;
+}
+
+function minutesToHHMM(minutes) {
+  const total = ((minutes % 1440) + 1440) % 1440;
+  const hours = Math.floor(total / 60);
+  const mins = total % 60;
+  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+}
+
+function expandPreferredTimes(preferredTimes, windowMinutes, stepMinutes) {
+  const baseTimes = Array.isArray(preferredTimes) ? preferredTimes : [];
+  const normalized = [];
+  const seen = new Set();
+  const window = Number.isFinite(windowMinutes) ? Math.max(0, windowMinutes) : 0;
+  const step = Number.isFinite(stepMinutes) ? Math.max(1, stepMinutes) : 5;
+
+  for (const time of baseTimes) {
+    const baseMinutes = timeToMinutes(time);
+    if (baseMinutes === null) continue;
+    const offsets = [0];
+    for (let delta = step; delta <= window; delta += step) {
+      offsets.push(-delta, delta);
+    }
+    for (const offset of offsets) {
+      const label = minutesToHHMM(baseMinutes + offset);
+      if (!seen.has(label)) {
+        seen.add(label);
+        normalized.push(label);
+      }
+    }
+  }
+
+  return normalized;
+}
+
 async function runBooking(config) {
   const {
     jobId,
@@ -604,97 +2578,259 @@ async function runBooking(config) {
     targetPlayDate,
     players = [],
     partySize,
-    slotsData = [],  // Array of {time, openSlots, status}
+    slotsData = [],
+    warmPage = null,
+    cachedSelectors = {},
+    useReleaseObserver = false,
+    dryRun = false,
   } = config;
-
   if (!username || !password) {
     throw new Error('Missing BRS credentials for booking run');
   }
-
   let browser;
+  let page;
+  let isWarm = false;
   let runId;
   const startTime = Date.now();
   const teeDate = targetPlayDate ? new Date(targetPlayDate) : new Date();
   const notes = [];
-
+  const normalizedPreferredTimes = expandPreferredTimes(
+    preferredTimes,
+    CONFIG.SNIPER_FALLBACK_WINDOW_MINUTES,
+    CONFIG.SNIPER_FALLBACK_STEP_MINUTES,
+  );
+  if (Array.isArray(preferredTimes) && preferredTimes.length > 0) {
+    const expanded = normalizedPreferredTimes.join(', ');
+    const original = preferredTimes.join(', ');
+    if (expanded && expanded !== original) {
+      console.log(`[SNIPER] Expanded preferred times: ${expanded}`);
+    }
+  }
+  let bookedTime = null;
+  let fallbackLevel = 0;
+  let additionalPlayers = [];
   try {
-    console.log('='.repeat(60));
-    console.log('FAIRWAY SNIPER - BOOKING AGENT STARTED');
-    console.log('='.repeat(60));
-    console.log(`Job ID: ${jobId}`);
-    console.log(`Target fire time: ${new Date(targetFireTime).toISOString()}`);
-    console.log(`Preferred times: ${preferredTimes.join(', ')}`);
+    runId = await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
+    if (warmPage) {
+      page = warmPage;
+      browser = page.context();
+      isWarm = true;
+      console.log('[WARM] Using preloaded session/page; skipping login + navigation');
+    } else {
+      // ...existing browser launch, login, and tee sheet navigation...
+    }
 
-    // Create run record
-    runId = await fsAddRun(
-      jobId,
-      ownerUid,
-      new Date(),
-      'Booking attempt started',
-    );
-
-    // Launch browser
-    console.log('\n[1/5] Launching headless browser...');
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--disable-blink-features=AutomationControlled'],
-    });
-
-    const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1920, height: 1080 },
-    });
-
-    const page = await context.newPage();
-
-    // Navigate and login
-    console.log(`\n[2/5] Navigating to ${loginUrl}...`);
-    await loginToBRS(page, loginUrl, username, password);
-
-    console.log(
-      `\n[3/5] Loading tee sheet for ${teeDate.toISOString().slice(0, 10)}...`,
-    );
-    await navigateToTeeSheet(page, teeDate);
-
-    // Coarse wait until near target time
+    // --- PATCH: release-watcher retries handled after timeout ---
+    const locatorCache = {};
+    for (const time of normalizedPreferredTimes) {
+      const hhmm = normalizeTimeToHHMM(time);
+      if (!hhmm || hhmm.length !== 4) {
+        console.log(`[WARN] Skipping invalid time format in preferredTimes: "${time}"`);
+        continue;
+      }
+      const fallbackSel = `a[href*="/bookings/book/${hhmm}"]`;
+      const cachedSel = cachedSelectors?.[time] || fallbackSel;
+      locatorCache[time] = page.locator(cachedSel).first();
+    }
+    const releaseFallbackLocator = page.locator('a[href*="/bookings/book"]').first();
+    const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
+    additionalPlayers = players.slice(0, desiredAdditionalCount);
     await coarseWaitUntil(targetFireTime);
-
-    // Spin-wait for precise timing
     console.log('\n[4/5] Executing precise timing...');
     await spinUntil(targetFireTime);
+    const targetReachedAt = Date.now();
+    let releaseResult = null;
+    if (useReleaseObserver) {
+      const watchMs = Number.isFinite(CONFIG.SNIPER_RELEASE_WATCH_MS)
+        ? Math.max(500, CONFIG.SNIPER_RELEASE_WATCH_MS)
+        : 8000;
+      const retries = Number.isFinite(CONFIG.SNIPER_RELEASE_RETRY_COUNT)
+        ? Math.max(0, CONFIG.SNIPER_RELEASE_RETRY_COUNT)
+        : 2;
+      const maxAttempts = retries + 1;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        console.log(
+          `[SNIPER] Release watcher (MutationObserver) armed... attempt ${attempt}/${maxAttempts} timeout ${watchMs}ms`,
+        );
+        try {
+          await page.waitForLoadState('domcontentloaded');
+          releaseResult = await waitForBookingRelease(page, watchMs, CONFIG.TEST_MODE);
+        } catch (error) {
+          const msg = error?.message || String(error);
+          console.warn(`[SNIPER] Release watcher error on attempt ${attempt}/${maxAttempts}: ${msg}`);
+          releaseResult = null;
+        }
+        if (releaseResult && releaseResult.found) {
+          break;
+        }
+        const snapshotPath = await saveHtmlSnapshot(page, runId || jobId || 'release-timeout');
+        notes.push(
+          `release-watcher-timeout attempt ${attempt}/${maxAttempts} snapshot=${snapshotPath || 'n/a'}`,
+        );
+        if (attempt < maxAttempts && targetPlayDate) {
+          console.log('[SNIPER] Release watcher timeout — reloading tee sheet and retrying...');
+          const reloadUrl = teeSheetUrlForDate(targetPlayDate);
+          await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
+        }
+      }
+      if (releaseResult && releaseResult.found) {
+        const fireLatencyMs = releaseResult.fireLatencyMs;
+        console.log(`[FIRE] FIRE_LATENCY_MS=${fireLatencyMs}`);
+        if (fireLatencyMs > 200) {
+          console.warn(`[WARN] ⚠️ FIRE_LATENCY_MS >200ms: ${fireLatencyMs}ms`);
+          if (jobId) logJobEvent(jobId, `⚠️ FIRE LATENCY HIGH (${fireLatencyMs}ms)`);
+        }
+        if (CONFIG.TEST_MODE) {
+          console.log(`[TEST_MODE] ⚠️ Booking click executed in page context (TEST_MODE active)`);
+        }
+        // Click already executed in page context by waitForBookingRelease
+        const clickResult = await executeReleaseBooking(
+          page,
+          null,
+          additionalPlayers,
+          slotsData[0]?.openSlots || 3,
+          targetReachedAt,
+          jobId,
+          dryRun,
+          true,
+          fireLatencyMs,
+        );
+        if (dryRun) {
+          const diagnostics = {
+            fire_latency_ms: fireLatencyMs,
+            verification_url: page.url(),
+            verification_signal: 'dry-run',
+          };
+          bookedTime = releaseResult.slotTime || 'release';
+          fallbackLevel = 0;
+          notes.push(`Dry-run; fire_latency=${fireLatencyMs}ms`);
+          await fsFinishRun(runId, {
+            result: 'dry_run',
+            notes: `Dry-run; ${notes.join(' | ')}`,
+            latency_ms: Date.now() - startTime,
+            chosen_time: bookedTime,
+            fallback_level: fallbackLevel,
+            ...diagnostics,
+          });
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: true,
+            result: 'dry_run',
+            bookedTime,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: notes.join(' | '),
+            playersRequested: additionalPlayers,
+            ...diagnostics,
+          };
+        }
+        console.log('[SNIPER] Verification started...');
+        const verification = await verifyBookingConfirmation(
+          page,
+          releaseResult.slotTime || 'release',
+          12000,
+        );
+        if (
+          ['confirm-button-not-found', 'confirm-clicked-no-confirmation-text'].includes(
+            clickResult?.confirmationText,
+          )
+        ) {
+          verification.confirmed = false;
+          verification.verificationSignal = 'confirm-missing';
+        }
+        if (additionalPlayers.length > 0 && (clickResult.playersFilled || []).length < additionalPlayers.length) {
+          verification.confirmed = false;
+          verification.verificationSignal = 'players-missing';
+        }
+        console.log(`[SNIPER] Verification: URL=${verification.verificationUrl}`);
 
-    // BOOKING EXECUTION
-    console.log('\n[5/5] 🎯 ATTEMPTING BOOKING NOW!');
-    const bookingStartTime = Date.now();
+        const clickDeltaMsConfirmed = clickResult?.clickDeltaMs ?? null;
+        const diagnostics = {
+          click_delta_ms: clickDeltaMsConfirmed,
+          release_detect_delta_ms: delta,
+          verification_url: verification.verificationUrl,
+          verification_signal: verification.verificationSignal,
+          booking_links_count_after_click: verification.bookingLinksCountAfterClick,
+        };
 
-    let bookedTime = null;
-    let fallbackLevel = 0;
+        if (verification.confirmed) {
+          bookedTime = releaseResult.slotTime || 'release';
+          fallbackLevel = 0;
+          notes.push(`Release-night booking confirmed; Detected at delta ${delta}ms`);
+          await fsFinishRun(runId, {
+            result: 'success_confirmed',
+            notes: `Release-booked; ${notes.join(' | ')}`,
+            latency_ms: Date.now() - startTime,
+            chosen_time: bookedTime,
+            fallback_level: fallbackLevel,
+            ...diagnostics,
+          });
+          await sendPushFCM('✅ Tee Time Booked!', `Successfully booked (release)`, pushToken);
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: true,
+            result: 'success_confirmed',
+            bookedTime,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: notes.join(' | '),
+            playersRequested: additionalPlayers,
+            ...diagnostics,
+          };
+        }
 
-    // Only fill additional players (Player 1 is the logged-in user)
-    const desiredAdditionalCount =
-      typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
-    const additionalPlayers = players.slice(0, desiredAdditionalCount);
-
-    // Try each preferred time in order
-    for (const [index, time] of preferredTimes.entries()) {
+        console.log('[SNIPER] Verification failed: no confirmation within 12s');
+        const snapshotPath = await saveHtmlSnapshot(page, runId || jobId || 'release');
+        await fsFinishRun(runId, {
+          result: 'click_only',
+          notes: `Clicked booking link but no confirmation; ${notes.join(' | ')}`,
+          latency_ms: Date.now() - startTime,
+          chosen_time: bookedTime,
+          fallback_level: fallbackLevel,
+          snapshot_path: snapshotPath,
+          ...diagnostics,
+        });
+        if (browser && !isWarm) await browser.close();
+        return {
+          success: false,
+          result: 'click_only',
+          bookedTime: null,
+          fallbackLevel,
+          latencyMs: Date.now() - startTime,
+          notes: 'clicked but no confirmation',
+          playersRequested: additionalPlayers,
+          error: 'clicked but no confirmation',
+          snapshotPath,
+          ...diagnostics,
+        };
+      } else {
+        console.log('[SNIPER] Release watcher timeout — fallback to normal scan');
+      }
+    }
+    // === FALLBACK: NORMAL PREFERRED TIMES LOOP ===
+    for (const [index, time] of normalizedPreferredTimes.entries()) {
       try {
         console.log(`Trying time slot: ${time}`);
-        
-        // Find openSlots for this time from slotsData
-        const slotInfo = slotsData.find(s => s.time === time);
-        const openSlots = slotInfo ? slotInfo.openSlots : 3; // default to 3 if not found
-        
+        const slotInfo = slotsData.find((s) => s.time === time);
+        const openSlots = slotInfo ? slotInfo.openSlots : 3;
         const bookingResult = await tryBookTime(
           page,
           time,
           additionalPlayers,
           openSlots,
+          locatorCache[time] || releaseFallbackLocator,
+          targetFireTime,
+          jobId,
         );
         if (bookingResult && bookingResult.booked) {
           bookedTime = time;
           fallbackLevel = index;
-          notes.push(`Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`);
+          notes.push(
+            `Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`,
+          );
           break;
         } else if (bookingResult) {
           const msg = `Could not complete booking for ${time}: ${bookingResult.error || bookingResult.confirmationText}`;
@@ -707,1248 +2843,111 @@ async function runBooking(config) {
         notes.push(msg);
       }
     }
+    const success = !!bookedTime;
+    const resultType = success
+      ? fallbackLevel === 0
+        ? 'success'
+        : 'fallback'
+      : 'failed';
 
-    const latencyMs = Date.now() - bookingStartTime;
+    const finalNotes = notes.join(' | ') || (success ? 'booking-complete' : 'booking-failed');
 
-    // Determine result
-    let result;
-    let notificationTitle;
-    let notificationBody;
-
-    if (bookedTime) {
-      if (fallbackLevel === 0) {
-        result = 'success';
-        notificationTitle = '✅ Tee Time Booked!';
-        notificationBody = `Successfully booked ${bookedTime}`;
-      } else {
-        result = 'fallback';
-        notificationTitle = '☑️ Fallback Slot Booked';
-        notificationBody = `Booked ${bookedTime} (fallback option ${
-          fallbackLevel + 1
-        })`;
-      }
-    } else {
-      result = 'failed';
-      notificationTitle = '❌ Booking Failed';
-      notificationBody = 'No preferred slots were available';
-    }
-
-    // Save results
     await fsFinishRun(runId, {
-      result,
-      notes: `Completed in ${latencyMs}ms; ${notes.join(' | ')}`,
-      latency_ms: latencyMs,
+      result: resultType,
+      notes: finalNotes,
+      latency_ms: Date.now() - startTime,
       chosen_time: bookedTime,
       fallback_level: fallbackLevel,
     });
 
-    // Send notification
-    await sendPushFCM(notificationTitle, notificationBody, pushToken);
+    if (success) {
+      await sendPushFCM(
+        '✅ Tee Time Booked!',
+        `Successfully booked ${bookedTime}`,
+        pushToken,
+      );
+    } else {
+      await sendPushFCM(
+        '❌ Booking Failed',
+        notes.slice(-1)[0] || 'No booking slot could be booked',
+        pushToken,
+      );
+    }
 
-    console.log('\n' + '='.repeat(60));
-    console.log(`RESULT: ${result.toUpperCase()}`);
-    if (bookedTime) console.log(`BOOKED TIME: ${bookedTime}`);
-    console.log(`LATENCY: ${latencyMs}ms`);
-    console.log(`NOTES: ${notes.join(' | ')}`);
-    console.log('='.repeat(60));
-
-    await browser.close();
+    if (browser && !isWarm) await browser.close();
 
     return {
-      success: result === 'success' || result === 'fallback',
-      result,
+      success,
+      result: resultType,
       bookedTime,
       fallbackLevel,
-      latencyMs,
-      notes: notes.join(' | '),
+      latencyMs: Date.now() - startTime,
+      notes: finalNotes,
       playersRequested: additionalPlayers,
     };
   } catch (error) {
-    console.error('\n❌ ERROR:', error);
-
-    if (runId) {
-      await fsFinishRun(runId, {
-        result: 'error',
-        notes: error.message,
-        latency_ms: Date.now() - startTime,
-      });
-    }
-
-    if (pushToken) {
-      await sendPushFCM('⚠️ Booking Error', error.message, pushToken);
-    }
-
-    if (browser) await browser.close();
-
-    return { success: false, error: error.message };
-  }
-}
-
-// ========================================
-
-
-// ========================================
-// TEE TIME FETCHER (HTTP ENDPOINT)
-// ========================================
-
-
-
-/**
- * Fetches available tee times for a specific date from BRS Golf
- * Uses Playwright to scrape the actual booking page
- */
-async function fetchAvailableTeeTimesFromBRS(date, username, password) {
-  let browser;
-
-  try {
-    const dateStr = date.toISOString().split('T')[0];
-    console.log(`Fetching tee times for ${dateStr}...`);
-
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--disable-blink-features=AutomationControlled'],
+    const msg = `Booking run failed: ${error.message}`;
+    console.error(msg);
+    await fsFinishRun(runId, {
+      result: 'error',
+      notes: msg,
+      latency_ms: Date.now() - startTime,
+      chosen_time: bookedTime,
+      fallback_level: fallbackLevel,
     });
-
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      viewport: { width: 1280, height: 720 },
-    });
-
-    const page = await context.newPage();
-
-    await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
-    await navigateToTeeSheet(page, date);
-
-    const slots = await scrapeTeeTimesFromPage(page);
-
-    await browser.close();
-
-    const sorted = slots.sort((a, b) => a.time.localeCompare(b.time));
-    console.log(
-      `  ✅ Found ${sorted.length} available tee times (with capacity hints)`,
-    );
+    if (browser && !isWarm) await browser.close();
     return {
-      times: sorted.map((s) => s.time),
-      slots: sorted,
+      success: false,
+      result: 'error',
+      bookedTime,
+      fallbackLevel,
+      latencyMs: Date.now() - startTime,
+      notes: msg,
+      playersRequested: additionalPlayers,
+      error: error.message,
     };
-  } catch (error) {
-    console.error('Error fetching tee times:', error);
-    if (browser) await browser.close();
-    throw error;
   }
 }
 
-async function scrapeTeeTimesFromPage(page) {
-  // Wait for booking links to appear
-  const start = Date.now();
-  const pollTimeout = 20000;
-  let count = 0;
-  while (Date.now() - start < pollTimeout) {
-    count = await page.locator('a[href*="/bookings/book/"]').count();
-    if (count > 0) break;
-    await page.waitForTimeout(300);
-  }
-  console.log(`  ✅ Found ${count} booking links`);
-
-  const slots = await page.$$eval('a[href*="/bookings/book/"]', (anchors) => {
-    const seen = new Set();
-    const out = [];
-
-    const guessBookedCount = (row) => {
-      if (!row) return 0;
-      const cells = Array.from(row.querySelectorAll('td'));
-      const playerCells = cells.filter((td) => {
-        const text = (td.innerText || '').trim();
-        if (!text || text.length < 3) return false;
-        if (/^\d{1,2}:\d{2}/.test(text)) return false;
-        if (/book now|add|waiting|view/i.test(text)) return false;
-        return true;
-      });
-
-      const allText = playerCells.map((td) => td.innerText || '').join('\n');
-      const tokens = allText
-        .split(/\n+/)
-        .map((t) => t.trim())
-        .filter(Boolean);
-
-      const seenNames = new Set();
-      const nameTokens = tokens.filter((t) => {
-        const lower = t.toLowerCase();
-        if (!/[a-z]/i.test(t)) return false;
-        if (/\d{1,2}:\d{2}/.test(lower)) return false;
-        if (
-          /book|booking|available|waiting|waitlist|wait list|open|holes|format|course|tee|sheet|buggy|buggies|price|rate|member|login|book now|member booked/i.test(
-            lower,
-          )
-        )
-          return false;
-        if (/£|€|\$/.test(t)) return false;
-        if (/^\d+$/.test(t)) return false;
-
-        const cleaned = t.replace(/[^a-zA-Z'\-\s]/g, '').trim();
-        if (cleaned.length < 2) return false;
-        if (!/[a-zA-Z]{2}/.test(cleaned)) return false;
-
-        const key = cleaned.toLowerCase();
-        if (seenNames.has(key)) return false;
-        seenNames.add(key);
-        return true;
-      });
-
-      return Math.min(4, Math.max(0, nameTokens.length));
-    };
-
-    anchors.forEach((a) => {
-      const href = a.getAttribute('href') || '';
-      const match = href.match(/\/(\d{4})(?:[^\d]|$)/);
-      if (!match) return;
-
-      const hhmm = match[1];
-      const hh = hhmm.slice(0, 2);
-      const mm = hhmm.slice(2, 4);
-      const time = `${hh}:${mm}`;
-      if (seen.has(time)) return;
-
-      let row = a.closest('tr');
-      if (!row) row = a.closest('td')?.parentElement;
-      if (!row) row = a.parentElement;
-
-      const totalSlots = 4;
-      const bookedCount = guessBookedCount(row);
-      const openSlots = Math.max(0, totalSlots - bookedCount);
-
-      out.push({
-        time,
-        status: openSlots > 0 ? 'bookable' : 'full',
-        openSlots,
-        totalSlots,
-      });
-
-      seen.add(time);
-    });
-
-    return out;
-  });
-
-  return slots;
-}
-
-// HTTP endpoint to fetch tee times
-app.post('/api/fetch-tee-times', async (req, res) => {
+// --- Release-night helper endpoint ---
+app.post('/api/release-snipe', async (req, res) => {
   try {
-    const { date, username, password } = req.body;
-
-    if (!date) {
-      return res.status(400).json({ error: 'Date is required' });
+    const { username, password, targetDate, fireTimeUtc, preferredTimes, partySize } = req.body;
+    if (!username || !password || !targetDate) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
-
-    if (!username || !password) {
-      return res.status(400).json({ error: 'BRS credentials are required' });
+    // Default: fireTimeUtc = 1 min from now if not provided
+    let fireTime = fireTimeUtc ? new Date(fireTimeUtc).getTime() : Date.now() + 60000;
+    // Default: preferredTimes = []
+    const times = Array.isArray(preferredTimes) ? preferredTimes : [];
+    // Warm preload
+    const warmPage = await warmSession.getWarmPage(targetDate, username, password);
+    // Schedule fire
+    const now = Date.now();
+    if (fireTime > now) {
+      await coarseWaitUntil(fireTime);
     }
-
-    const targetDate = new Date(date);
-    const { times, slots } = await fetchAvailableTeeTimesFromBRS(
-      targetDate,
-      username,
-      password,
-    );
-
-    res.json({ success: true, times, slots });
-  } catch (error) {
-    console.error('Fetch tee times error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to fetch tee times',
-    });
-  }
-});
-
-// Fetch tee times over a range of days
-// Request body: { startDate: ISO string, days: number, username, password }
-app.post('/api/fetch-tee-times-range', async (req, res) => {
-  try {
-    const { startDate, days, username, password, reuseBrowser } = req.body;
-    if (!startDate || !days || !username || !password) {
-      return res.status(400).json({
-        success: false,
-        error: 'startDate, days, username, password are required',
-      });
-    }
-
-    const start = new Date(startDate);
-    if (Number.isNaN(start.getTime())) {
-      return res
-        .status(400)
-        .json({ success: false, error: 'Invalid startDate' });
-    }
-
-    const results = [];
-    if (reuseBrowser === true) {
-      const browser = await chromium.launch({
-        headless: true,
-        args: ['--disable-blink-features=AutomationControlled'],
-      });
-      try {
-        const context = await browser.newContext({
-          userAgent:
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          viewport: { width: 1280, height: 720 },
-        });
-        const page = await context.newPage();
-        await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
-
-        for (let i = 0; i < Number(days); i++) {
-          const targetDate = new Date(start);
-          targetDate.setDate(start.getDate() + i);
-          const dayStr = targetDate.toISOString().slice(0, 10);
-          await navigateToTeeSheet(page, targetDate);
-          const slots = await scrapeTeeTimesFromPage(page);
-          const sorted = slots.sort((a, b) => a.time.localeCompare(b.time));
-          results.push({
-            date: dayStr,
-            times: sorted.map((s) => s.time),
-            slots: sorted,
-          });
-        }
-      } finally {
-        await browser.close();
-      }
-    } else {
-      for (let i = 0; i < Number(days); i++) {
-        const targetDate = new Date(start);
-        targetDate.setDate(start.getDate() + i);
-        const dayStr = targetDate.toISOString().slice(0, 10);
-        const { times, slots } = await fetchAvailableTeeTimesFromBRS(
-          targetDate,
-          username,
-          password,
-        );
-        results.push({ date: dayStr, times, slots });
-      }
-    }
-
-    res.json({
-      success: true,
-      days: results,
-      count: results.length,
-      fetchedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error('  ❌ Error fetching tee times range:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to fetch tee times range',
-    });
-  }
-});
-
-async function fetchPlayerDirectoryFromBRS({ userId, username, password }) {
-  console.log(`\n🔍 Fetching player directory for user ${userId}...`);
-
-  const browser = await chromium.launch({ headless: true });
-
-  // DON'T use stored session for player directory - need fresh login to get correct Player 1 name
-  let contextOptions = {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    viewport: { width: 1920, height: 1080 },
-  };
-
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
-
-  // Reuse proven login + tee sheet navigation (same as /api/snipe -> runBooking)
-  await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
-  const today = new Date();
-  await navigateToTeeSheet(page, today);
-
-  // Evidence capture before selecting a booking link (tee sheet state)
-  const fs = await import('fs');
-  const path = await import('path');
-  const outputDir = path.join(process.cwd(), 'output');
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-  await fs.promises.mkdir(outputDir, { recursive: true }).catch(() => {});
-  const prebookScreenshot = path.join(outputDir, `player_dir_prebook_${timestamp}.png`);
-  const prebookHtml = path.join(outputDir, `player_dir_prebook_${timestamp}.html`);
-  await page.screenshot({ path: prebookScreenshot, fullPage: true }).catch(() => {});
-  const prebookDump = await page.content();
-  await fs.promises.writeFile(prebookHtml, prebookDump.slice(0, 120000), 'utf8').catch(() => {});
-  console.log(`  🌐 Prebook URL: ${page.url()} frames=${page.frames().length}`);
-  console.log(`  💾 Prebook snapshot: ${prebookScreenshot}, ${prebookHtml}`);
-
-  // Ensure tee sheet rows/book links are loaded (same page state /api/snipe relies on)
-  const detailBtn = page.locator('button#detail, button:has-text("Detail")').first();
-  if (await detailBtn.isVisible().catch(() => false)) {
-    await detailBtn.click().catch(() => {});
-  }
-  const start = Date.now();
-  const pollTimeout = 20000;
-  let bookingLinkCount = 0;
-  while (Date.now() - start < pollTimeout) {
-    bookingLinkCount = await page.locator('a[href*="/bookings/book/"]').count();
-    if (bookingLinkCount > 0) break;
-    await page.waitForTimeout(300);
-  }
-
-  // Pick first booking link that leads to a form with Player 2 enabled
-  let bookingLinks = [];
-  if (bookingLinkCount > 0) {
-    bookingLinks = await page.$$eval('a[href*="/bookings/book/"]', (anchors) => {
-      const hrefs = anchors.map((a) => a.getAttribute('href')).filter(Boolean);
-      return Array.from(new Set(hrefs));
-    });
-  } else {
-    for (const frame of page.frames()) {
-      if (frame === page.mainFrame()) continue;
-      const count = await frame.locator('a[href*="/bookings/book/"]').count().catch(() => 0);
-      if (count > 0) {
-        bookingLinks = await frame.$$eval('a[href*="/bookings/book/"]', (anchors) => {
-          const hrefs = anchors.map((a) => a.getAttribute('href')).filter(Boolean);
-          return Array.from(new Set(hrefs));
-        });
-        break;
-      }
-    }
-  }
-  if (!bookingLinks.length) {
-    throw new Error('No booking links found on tee sheet');
-  }
-
-  let chosenHref = null;
-  for (const href of bookingLinks) {
-    const bookingUrl = new URL(href, 'https://members.brsgolf.com/galgorm');
-    await page.goto(bookingUrl.href, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(1500);
-    await page.locator('text=Player 1').first().waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
-
-    const player2 = await page.$('select#member_booking_form_player_2');
-    const disabled = player2 ? await player2.getAttribute('disabled') : 'true';
-    const p2Select2 = page.locator('select#member_booking_form_player_2 + span.select2 .select2-selection').first();
-    const p2AriaDisabled = (await p2Select2.getAttribute('aria-disabled').catch(() => 'true')) || 'true';
-    if (!disabled && p2AriaDisabled !== 'true') {
-      chosenHref = href;
-      break;
-    }
-
-    // Not enough open slots; return to tee sheet and try next
-    await navigateToTeeSheet(page, today);
-  }
-
-  if (!chosenHref) {
-    throw new Error('No bookable tee time with >=2 open slots found');
-  }
-
-  // Minimal, proven Select2 scraping: open dropdown, scrape all visible names, return flat list
-  // --- HUMAN-ACCURATE SELECT2 SCRAPING LOGIC ---
-  // (A) Ensure booking details page is open
-  let onBookingPage = page.url().includes('/bookings/book/') || (await page.locator('text=Player 1').isVisible().catch(() => false));
-  if (!onBookingPage) {
-    // Click first available tee time row
-    const bookBtn = page.locator('a[href*="/bookings/book/"]').first();
-    if (!(await bookBtn.isVisible().catch(() => false))) {
-      throw new Error('No Book button found on tee sheet');
-    }
-    await bookBtn.click();
-    await page.waitForTimeout(2000);
-    onBookingPage = true;
-  }
-  // (B) Open Select2 for first enabled player slot
-  let foundDropdownNum = null;
-  for (const num of [2, 3, 4]) {
-    const selectSel = `select#member_booking_form_player_${num}`;
-    const selectElem = await page.$(selectSel);
-    if (!selectElem) continue;
-    const isDisabled = await selectElem.getAttribute('disabled');
-    if (isDisabled) continue;
-
-    const selectorsToTry = [
-      `${selectSel} + span.select2 .select2-selection`,
-      `.select2-container[aria-owns*="player_${num}"] .select2-selection`,
-      `.select2-selection[aria-labelledby="select2-member_booking_form_player_${num}-container"]`,
-    ];
-    let clicked = false;
-    for (const sel of selectorsToTry) {
-      const box = page.locator(sel).first();
-      const ariaDisabled = await box.getAttribute('aria-disabled').catch(() => 'true');
-      if (await box.isVisible().catch(() => false) && ariaDisabled !== 'true') {
-        foundDropdownNum = num;
-        await box.click();
-        clicked = true;
-        break;
-      }
-    }
-    if (clicked) break;
-  }
-  if (!foundDropdownNum) throw new Error('No enabled Select2 player field found');
-  // (C) Wait for open Select2 results container (try selectors in order, page then frames)
-  const selectors = [
-    'body .select2-container--open .select2-results',
-    'body .select2-dropdown .select2-results',
-    'body .select2-results',
-  ];
-  let resultsHandle = null, matchedSelector = null, matchedFrame = null;
-  for (const sel of selectors) {
-    const h = await page.$(sel);
-    if (h) { resultsHandle = h; matchedSelector = sel; matchedFrame = null; break; }
-  }
-  if (!resultsHandle) {
-    for (const frame of page.frames()) {
-      if (frame === page.mainFrame()) continue;
-      for (const sel of selectors) {
-        const h = await frame.$(sel);
-        if (h) { resultsHandle = h; matchedSelector = sel; matchedFrame = frame; break; }
-      }
-      if (resultsHandle) break;
-    }
-  }
-  // (E) Diagnostics: screenshot and HTML dump
-  const screenshotFile = path.join(outputDir, `player_dir_open_${timestamp}.png`);
-  await page.screenshot({ path: screenshotFile, fullPage: true }).catch(() => {});
-  let htmlDump = '';
-  if (resultsHandle) {
-    if (matchedFrame) {
-      htmlDump = await matchedFrame.evaluate(el => el.outerHTML, resultsHandle);
-    } else {
-      htmlDump = await page.evaluate(el => el.outerHTML, resultsHandle);
-    }
-    const htmlFile = path.join(outputDir, `player_dir_open_${timestamp}.html`);
-    await fs.promises.writeFile(htmlFile, htmlDump.slice(0, 120000), 'utf8').catch(() => {});
-  }
-  // (C, cont) If still not found, error
-  if (!resultsHandle) {
-    const failHtml = await page.content();
-    await fs.promises.writeFile(path.join(outputDir, `player_dir_fail_${timestamp}.html`), failHtml.slice(0, 120000), 'utf8').catch(() => {});
-    throw new Error('Could not find open Select2 results container in any frame');
-  }
-  // (D) Scrape all categories + names from open results
-  const categorizedPlayers = await (matchedFrame || page).evaluate((sel) => {
-    const root = document.querySelector(sel);
-    if (!root) return { categories: [], playerCount: 0 };
-    const categories = [];
-    let currentCategory = null, catObj = null;
-    const idSet = new Set();
-    let groupCount = 0, optionCount = 0;
-    const items = Array.from(
-      root.querySelectorAll('.select2-results__group, .select2-results__option')
-    );
-    for (const el of items) {
-      if (el.classList.contains('select2-results__group')) {
-        if (catObj && catObj.players.length) categories.push(catObj);
-        currentCategory = el.innerText.trim();
-        catObj = { name: currentCategory, players: [] };
-        groupCount++;
-        } else if (
-          el.classList.contains('select2-results__option') &&
-          !el.classList.contains('select2-results__option--disabled') &&
-          el.getAttribute('aria-disabled') !== 'true'
-        ) {
-          if (el.getAttribute('role') === 'group') continue;
-          let name = el.innerText
-            .trim()
-            .replace(/^Member\s*/i, '')
-            .replace(/\s+Holes.*/i, '')
-            .replace(/\s+/g, ' ');
-          if (!name || /Start typing|Searching/i.test(name)) continue;
-          const rawId =
-            el.getAttribute('data-select2-id') ||
-            el.id ||
-            el.getAttribute('value') ||
-            btoa(unescape(encodeURIComponent(name))).slice(0, 16);
-          let id = rawId;
-          const match = String(rawId).match(/-(\d+)$/);
-          if (match) id = match[1];
-          if (idSet.has(id)) continue;
-          idSet.add(id);
-        const type = /guest/i.test(name) ? 'guest' : 'member';
-        if (!catObj) catObj = { name: 'Players', players: [] };
-        catObj.players.push({ id, name, type });
-        optionCount++;
-      }
-    }
-    if (catObj && catObj.players.length) categories.push(catObj);
-    const playerCount = categories.reduce((sum, c) => sum + c.players.length, 0);
-    return { categories, playerCount, groupCount, optionCount };
-  }, matchedSelector);
-  // (E) Log selector/frame info and counts
-  console.log(`  🟢 Select2 scrape: selector=${matchedSelector} frame=${matchedFrame ? page.frames().indexOf(matchedFrame) : 'main'} groups=${categorizedPlayers.groupCount} options=${categorizedPlayers.optionCount} uniquePlayers=${categorizedPlayers.playerCount}`);
-  // (F) Return unchanged schema
-  await browser.close();
-  return {
-    categories: categorizedPlayers.categories,
-    currentMemberId: null,
-    currentUserName: null,
-    count: categorizedPlayers.playerCount,
-    fetchedAt: new Date().toISOString(),
-  };
-}
-
-// Fetch player directory endpoint (scrapes player names from booking form)
-app.post('/api/brs/fetch-player-directory', async (req, res) => {
-  try {
-    const { userId, username, password } = req.body;
-
-    if (!username || !password) {
-      return res.status(400).json({ error: 'BRS credentials are required' });
-    }
-
-    const payload = await fetchPlayerDirectoryFromBRS({ userId, username, password });
-    return res.json({
-      success: true,
-      ...payload,
-    });
-  } catch (error) {
-    console.error('  ❌ Error fetching player directory:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to fetch player directory',
-    });
-  }
-});
-
-// Wizard-friendly player directory endpoint
-app.post('/api/brs/player-directory', async (req, res) => {
-  try {
-    const { userId, username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).json({ error: 'BRS credentials are required' });
-    }
-    const payload = await fetchPlayerDirectoryFromBRS({ userId, username, password });
-    return res.json({
-      success: true,
-      ...payload,
-    });
-  } catch (error) {
-    console.error('  ❌ Error fetching player directory (wizard):', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to fetch player directory',
-    });
-  }
-});
-/*
-            `  ✅ Found ${count} Book buttons (day offset ${dayOffset})`,
-          );
-          break;
-        }
-        await page.waitForTimeout(200);
-      }
-    }
-
-    // Find and click FIRST Book button (use JavaScript to click hidden element)
-    console.log('  🔍 Looking for Book button...');
-    if (!bookHref) {
-      throw new Error('No Book button found after checking multiple days');
-    }
-    console.log(`  ✅ Found booking URL: ${bookHref}`);
-
-    // Navigate to the booking page directly
-    const bookUrl = new URL(bookHref, 'https://members.brsgolf.com/galgorm');
-    await page.goto(bookUrl.href, {
-      waitUntil: 'domcontentloaded',
-      timeout: 45000,
-    });
-    console.log('  ✅ Navigated to booking form');
-
-    // Wait for booking form to load
-    await page.waitForTimeout(2000);
-
-    // Extract players from Player 3 select dropdown (Player 1/2 may be disabled if existing booking)
-    console.log('  🔍 Extracting players from form...');
-    // Try Player 2, 3, then 4 in order, use the first enabled one
-    const playerDropdownIds = [2, 3, 4];
-    let foundDropdown = null;
-    let foundDropdownNum = null;
-    for (const num of playerDropdownIds) {
-      const selector = `select#member_booking_form_player_${num}`;
-      const selectElem = await page.$(selector);
-      if (selectElem) {
-        const isDisabled = await selectElem.getAttribute('disabled');
-        if (!isDisabled) {
-          foundDropdown = selector;
-          foundDropdownNum = num;
-          break;
-        }
-      }
-    }
-    if (!foundDropdown) {
-      throw new Error('No enabled player dropdown (2, 3, or 4) found');
-    }
-    console.log(`  🎯 Using Player ${foundDropdownNum} dropdown for scraping`);
-
-    // Wait for the select to exist
-    // --- OPEN-SELECT2 SCRAPING LOGIC ---
-    // 1. Find the Select2 visible selection area for the enabled player field
-    const select2Selector = `#member_booking_form_player_${foundDropdownNum}`;
-    const select2Container = await page.locator(
-      `.select2-container[aria-owns*="player_${foundDropdownNum}"] .select2-selection`
-    ).first();
-    if (!(await select2Container.isVisible().catch(() => false))) {
-      throw new Error(`Select2 selection area not found for Player ${foundDropdownNum}`);
-    }
-    await select2Container.click();
-    // 2. Wait for Select2 results in body (main page or any frame)
-    let resultsHandle = null;
-    let matchedSelector = null;
-    let matchedFrame = null;
-    const selectors = [
-      'body .select2-container--open .select2-results',
-      'body .select2-dropdown .select2-results',
-    ];
-    // Try main page first
-    for (const sel of selectors) {
-      const handle = await page.$(sel);
-      if (handle) {
-        resultsHandle = handle;
-        matchedSelector = sel;
-        matchedFrame = null;
-        break;
-      }
-    }
-    // If not found, try all frames
-    if (!resultsHandle) {
-      for (const frame of page.frames()) {
-        if (frame === page.mainFrame()) continue;
-        for (const sel of selectors) {
-          const handle = await frame.$(sel);
-          if (handle) {
-            resultsHandle = handle;
-            matchedSelector = sel;
-            matchedFrame = frame;
-            break;
-          }
-        }
-        if (resultsHandle) break;
-      }
-    }
-    if (!resultsHandle) {
-      throw new Error('Could not find open Select2 results container in any frame');
-    }
-    // 3. Diagnostics: screenshot and HTML dump
-    const fs = await import('fs');
-    const path = await import('path');
-    const outputDir = path.join(process.cwd(), 'output');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-    await fs.promises.mkdir(outputDir, { recursive: true }).catch(() => {});
-    const screenshotFile = path.join(outputDir, `player_dir_open_${timestamp}.png`);
-    await page.screenshot({ path: screenshotFile, fullPage: true }).catch(() => {});
-    let htmlDump = '';
-    if (matchedFrame) {
-      htmlDump = await matchedFrame.evaluate((el) => el.outerHTML, resultsHandle);
-    } else {
-      htmlDump = await page.evaluate((el) => el.outerHTML, resultsHandle);
-    }
-    const htmlFile = path.join(outputDir, `player_dir_open_${timestamp}.html`);
-    await fs.promises.writeFile(htmlFile, htmlDump.slice(0, 120000), 'utf8').catch(() => {});
-    console.log(`  💾 Saved screenshot: ${screenshotFile}`);
-    console.log(`  💾 Saved dropdown HTML: ${htmlFile}`);
-    // 4. Scrape categories and options from the open Select2 results
-    const categorizedPlayers = await (matchedFrame || page).evaluate((sel) => {
-      const root = document.querySelector(sel);
-      if (!root) return { categories: [], source: 'none', playerCount: 0 };
-      const headers = Array.from(root.querySelectorAll('.select2-results__group'));
-      const options = Array.from(root.querySelectorAll('.select2-results__option'));
-      let currentCategory = null;
-      const categories = [];
-      const idSet = new Set();
-      let catObj = null;
-      for (const el of root.children) {
-        if (el.classList.contains('select2-results__group')) {
-          if (catObj) categories.push(catObj);
-          currentCategory = el.innerText.trim();
-          catObj = { name: currentCategory, players: [] };
-        } else if (el.classList.contains('select2-results__option') && !el.classList.contains('select2-results__option--disabled')) {
-          let name = el.innerText.trim().replace(/^Member\s* /i, '').replace(/\s+Holes.* /i, '').replace(/\s+/g, ' ');
-          if (!name || /Start typing/i.test(name)) continue;
-          let id = el.getAttribute('data-select2-id') || el.id || btoa(unescape(encodeURIComponent(name))).slice(0, 16);
-          if (idSet.has(id)) continue;
-          idSet.add(id);
-          const type = /guest/i.test(name) ? 'guest' : 'member';
-          if (!catObj) {
-            catObj = { name: 'Players', players: [] };
-          }
-          catObj.players.push({ id, name, type });
-        }
-      }
-      if (catObj && catObj.players.length) categories.push(catObj);
-      const playerCount = categories.reduce((sum, c) => sum + c.players.length, 0);
-      return { categories, source: 'select2-open-results', playerCount };
-    }, matchedSelector);
-    // 5. Log selector/frame info and counts
-    console.log(`  🟢 Select2 scrape: selector=${matchedSelector} frame=${matchedFrame ? page.frames().indexOf(matchedFrame) : 'main'} categories=${categorizedPlayers.categories.length} totalPlayers=${categorizedPlayers.playerCount}`);
-
-    await browser.close();
-
-    const totalPlayers = categorizedPlayers.categories.reduce(
-      (sum, cat) => sum + cat.players.length,
-      0,
-    );
-    console.log(
-      `  ✅ Found ${totalPlayers} players in ${categorizedPlayers.categories.length} categories (source: ${categorizedPlayers.source})`,
-    );
-    if (categorizedPlayers.currentUserName) {
-      console.log(
-        `  👤 Logged-in user: ${categorizedPlayers.currentUserName} (ID: ${categorizedPlayers.currentMemberId})`,
-      );
-    }
-    if (totalPlayers === 0) {
-      console.log(
-        '  ⚠️ WARNING: No players extracted; booking form may not have been fully loaded',
-      );
-    }
-
-    res.json({
-      success: true,
-      categories: categorizedPlayers.categories,
-      currentMemberId: categorizedPlayers.currentMemberId,
-      currentUserName: categorizedPlayers.currentUserName,
-      count: totalPlayers,
-      fetchedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error('  ❌ Error fetching player directory:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to fetch player directory',
-    });
-  }
-});
-*/
-
-// SNIPER UNIFIED ENDPOINT - Check availability AND book
-// Request body: { username, password, targetDate, preferredTimes, players, checkOnly }
-app.post('/api/snipe', async (req, res) => {
-  try {
-    const {
-      username,
-      password,
-      targetDate,
-      preferredTimes,
-      players,
-      partySize,
-      checkOnly,
-      previewBooking,
-    } = req.body;
-
-    // Validate required fields
-    if (!username || !password) {
-      return res.status(400).json({ error: 'BRS credentials required' });
-    }
-
-    if (!targetDate) {
-      return res.status(400).json({ error: 'Target date required' });
-    }
-
-    console.log('\n🎯 SNIPER API CALL');
-    console.log(`   Mode: ${checkOnly ? 'CHECK AVAILABILITY' : 'SNIPE & BOOK'}`);
-    console.log(`   Target Date: ${targetDate}`);
-    console.log(`   Preferred Times: ${(preferredTimes || []).join(', ')}`);
-    console.log(`   Players: ${(players || []).join(', ')}`);
-
-    // Phase 1: Check availability
-    const { times, slots } = await fetchAvailableTeeTimesFromBRS(
-      new Date(targetDate),
-      username,
-      password,
-    );
-
-    const slotsCount = Array.isArray(slots)
-      ? slots.reduce((sum, s) => sum + (s.openSlots || 0), 0)
-      : Number(slots) || 0;
-    console.log(`   ✅ Found ${slotsCount} available slots on ${targetDate}`);
-
-    // If checkOnly mode, just return availability
-    if (checkOnly) {
-      return res.json({
-        success: true,
-        available: slotsCount > 0,
-        slots: slotsCount,
-        times: times || [],
-        date: targetDate,
-      });
-    }
-
-    // Preview booking mode: open booking details + select2, then exit safely
-    if (previewBooking === true) {
-      const browser = await chromium.launch({ headless: true });
-      try {
-        const context = await browser.newContext({
-          userAgent:
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          viewport: { width: 1920, height: 1080 },
-        });
-        const page = await context.newPage();
-
-        await loginToBRS(page, CONFIG.CLUB_LOGIN_URL, username, password);
-        const today = new Date(targetDate);
-        await navigateToTeeSheet(page, today);
-
-        const detailBtn = page
-          .locator('button#detail, button:has-text("Detail")')
-          .first();
-        if (await detailBtn.isVisible().catch(() => false)) {
-          await detailBtn.click().catch(() => {});
-        }
-        const start = Date.now();
-        const pollTimeout = 20000;
-        let bookingLinkCount = 0;
-        while (Date.now() - start < pollTimeout) {
-          bookingLinkCount = await page
-            .locator('a[href*="/bookings/book/"]')
-            .count();
-          if (bookingLinkCount > 0) break;
-          await page.waitForTimeout(300);
-        }
-
-        let bookingLinks = [];
-        if (bookingLinkCount > 0) {
-          bookingLinks = await page.$$eval(
-            'a[href*="/bookings/book/"]',
-            (anchors) => {
-              const hrefs = anchors
-                .map((a) => a.getAttribute('href'))
-                .filter(Boolean);
-              return Array.from(new Set(hrefs));
-            },
-          );
-        } else {
-          for (const frame of page.frames()) {
-            if (frame === page.mainFrame()) continue;
-            const count = await frame
-              .locator('a[href*="/bookings/book/"]')
-              .count()
-              .catch(() => 0);
-            if (count > 0) {
-              bookingLinks = await frame.$$eval(
-                'a[href*="/bookings/book/"]',
-                (anchors) => {
-                  const hrefs = anchors
-                    .map((a) => a.getAttribute('href'))
-                    .filter(Boolean);
-                  return Array.from(new Set(hrefs));
-                },
-              );
-              break;
-            }
-          }
-        }
-        if (!bookingLinks.length) {
-          throw new Error('No booking links found on tee sheet');
-        }
-
-        let chosenHref = null;
-        for (const href of bookingLinks) {
-          const bookingUrl = new URL(
-            href,
-            'https://members.brsgolf.com/galgorm',
-          );
-          await page.goto(bookingUrl.href, {
-            waitUntil: 'domcontentloaded',
-            timeout: 45000,
-          });
-          await page.waitForTimeout(1500);
-          await page
-            .locator('text=Player 1')
-            .first()
-            .waitFor({ state: 'visible', timeout: 15000 })
-            .catch(() => {});
-
-          const player2 = await page.$('select#member_booking_form_player_2');
-          const disabled = player2
-            ? await player2.getAttribute('disabled')
-            : 'true';
-          const p2Select2 = page
-            .locator(
-              'select#member_booking_form_player_2 + span.select2 .select2-selection',
-            )
-            .first();
-          const p2AriaDisabled =
-            (await p2Select2
-              .getAttribute('aria-disabled')
-              .catch(() => 'true')) || 'true';
-          if (!disabled && p2AriaDisabled !== 'true') {
-            chosenHref = href;
-            break;
-          }
-
-          await navigateToTeeSheet(page, today);
-        }
-
-        if (!chosenHref) {
-          throw new Error('No bookable tee time with >=2 open slots found');
-        }
-
-        // Assert booking details + open Select2
-        await page
-          .locator('text=Player 1')
-          .first()
-          .waitFor({ state: 'visible', timeout: 15000 });
-        const player2Select = await page.$(
-          'select#member_booking_form_player_2',
-        );
-        if (!player2Select) {
-          throw new Error('Player 2 field not found on booking details');
-        }
-
-        const select2Box = page
-          .locator(
-            'select#member_booking_form_player_2 + span.select2 .select2-selection',
-          )
-          .first();
-        await select2Box.click();
-
-        const selectors = [
-          'body .select2-container--open .select2-results',
-          'body .select2-dropdown .select2-results',
-          'body .select2-results',
-        ];
-        let resultsHandle = null;
-        let matchedSelector = null;
-        let matchedFrame = null;
-        for (const sel of selectors) {
-          const h = await page.$(sel);
-          if (h) {
-            resultsHandle = h;
-            matchedSelector = sel;
-            matchedFrame = null;
-            break;
-          }
-        }
-        if (!resultsHandle) {
-          for (const frame of page.frames()) {
-            if (frame === page.mainFrame()) continue;
-            for (const sel of selectors) {
-              const h = await frame.$(sel);
-              if (h) {
-                resultsHandle = h;
-                matchedSelector = sel;
-                matchedFrame = frame;
-                break;
-              }
-            }
-            if (resultsHandle) break;
-          }
-        }
-        if (!resultsHandle) {
-          throw new Error('Could not find open Select2 results container');
-        }
-
-        const select2OptionsCount = await (matchedFrame || page).evaluate(
-          (sel) => {
-            const root = document.querySelector(sel);
-            if (!root) return 0;
-            const options = root.querySelectorAll(
-              '.select2-results__option:not(.select2-results__option--disabled)',
-            );
-            return options.length;
-          },
-          matchedSelector,
-        );
-
-        if (select2OptionsCount < 20) {
-          throw new Error(
-            `Select2 options count too low: ${select2OptionsCount}`,
-          );
-        }
-
-        const fs = await import('fs');
-        const path = await import('path');
-        const outputDir = path.join(process.cwd(), 'output');
-        const timestamp = new Date()
-          .toISOString()
-          .replace(/[:.]/g, '-')
-          .slice(0, -5);
-        await fs.promises.mkdir(outputDir, { recursive: true }).catch(() => {});
-        const screenshotFile = path.join(
-          outputDir,
-          `preview_booking_${timestamp}.png`,
-        );
-        await page.screenshot({ path: screenshotFile, fullPage: true }).catch(
-          () => {},
-        );
-
-        await browser.close();
-        return res.json({
-          success: true,
-          preview: true,
-          reachedBookingDetails: true,
-          select2OptionsCount,
-        });
-      } catch (error) {
-        await browser.close();
-        throw error;
-      }
-    }
-
-    // Phase 2: If slots available and NOT checkOnly, execute booking
-    if (slotsCount === 0) {
-      return res.json({
-        success: false,
-        available: false,
-        slots: 0,
-        times: [],
-        error: 'No available slots on this date',
-        date: targetDate,
-      });
-    }
-
-    // Execute booking
+    // Run booking with release observer
     const result = await runBooking({
-      jobId: 'snipe-' + Date.now(),
-      ownerUid: 'app-user',
-      loginUrl: 'https://members.brsgolf.com/galgorm/login',
+      jobId: 'release-snipe-' + Date.now(),
+      ownerUid: 'release-night',
+      loginUrl: CONFIG.CLUB_LOGIN_URL,
       username,
       password,
-      preferredTimes: preferredTimes || [],
-      targetFireTime: new Date(),
-      pushToken: null,
+      preferredTimes: times,
+      targetFireTime: fireTime,
       targetPlayDate: targetDate,
-      players: players || [],
+      players: [],
       partySize,
-      slotsData: slots || [],  // Pass the full slots array with openSlots info
+      slotsData: [],
+      warmPage,
+      useReleaseObserver: true,
     });
-
-    res.json({
-      success: result.success,
-      booked: result.success,
-      result: result.result || null,
-      error: result.error || null,
-      mode: 'sniper',
-      booking: {
-        targetDate,
-        selectedTime: result.bookedTime,
-        preferredTimes,
-        playersRequested: result.playersRequested,
-        openSlots: result.bookedTime
-          ? slots.find(s => s.time === result.bookedTime)?.openSlots
-          : null,
-      },
-      timing: {
-        latencyMs: result.latencyMs,
-        fallbackLevel: result.fallbackLevel,
-      },
-      notes: result.notes,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error('🎯 Sniper error:', error);
-    res.status(500).json({
-      success: false,
-      available: false,
-      error: error.message || 'Sniper failed',
-    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
-
-// Immediate booking endpoint for Normal mode
-// Request body: { username, password, targetDate, preferredTimes: [time1, time2], players: [name1, name2, ...], pushToken }
-app.post('/api/book-now', async (req, res) => {
-  try {
-    const {
-      username,
-      password,
-      targetDate,
-      preferredTimes,
-      players,
-      partySize,
-      pushToken,
-    } = req.body;
-
-    // Validate required fields
-    if (!username || !password) {
-      return res.status(400).json({ error: 'BRS credentials are required' });
-    }
-
-    if (!targetDate) {
-      return res.status(400).json({ error: 'Target date is required' });
-    }
-
-    if (!preferredTimes || preferredTimes.length === 0) {
-      return res.status(400).json({ error: 'Preferred times are required' });
-    }
-
-    console.log('\n📲 Immediate Normal Mode Booking Triggered');
-    console.log(`   Target Date: ${targetDate}`);
-    console.log(`   Preferred Times: ${preferredTimes.join(', ')}`);
-    console.log(`   Players: ${players.join(', ')}`);
-
-    // First, fetch available slots to pass to booking function
-    const { times, slots: slotsData } = await fetchAvailableTeeTimesFromBRS(
-      new Date(targetDate),
-      username,
-      password,
-    ).catch(() => ({ times: [], slots: [] }));
-
-    // Execute booking immediately
-    const result = await runBooking({
-      jobId: 'immediate-' + Date.now(), // Temporary ID for immediate bookings
-      ownerUid: 'web-user',
-      loginUrl: 'https://members.brsgolf.com/galgorm/login',
-      username,
-      password,
-      preferredTimes,
-      targetFireTime: new Date(), // Fire immediately
-      pushToken,
-      targetPlayDate: targetDate,
-      players: players || [],
-      partySize,
-      slotsData: slotsData || [],  // Pass slots data for accurate player fill logic
-    });
-
-    res.json({
-      success: result.success,
-      booked: result.success,
-      result: result.result,
-      error: result.error || null,
-      mode: 'normal',
-      booking: {
-        targetDate,
-        selectedTime: result.bookedTime,
-        preferredTimes,
-        playersRequested: result.playersRequested,
-        openSlots: result.bookedTime
-          ? slotsData?.find(s => s.time === result.bookedTime)?.openSlots
-          : null,
-      },
-      timing: {
-        latencyMs: result.latencyMs,
-        fallbackLevel: result.fallbackLevel,
-      },
-      notes: result.notes,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error('📲 Immediate booking error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to execute immediate booking',
-      timestamp: new Date().toISOString(),
-    });
-  }
-});
-
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'fairway-sniper-agent' });
-});
-
-
-async function main() {
-  // Start HTTP server
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`🚀 Fairway Sniper Agent HTTP server running on port ${PORT}`);
-    console.log(`   - Health: http://localhost:${PORT}/api/health`);
-    console.log(
-      `   - Sniper (unified): POST http://localhost:${PORT}/api/snipe`,
-    );
-    console.log(
-      `   - Fetch Tee Times: POST http://localhost:${PORT}/api/fetch-tee-times`,
-    );
-  });
-}
-
-if (globalThis.__BOOT_OK__ === true) {
-  main();
-}
 
 
 // Query Firestore for one active job (used by agent main loop)
@@ -1970,10 +2969,15 @@ async function fsGetOneActiveJob() {
   }
 }
 
+
+// Start the Express server
+const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0', () => {
+  logStartupBanner(port);
+});
+
 export {
-  main,
   runBooking,
   computeNextFireUTC,
   fsGetOneActiveJob,
-  fetchAvailableTeeTimesFromBRS,
 };

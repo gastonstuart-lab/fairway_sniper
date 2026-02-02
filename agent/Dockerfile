@@ -1,29 +1,23 @@
-# Use Playwright's official image which bundles browsers and a suitable Node runtime
-# This isolates the agent from local host issues (sandbox, conflicting node processes)
-FROM mcr.microsoft.com/playwright:latest
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
-# Create app directory
-WORKDIR /usr/src/app
+WORKDIR /app
 
-# Copy package files first for better layer caching
-COPY package.json package-lock.json* ./
+# Copy package files
+COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --silent
+# Install dependencies (npm install handles lock file updates)
+RUN npm install --omit=dev
 
-# Copy agent source
-COPY . .
+# Install Playwright with system dependencies
+RUN npx playwright install --with-deps chromium
 
-# Expose port used by agent HTTP server
-EXPOSE 3000
+# Copy application code
+COPY . ./
 
-# Use a non-root user where available (Playwright base image often sets pwuser)
-USER pwuser
-
-# Default envs
-ENV AGENT_RUN_MAIN=false
-ENV AGENT_HEADLESS=true
+# Set environment
 ENV NODE_ENV=production
+ENV AGENT_RUN_MAIN=true
 
-# Default command
-CMD ["node", "./index.js"]
+# Start application
+EXPOSE 8080
+CMD ["node", "index.js"]

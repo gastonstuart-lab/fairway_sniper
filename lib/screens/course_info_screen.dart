@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:fairway_sniper/theme.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 
 class CourseInfoScreen extends StatelessWidget {
   const CourseInfoScreen({super.key});
@@ -28,18 +29,18 @@ class CourseInfoScreen extends StatelessWidget {
           child: Center(
             child: Container(
               constraints: const BoxConstraints(maxWidth: 1000),
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.all(AppSpacing.xxl),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _buildCourseHeader(),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: AppSpacing.xl),
                   _buildCourseOverview(),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: AppSpacing.xl),
                   _buildScorecardSection(context),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: AppSpacing.xl),
                   _buildFacilitiesSection(),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: AppSpacing.xl),
                   _buildLocationSection(),
                 ],
               ),
@@ -62,21 +63,21 @@ class CourseInfoScreen extends StatelessWidget {
           ),
           borderRadius: BorderRadius.circular(12),
         ),
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(AppSpacing.xl),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
                 Container(
-                  padding: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.all(AppSpacing.md),
                   decoration: BoxDecoration(
                     color: Colors.white.withValues(alpha: 0.2),
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: const Icon(Icons.golf_course, color: Colors.white, size: 32),
                 ),
-                const SizedBox(width: 16),
+                const SizedBox(width: AppSpacing.lg),
                 const Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -102,13 +103,13 @@ class CourseInfoScreen extends StatelessWidget {
                 ),
               ],
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: AppSpacing.xl),
             Row(
               children: [
                 _buildStatChip('18 Holes', Icons.flag),
-                const SizedBox(width: 12),
+                const SizedBox(width: AppSpacing.md),
                 _buildStatChip('Par 72', Icons.star),
-                const SizedBox(width: 12),
+                const SizedBox(width: AppSpacing.md),
                 _buildStatChip('7,121 yds', Icons.straighten),
               ],
             ),
@@ -120,7 +121,7 @@ class CourseInfoScreen extends StatelessWidget {
 
   Widget _buildStatChip(String label, IconData icon) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md, vertical: AppSpacing.sm),
       decoration: BoxDecoration(
         color: Colors.white.withValues(alpha: 0.2),
         borderRadius: BorderRadius.circular(20),

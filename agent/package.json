@@ -5,6 +5,8 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
+    "postinstall": "npx playwright install --with-deps chromium",
+    "build": "npx playwright install --with-deps chromium",
     "start": "node index.js",
     "start:boot": "node boot.js",
     "test": "node index.js --dry-run",
@@ -18,6 +20,8 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^4.18.2",
+    "firebase-admin": "^12.7.0",
+    "luxon": "^3.4.4",
     "winston": "^3.18.3"
   },
   "engines": {

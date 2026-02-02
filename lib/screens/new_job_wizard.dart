@@ -3,12 +3,15 @@ import 'dart:convert';
 import 'package:fairway_sniper/models/booking_job.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/player_directory_service.dart';
+import 'package:fairway_sniper/services/agent_base_url.dart';
+import 'package:fairway_sniper/services/availability_cache_service.dart';
 import 'package:fairway_sniper/widgets/player_selector_modal.dart';
 import 'package:fairway_sniper/widgets/player_list_editor.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 
 class NewJobWizard extends StatefulWidget {
   const NewJobWizard({super.key});
@@ -33,36 +36,48 @@ class _NewJobWizardState extends State<NewJobWizard> {
   DateTime? _targetDate;
   String? _selectedTime; // For Normal mode: single time selection
   DateTime? _selectedDate; // For Normal mode: which day the selected time is on
-  int _playerCount = 2; // For Normal mode: how many slots needed
+  int _additionalPlayerCount = 1; // Additional players beyond Player 1
   List<String> _selectedPlayers = []; // Additional players (Player 2+)
   String? _currentUserName; // Player 1 (logged-in user)
   final List<TextEditingController> _playerControllers = [
     TextEditingController()
   ];
   static const int _rangeWindowDays = 5;
-  late final String _agentBaseUrl = _resolveAgentBaseUrl();
+  String _agentBaseUrl = defaultAgentBaseUrl();
+  bool _agentTesting = false;
+  String? _agentTestStatus;
+  bool _agentHealthOk = true;
+  String? _agentHealthBaseUrl;
   bool _isFetchingAvailability = false;
   String? _availabilityError;
   DateTime? _availabilityFetchedAt;
   DateTime? _focusedAvailabilityDate;
   List<_DayAvailability> _availabilityDays = [];
+  bool _allowPairing = true;
   BookingMode _mode = BookingMode.normal; // booking strategy selection
   Map<String, String>? _savedCreds; // loaded from Firestore user profile
   bool _useSavedCreds = true; // default to using saved if present
   bool _loadingSavedCreds = false;
+  bool _isRefreshingPlayers = false;
+  bool _isNextBusy = false;
+  final _availabilityCacheService = AvailabilityCacheService();
+  int get _partySize => _additionalPlayerCount + 1;
 
   @override
   void initState() {
     super.initState();
     _playerDirectoryService = PlayerDirectoryService(
       firebaseService: _firebaseService,
-      agentBaseUrl: _agentBaseUrl,
     );
+    _loadDraftLocally(); // Recover interrupted booking
     _loadSavedCreds();
+    _loadAgentBaseUrl();
+    _runAgentDiagnostics();
   }
 
   @override
   void dispose() {
+    _saveDraftLocally(); // Auto-save on dispose
     _pageController.dispose();
     _brsEmailController.dispose();
     _brsPasswordController.dispose();
@@ -70,6 +85,82 @@ class _NewJobWizardState extends State<NewJobWizard> {
       controller.dispose();
     }
     super.dispose();
+  }
+
+  /// Save wizard state to SharedPreferences for recovery
+  Future<void> _saveDraftLocally() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final draftData = {
+        'page': _currentPage,
+        'username': _brsEmailController.text,
+        'password': _brsPasswordController.text,
+        'club': _club,
+        'releaseDay': _releaseDay,
+        'releaseTime': _releaseTime,
+        'targetDate': _targetDate?.toIso8601String(),
+        'selectedTime': _selectedTime,
+        'selectedDate': _selectedDate?.toIso8601String(),
+        'additionalPlayerCount': _additionalPlayerCount,
+        'selectedPlayers': jsonEncode(_selectedPlayers),
+        'currentUserName': _currentUserName,
+        'allowPairing': _allowPairing,
+        'timestamp': DateTime.now().toIso8601String(),
+      };
+      await prefs.setString('new_job_wizard_draft', jsonEncode(draftData));
+    } catch (e) {
+      print('❌ Failed to save draft: $e');
+    }
+  }
+
+  /// Load draft from SharedPreferences if available (24h expiry)
+  Future<void> _loadDraftLocally() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final draftJson = prefs.getString('new_job_wizard_draft');
+      if (draftJson == null) return;
+
+      final draft = jsonDecode(draftJson) as Map<String, dynamic>;
+      final timestamp = DateTime.parse(draft['timestamp'] as String? ?? '');
+      final now = DateTime.now();
+      
+      // Discard draft if older than 24 hours
+      if (now.difference(timestamp).inHours > 24) {
+        await prefs.remove('new_job_wizard_draft');
+        return;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _currentPage = draft['page'] ?? 0;
+        _club = draft['club'] ?? 'galgorm';
+        _releaseDay = draft['releaseDay'] ?? 'Tuesday';
+        _releaseTime = draft['releaseTime'] ?? '19:20';
+        _targetDate = draft['targetDate'] != null ? DateTime.parse(draft['targetDate'] as String) : null;
+        _selectedTime = draft['selectedTime'];
+        _selectedDate = draft['selectedDate'] != null ? DateTime.parse(draft['selectedDate'] as String) : null;
+        _additionalPlayerCount = draft['additionalPlayerCount'] ?? 1;
+        _currentUserName = draft['currentUserName'];
+        _allowPairing = draft['allowPairing'] ?? true;
+        
+        final playersJson = draft['selectedPlayers'];
+        if (playersJson != null) {
+          _selectedPlayers = List<String>.from(jsonDecode(playersJson) as List);
+        }
+
+        _brsEmailController.text = draft['username'] ?? '';
+        _brsPasswordController.text = draft['password'] ?? '';
+      });
+
+      // Navigate to last page
+      if (_currentPage > 0) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _pageController.jumpToPage(_currentPage);
+        });
+      }
+    } catch (e) {
+      print('❌ Failed to load draft: $e');
+    }
   }
 
   Future<void> _loadSavedCreds() async {
@@ -87,6 +178,13 @@ class _NewJobWizardState extends State<NewJobWizard> {
         // Prefill (user can toggle off to edit)
         _brsEmailController.text = creds['username'] ?? '';
         _brsPasswordController.text = creds['password'] ?? '';
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          if (_currentPage == 0) {
+            _pageController.jumpToPage(1);
+            setState(() => _currentPage = 1);
+          }
+        });
       }
     } catch (e) {
       if (!mounted) return;
@@ -94,7 +192,66 @@ class _NewJobWizardState extends State<NewJobWizard> {
     }
   }
 
+  Future<void> _loadAgentBaseUrl() async {
+    final url = await getAgentBaseUrl();
+    if (!mounted) return;
+    setState(() => _agentBaseUrl = url);
+  }
+
+  Future<void> _runAgentDiagnostics() async {
+    final baseUrl = await getAgentBaseUrl();
+    if (!mounted) return;
+    setState(() => _agentHealthBaseUrl = baseUrl);
+
+    final healthUrl = '$baseUrl/api/health';
+    print('🚨🚨 [AGENT-DIAG] HEALTH CHECK URL: $healthUrl');
+    try {
+      final response = await http
+          .get(Uri.parse(healthUrl))
+          .timeout(const Duration(seconds: 8));
+      print(
+          '🚨🚨 [AGENT-DIAG] HEALTH STATUS: ${response.statusCode} BODY: ${response.body}');
+      if (!mounted) return;
+      setState(() => _agentHealthOk = response.statusCode == 200);
+    } catch (e) {
+      print('🚨🚨 [AGENT-DIAG] HEALTH ERROR: $e');
+      if (!mounted) return;
+      setState(() => _agentHealthOk = false);
+    }
+
+    if (!_agentHealthOk) return;
+
+    final diagUser = _brsEmailController.text.trim();
+    final diagPass = _brsPasswordController.text.trim();
+    if (diagUser.isEmpty || diagPass.isEmpty) return;
+
+    final fetchUrl = '$baseUrl/api/fetch-tee-times-range';
+    final payload = {
+      'startDate': DateTime.now().toIso8601String(),
+      'days': _rangeWindowDays,
+      'username': diagUser,
+      'password': diagPass,
+      'club': _club,
+      'reuseBrowser': true,
+    };
+    print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
+    try {
+      final response = await http.post(
+        Uri.parse(fetchUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(payload),
+      );
+      final body = response.body;
+      final snippet = body.substring(0, body.length.clamp(0, 300));
+      print(
+          '🚨🚨 [AGENT-DIAG] FETCH STATUS: ${response.statusCode} BODY: $snippet');
+    } catch (e) {
+      print('🚨🚨 [AGENT-DIAG] FETCH ERROR: $e');
+    }
+  }
+
   Future<void> _nextPage() async {
+    if (_isNextBusy) return;
     // Validate page 0 (BRS Credentials)
     if (_currentPage == 0) {
       final username = _brsEmailController.text.trim();
@@ -126,7 +283,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     // Validate players on page 2
     if (_currentPage == 2) {
-      final requiredAdditional = _playerCount > 1 ? _playerCount - 1 : 0;
+      final requiredAdditional = _additionalPlayerCount;
       if (_selectedPlayers.length < requiredAdditional) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -142,25 +299,22 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     if (_currentPage < 3) {
       // Changed from 4 to 3 (now 4 pages total)
-      _pageController.nextPage(
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeInOut,
-      );
+      setState(() => _isNextBusy = true);
+      _pageController
+          .nextPage(
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeInOut,
+          )
+          .whenComplete(() {
+        if (mounted) {
+          setState(() => _isNextBusy = false);
+        }
+      });
     }
   }
 
   void _handlePageChanged(int page) {
     setState(() => _currentPage = page);
-    if (page == 1) {
-      // Changed from page 2 to page 1 (now the booking page is second)
-      final hasCredentials = _brsEmailController.text.trim().isNotEmpty &&
-          _brsPasswordController.text.trim().isNotEmpty;
-      if (hasCredentials &&
-          _availabilityDays.isEmpty &&
-          !_isFetchingAvailability) {
-        _refreshRangeFromAgent();
-      }
-    }
   }
 
   void _previousPage() {
@@ -211,7 +365,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
       targetDay: DateFormat('EEEE').format(_selectedDate!),
       preferredTimes: [_selectedTime!], // Single time for Normal mode
       players: players,
-      partySize: _playerCount,
+      partySize: _partySize,
       pushToken: fcmToken,
       bookingMode: _mode,
       targetPlayDate:
@@ -237,7 +391,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
           targetDate: _selectedDate!,
           preferredTimes: [_selectedTime!],
           players: players,
-          partySize: _playerCount,
+          partySize: _partySize,
           pushToken: fcmToken,
         );
 
@@ -335,11 +489,13 @@ class _NewJobWizardState extends State<NewJobWizard> {
     required int partySize,
     required String? pushToken,
   }) async {
+    String baseUrl = _agentBaseUrl;
     try {
+      baseUrl = await getAgentBaseUrl();
       final client = http.Client();
       final response = await client
           .post(
-            Uri.parse('$_agentBaseUrl/api/book-now'),
+            Uri.parse('$baseUrl/api/book-now'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'username': username,
@@ -367,7 +523,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
         return {
           'success': false,
           'result': 'error',
-          'error': 'Server error: ${response.statusCode}',
+          'error':
+              'Agent error ${response.statusCode} at $baseUrl. ${_agentHelpText()}',
         };
       }
     } catch (e) {
@@ -375,7 +532,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
       return {
         'success': false,
         'result': 'error',
-        'error': e.toString(),
+        'error':
+            'Failed to contact agent at $baseUrl. ${_agentHelpText()} ($e)',
       };
     }
   }
@@ -406,9 +564,25 @@ class _NewJobWizardState extends State<NewJobWizard> {
               color: Colors.black,
               borderRadius: BorderRadius.circular(16),
             ),
-            margin: const EdgeInsets.symmetric(vertical: 20),
+            margin: const EdgeInsets.symmetric(vertical: AppSpacing.xl),
             child: Column(
               children: [
+                if (!_agentHealthOk && _agentHealthBaseUrl != null)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppSpacing.lg,
+                      vertical: AppSpacing.md,
+                    ),
+                    color: Colors.red.shade700,
+                    child: Text(
+                      'AGENT NOT RUNNING at $_agentHealthBaseUrl',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
                 _buildProgressIndicator(),
                 Expanded(
                   child: PageView(
@@ -434,7 +608,10 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
   Widget _buildProgressIndicator() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.xl,
+        vertical: AppSpacing.lg,
+      ),
       child: Row(
         children: List.generate(4, (index) {
           // Changed from 5 to 4 steps
@@ -444,7 +621,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
           return Expanded(
             child: Container(
               height: 4,
-              margin: EdgeInsets.only(right: index < 4 ? 8 : 0),
+              margin: EdgeInsets.only(right: index < 4 ? AppSpacing.sm : 0),
               decoration: BoxDecoration(
                 color: isCompleted || isActive
                     ? Theme.of(context).colorScheme.primary
@@ -460,37 +637,37 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
   Widget _buildPage0BrsCredentials() {
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(AppSpacing.xl),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Icon(Icons.lock_outline, size: 64, color: Color(0xFF2E7D32)),
-          const SizedBox(height: 24),
+          const SizedBox(height: AppSpacing.xl),
           Text(
             'BRS Golf Login',
             style: Theme.of(context).textTheme.headlineMedium?.copyWith(
                   fontWeight: FontWeight.bold,
                 ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
           Text(
             'Enter your BRS Golf account credentials for automated booking',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: Colors.grey.shade600,
                 ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: AppSpacing.lg),
           if (_loadingSavedCreds)
             const LinearProgressIndicator()
           else if (_savedCreds != null) ...[
             Card(
               color: Colors.green.shade50,
               child: Padding(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(AppSpacing.md),
                 child: Row(
                   children: [
                     const Icon(Icons.check_circle, color: Colors.green),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: AppSpacing.md),
                     Expanded(
                       child: Text(
                         'Saved credentials found. Use them or toggle off to enter different ones.',
@@ -523,11 +700,11 @@ class _NewJobWizardState extends State<NewJobWizard> {
             Card(
               color: Colors.yellow.shade50,
               child: Padding(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(AppSpacing.md),
                 child: Row(
                   children: [
                     const Icon(Icons.info_outline, color: Colors.orange),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: AppSpacing.md),
                     Expanded(
                       child: Text(
                         'No saved credentials yet. They will be stored after you create your first job.',
@@ -542,7 +719,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
               ),
             ),
           ],
-          const SizedBox(height: 32),
+          const SizedBox(height: AppSpacing.xxl),
           TextField(
             controller: _brsEmailController,
             obscureText: _obscureUsername,
@@ -560,7 +737,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
             ),
             enabled: !_useSavedCreds || _savedCreds == null,
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: AppSpacing.lg),
           TextField(
             controller: _brsPasswordController,
             obscureText: _obscurePassword,
@@ -578,9 +755,11 @@ class _NewJobWizardState extends State<NewJobWizard> {
             ),
             enabled: !_useSavedCreds || _savedCreds == null,
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: AppSpacing.xl),
+          _buildAgentConnectionRow(),
+          const SizedBox(height: AppSpacing.xl),
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(AppSpacing.lg),
             decoration: BoxDecoration(
               color: Colors.blue.shade50,
               borderRadius: BorderRadius.circular(12),
@@ -589,7 +768,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
             child: Row(
               children: [
                 Icon(Icons.info_outline, color: Colors.blue.shade700),
-                const SizedBox(width: 12),
+                const SizedBox(width: AppSpacing.md),
                 Expanded(
                   child: Text(
                     'Your credentials are stored securely and only used by the automation agent to book tee times on your behalf.',
@@ -599,9 +778,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
               ],
             ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: AppSpacing.lg),
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(AppSpacing.lg),
             decoration: BoxDecoration(
               color: Colors.orange.shade50,
               borderRadius: BorderRadius.circular(12),
@@ -612,7 +791,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
               children: [
                 Icon(Icons.warning_amber_rounded,
                     color: Colors.orange.shade700),
-                const SizedBox(width: 12),
+                const SizedBox(width: AppSpacing.md),
                 Expanded(
                   child: Text(
                     'Important: If your BRS Golf credentials are incorrect, the booking process will fail. Please double-check your username and password.',
@@ -636,7 +815,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
   Widget _buildPage2() {
     final theme = Theme.of(context);
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(AppSpacing.xl),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -646,41 +825,42 @@ class _NewJobWizardState extends State<NewJobWizard> {
               fontWeight: FontWeight.bold,
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
           Text(
-            'Choose your party size, then select ONE available slot to book immediately',
+            'Choose additional players, then select ONE available slot to book immediately',
             style: theme.textTheme.bodyLarge?.copyWith(
               color: Colors.grey.shade600,
             ),
           ),
-          const SizedBox(height: 24),
-          _buildSectionTitle('Party Size'),
+          const SizedBox(height: AppSpacing.xl),
+          _buildSectionTitle('Additional Players'),
           Card(
             child: Padding(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(AppSpacing.lg),
               child: Row(
                 children: [
                   const Icon(Icons.group),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: AppSpacing.lg),
                   Expanded(
-                    child: Text('How many players?',
+                    child: Text('How many additional players?',
                         style: theme.textTheme.titleMedium),
                   ),
                   SegmentedButton<int>(
                     segments: const [
+                      ButtonSegment(value: 0, label: Text('0')),
                       ButtonSegment(value: 1, label: Text('1')),
                       ButtonSegment(value: 2, label: Text('2')),
                       ButtonSegment(value: 3, label: Text('3')),
-                      ButtonSegment(value: 4, label: Text('4')),
                     ],
-                    selected: {_playerCount},
+                    selected: {_additionalPlayerCount},
                     onSelectionChanged: (Set<int> newSelection) {
                       final nextCount = newSelection.first;
                       setState(() {
-                        _playerCount = nextCount;
-                        if (_selectedPlayers.length > nextCount) {
-                          _selectedPlayers =
-                              _selectedPlayers.take(nextCount).toList();
+                        _additionalPlayerCount = nextCount;
+                        if (_selectedPlayers.length > _additionalPlayerCount) {
+                          _selectedPlayers = _selectedPlayers
+                              .take(_additionalPlayerCount)
+                              .toList();
                         }
                       });
                     },
@@ -689,16 +869,16 @@ class _NewJobWizardState extends State<NewJobWizard> {
               ),
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: AppSpacing.xl),
           if (_selectedTime != null && _selectedDate != null) ...[
             Card(
               color: theme.colorScheme.primaryContainer,
               child: Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(AppSpacing.lg),
                 child: Row(
                   children: [
                     Icon(Icons.check_circle, color: theme.colorScheme.primary),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: AppSpacing.md),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -709,7 +889,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
                               color: theme.colorScheme.onPrimaryContainer,
                             ),
                           ),
-                          const SizedBox(height: 4),
+                          const SizedBox(height: AppSpacing.xs),
                           Text(
                             '${DateFormat('EEEE d MMM').format(_selectedDate!)} at $_selectedTime',
                             style: theme.textTheme.titleMedium?.copyWith(
@@ -731,7 +911,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
                 ),
               ),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: AppSpacing.xl),
           ],
           _buildLiveAvailabilitySection(theme),
         ],
@@ -748,7 +928,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     if (_isFetchingAvailability) {
       body.add(const LinearProgressIndicator());
-      body.add(const SizedBox(height: 12));
+      body.add(const SizedBox(height: AppSpacing.md));
       body.add(Text(
         'Scanning tee sheets for the next $_rangeWindowDays days…',
         style: theme.textTheme.bodyMedium,
@@ -768,17 +948,17 @@ class _NewJobWizardState extends State<NewJobWizard> {
         ),
       ));
       if (_availabilityDays.isNotEmpty) {
-        body.add(const SizedBox(height: 12));
+        body.add(const SizedBox(height: AppSpacing.md));
         body.add(Text(
           'Showing the last successful scan below.',
           style:
               theme.textTheme.bodySmall?.copyWith(color: Colors.grey.shade600),
         ));
-        body.add(const SizedBox(height: 12));
+        body.add(const SizedBox(height: AppSpacing.md));
         for (var i = 0; i < _availabilityDays.length; i++) {
           body.add(_buildAvailabilityDayCard(_availabilityDays[i], theme));
           if (i < _availabilityDays.length - 1) {
-            body.add(const SizedBox(height: 12));
+            body.add(const SizedBox(height: AppSpacing.md));
           }
         }
       }
@@ -797,7 +977,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
           style:
               theme.textTheme.bodySmall?.copyWith(color: Colors.grey.shade600),
         ));
-        body.add(const SizedBox(height: 12));
+        body.add(const SizedBox(height: AppSpacing.md));
       }
       if (_targetDate != null &&
           !_availabilityDays
@@ -821,10 +1001,36 @@ class _NewJobWizardState extends State<NewJobWizard> {
       body.add(const SizedBox(height: 16));
     }
     body.add(
+      Row(
+        children: [
+          Expanded(
+            child: Text(
+              _allowPairing
+                  ? 'Open to playing with others'
+                  : 'Only show fully open times',
+              style: theme.textTheme.bodyMedium,
+            ),
+          ),
+          Switch(
+            value: _allowPairing,
+            onChanged: (value) => setState(() => _allowPairing = value),
+          ),
+        ],
+      ),
+    );
+    if (!_allowPairing) {
+      body.add(const SizedBox(height: 6));
+      body.add(Text(
+        'Times without slot counts are hidden when pairing is off.',
+        style: theme.textTheme.bodySmall?.copyWith(color: Colors.grey.shade600),
+      ));
+    }
+    body.add(const SizedBox(height: 8));
+    body.add(
       Align(
         alignment: Alignment.centerLeft,
         child: ElevatedButton.icon(
-          onPressed: canScan ? _refreshRangeFromAgent : null,
+          onPressed: canScan ? () => _refreshRangeFromAgent(forceRefresh: true) : null,
           icon: const Icon(Icons.rss_feed),
           label: Text(_availabilityDays.isEmpty
               ? 'Scan Next $_rangeWindowDays Days'
@@ -847,7 +1053,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: 'Refresh availability',
-              onPressed: canScan ? _refreshRangeFromAgent : null,
+              onPressed: canScan ? () => _refreshRangeFromAgent(forceRefresh: true) : null,
             ),
           ],
         ),
@@ -930,14 +1136,23 @@ class _NewJobWizardState extends State<NewJobWizard> {
                   final summary = day.slotSummaries[time];
                   final bool hasSlotData =
                       summary != null && summary.openSlots != null;
-                  if (!hasSlotData)
-                    return true; // keep if no data so user can try
-                  return (summary.openSlots ?? 0) >= _playerCount;
+
+                  if (!_allowPairing) {
+                    if (!hasSlotData || summary.totalSlots == null) {
+                      return false;
+                    }
+                    final open = summary.openSlots ?? 0;
+                    final total = summary.totalSlots ?? 0;
+                    return open >= _partySize && open == total;
+                  }
+
+                  if (!hasSlotData) return true; // keep if no data so user can try
+                  return (summary.openSlots ?? 0) >= _partySize;
                 }).toList();
 
                 if (filteredTimes.isEmpty) {
                   return Text(
-                    'No tee times have at least $_playerCount slots available.',
+                    'No tee times have at least $_partySize slots available.',
                     style: theme.textTheme.bodySmall
                         ?.copyWith(color: Colors.grey.shade600),
                   );
@@ -952,7 +1167,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
                     final bool hasSlotData =
                         summary != null && summary.openSlots != null;
                     final bool hasEnoughSlots = hasSlotData
-                        ? (summary.openSlots ?? 0) >= _playerCount
+                        ? (summary.openSlots ?? 0) >= _partySize
                         : true; // Default to enabled if no slot data
                     final bool selected = _selectedTime == time &&
                         _selectedDate != null &&
@@ -966,7 +1181,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
                     return FilterChip(
                       label: Text(
-                        _formatSlotLabel(time, summary, _playerCount),
+                        _formatSlotLabel(time, summary, _partySize),
                         style: TextStyle(
                           color: selected
                               ? Colors.white
@@ -1012,11 +1227,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
     final total = summary.totalSlots;
 
     String label = time;
-    if (open != null && total != null) {
-      label = '$time · $open/$total open';
-    } else if (open != null) {
+    if (open != null) {
       final unit = open == 1 ? 'slot' : 'slots';
-      label = '$time · $open $unit';
+      label = '$time · $open $unit left';
     } else if (total != null) {
       label = '$time · $total capacity';
     } else if (summary.status == 'waiting-list') {
@@ -1043,7 +1256,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
     });
   }
 
-  Future<void> _refreshRangeFromAgent() async {
+  Future<void> _refreshRangeFromAgent({bool forceRefresh = false}) async {
     final username = _brsEmailController.text.trim();
     final password = _brsPasswordController.text.trim();
 
@@ -1072,53 +1285,53 @@ class _NewJobWizardState extends State<NewJobWizard> {
     DateTime? focusedDate = _focusedAvailabilityDate;
     String? error;
 
+    String baseUrl = _agentBaseUrl;
     try {
-      final uri = Uri.parse('$_agentBaseUrl/api/fetch-tee-times-range');
-      final payload = {
-        'startDate': DateTime.now().toIso8601String(),
-        'days': _rangeWindowDays,
-        'username': username,
-        'password': password,
-        'club': _club,
-        'reuseBrowser': true,
-      };
-      debugPrint('[AvailabilityRange] Base URL: $_agentBaseUrl');
-      debugPrint('[AvailabilityRange] POST: $uri');
-      debugPrint('[AvailabilityRange] Payload: ' + jsonEncode(payload));
-      final response = await http.post(
-        uri,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
-      );
-      debugPrint('[AvailabilityRange] Status: ${response.statusCode}');
-      debugPrint('[AvailabilityRange] Raw Body (truncated): ' +
-          response.body.substring(0, response.body.length.clamp(0, 500)));
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        final dynamic decoded = jsonDecode(response.body);
-        if (decoded is Map<String, dynamic>) {
-          if (decoded['success'] == true && decoded['days'] is List) {
-            final parsed = _parseAvailabilityDays(decoded['days'] as List);
-            nextDays = parsed;
-            fetchedAt = DateTime.now();
-            focusedDate = _computeFocusedAvailabilityDate(parsed);
-          } else {
-            final agentError = decoded['error']?.toString();
-            error = agentError == null || agentError.isEmpty
-                ? 'Agent response did not include success=true.'
-                : 'Agent reported error: $agentError';
-          }
-        } else {
-          error = 'Agent returned an unexpected response (not a Map).';
+      baseUrl = await getAgentBaseUrl();
+      if (!forceRefresh) {
+        final entry = await _availabilityCacheService.getOrFetch(
+          baseUrl: baseUrl,
+          username: username,
+          password: password,
+          days: _rangeWindowDays,
+          startDate: DateTime.now(),
+          club: _club,
+          reuseBrowser: false,
+        );
+        if (entry != null) {
+          final parsed = _parseAvailabilityDays(entry.days);
+          nextDays = parsed;
+          fetchedAt = entry.fetchedAt;
+          focusedDate = _computeFocusedAvailabilityDate(parsed);
         }
-      } else {
-        error =
-            'Agent request failed with status ${response.statusCode}. Body: ' +
-                response.body.substring(0, response.body.length.clamp(0, 300));
+      }
+
+      if (nextDays.isEmpty || forceRefresh) {
+        debugPrint('[AvailabilityRange] Base URL: $baseUrl');
+        final entry = await _availabilityCacheService.fetchAndCache(
+          baseUrl: baseUrl,
+          username: username,
+          password: password,
+          days: _rangeWindowDays,
+          startDate: DateTime.now(),
+          club: _club,
+          reuseBrowser: false,
+        );
+        if (entry == null) {
+          error =
+              'Failed to fetch availability from $baseUrl. ${_agentHelpText()}';
+        } else {
+          final parsed = _parseAvailabilityDays(entry.days);
+          nextDays = parsed;
+          fetchedAt = entry.fetchedAt;
+          focusedDate = _computeFocusedAvailabilityDate(parsed);
+        }
       }
     } catch (e, st) {
       debugPrint('[AvailabilityRange] Exception: $e');
       debugPrint('[AvailabilityRange] Stack: $st');
-      error = 'Failed to contact agent: $e';
+      error =
+          'Failed to contact agent at $baseUrl. ${_agentHelpText()} ($e)';
     }
 
     if (!mounted) return;
@@ -1237,30 +1450,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
     return null;
   }
 
-  static String _resolveAgentBaseUrl() {
-    const override =
-        String.fromEnvironment('FS_AGENT_BASE_URL', defaultValue: '');
-    if (override.isNotEmpty) {
-      return override;
-    }
-    if (kIsWeb) {
-      return 'http://localhost:3000';
-    }
-    switch (defaultTargetPlatform) {
-      case TargetPlatform.android:
-        return 'http://10.0.2.2:3000';
-      case TargetPlatform.iOS:
-      case TargetPlatform.macOS:
-      case TargetPlatform.windows:
-      case TargetPlatform.linux:
-      case TargetPlatform.fuchsia:
-        return 'http://localhost:3000';
-    }
-  }
-
   Widget _buildPage3() {
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(AppSpacing.xl),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1270,14 +1462,14 @@ class _NewJobWizardState extends State<NewJobWizard> {
                   fontWeight: FontWeight.bold,
                 ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
           Text(
-            'Choose up to ${_playerCount - 1} additional players (Player 1 is you)',
+            'Choose up to $_additionalPlayerCount additional players (Player 1 is you)',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: Colors.grey.shade600,
                 ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: AppSpacing.md),
           if (_currentUserName != null && _currentUserName!.isNotEmpty)
             Text(
               'Player 1: $_currentUserName',
@@ -1285,16 +1477,155 @@ class _NewJobWizardState extends State<NewJobWizard> {
                     fontWeight: FontWeight.w600,
                   ),
             ),
-          const SizedBox(height: 32),
+          const SizedBox(height: AppSpacing.xxl),
           PlayerListEditor(
             playerNames: _selectedPlayers,
             onPlayersChanged: (updated) {
               setState(() => _selectedPlayers = updated);
             },
             onAddPlayers: _showPlayerSelector,
-            maxPlayers: _playerCount > 1 ? _playerCount - 1 : 0,
+            maxPlayers: _additionalPlayerCount,
+          ),
+          if (_isRefreshingPlayers) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(
+              'Updating player directory...',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Colors.grey.shade600),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  String _agentHelpText() {
+    return 'If you are on Android emulator, use http://10.0.2.2:3000. '
+        'If you are on a physical phone, use your PC LAN IP (e.g. http://192.168.x.x:3000).';
+  }
+
+  Future<void> _showAgentUrlDialog() async {
+    final controller = TextEditingController(text: _agentBaseUrl);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Agent Base URL'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            hintText: 'http://localhost:3000',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Save'),
           ),
         ],
+      ),
+    );
+
+    if (result != null) {
+      await setAgentBaseUrl(result);
+      await _loadAgentBaseUrl();
+      setState(() => _agentTestStatus = null);
+    }
+  }
+
+  Future<void> _testAgentConnection() async {
+    setState(() {
+      _agentTesting = true;
+      _agentTestStatus = null;
+    });
+
+    try {
+      final baseUrl = await getAgentBaseUrl();
+      final response =
+          await http.get(Uri.parse('$baseUrl/api/health')).timeout(
+                const Duration(seconds: 8),
+              );
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        setState(() {
+          _agentTestStatus = '✅ Agent reachable at $baseUrl';
+        });
+      } else {
+        setState(() {
+          _agentTestStatus =
+              '❌ Agent responded ${response.statusCode} at $baseUrl. ${_agentHelpText()}';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _agentTestStatus =
+            '❌ Failed to reach agent at $_agentBaseUrl. ${_agentHelpText()}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _agentTesting = false);
+      }
+    }
+  }
+
+  Widget _buildAgentConnectionRow() {
+    return Card(
+      color: Colors.blueGrey.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.md),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.link, color: Colors.blueGrey),
+                const SizedBox(width: AppSpacing.sm),
+                const Text(
+                  'Agent Connection',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: _showAgentUrlDialog,
+                  child: const Text('Change'),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                ElevatedButton(
+                  onPressed: _agentTesting ? null : _testAgentConnection,
+                  child: _agentTesting
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Test'),
+                ),
+              ],
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            Text(
+              _agentBaseUrl,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            if (_agentTestStatus != null) ...[
+              const SizedBox(height: AppSpacing.sm),
+              Text(
+                _agentTestStatus!,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: _agentTestStatus!.startsWith('✅')
+                          ? Colors.green
+                          : Colors.red,
+                    ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -1304,35 +1635,40 @@ class _NewJobWizardState extends State<NewJobWizard> {
       context: context,
       directoryService: _playerDirectoryService,
       initialSelectedNames: _selectedPlayers,
-      maxPlayers: _playerCount > 1 ? _playerCount - 1 : 0,
+      maxPlayers: _additionalPlayerCount,
       username: _brsEmailController.text,
       password: _brsPasswordController.text,
     );
 
     if (selected != null) {
+      setState(() {
+        _selectedPlayers = selected;
+        _isRefreshingPlayers = true;
+      });
       print('🎯 Selected players from modal: $selected');
 
-      final directory = await _playerDirectoryService.getDirectory(
-        username: _brsEmailController.text,
-        password: _brsPasswordController.text,
-      );
-      setState(() {
-        _currentUserName = directory?.currentUserName;
-      });
-
-      setState(() {
-        _selectedPlayers = selected
-            .map((name) => name.trim())
-            .where((name) => name.isNotEmpty)
-            .toList();
-        print('🎯 Final player list: $_selectedPlayers');
+      // Refresh player directory in the background to update Player 1 name.
+      _playerDirectoryService
+          .getDirectory(
+            username: _brsEmailController.text,
+            password: _brsPasswordController.text,
+          )
+          .then((directory) {
+        if (!mounted) return;
+        setState(() {
+          _currentUserName = directory?.currentUserName;
+          _isRefreshingPlayers = false;
+        });
+      }).catchError((_) {
+        if (!mounted) return;
+        setState(() => _isRefreshingPlayers = false);
       });
     }
   }
 
   Widget _buildPage4() {
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(AppSpacing.xl),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1342,14 +1678,14 @@ class _NewJobWizardState extends State<NewJobWizard> {
                   fontWeight: FontWeight.bold,
                 ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: AppSpacing.sm),
           Text(
             'Please review your booking details',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: Colors.grey.shade600,
                 ),
           ),
-          const SizedBox(height: 32),
+          const SizedBox(height: AppSpacing.xxl),
           _buildReviewCard(
             'Club',
             _club == 'galgorm' ? 'Galgorm Castle' : _club,
@@ -1376,13 +1712,13 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
   Widget _buildReviewCard(String title, String value, IconData icon) {
     return Card(
-      margin: const EdgeInsets.only(bottom: 12),
+      margin: const EdgeInsets.only(bottom: AppSpacing.md),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(AppSpacing.lg),
         child: Row(
           children: [
             Container(
-              padding: const EdgeInsets.all(10),
+              padding: const EdgeInsets.all(AppSpacing.sm),
               decoration: BoxDecoration(
                 color: Theme.of(context)
                     .colorScheme
@@ -1392,7 +1728,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
               ),
               child: Icon(icon, color: Theme.of(context).colorScheme.primary),
             ),
-            const SizedBox(width: 16),
+            const SizedBox(width: AppSpacing.lg),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1403,7 +1739,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
                           color: Colors.grey.shade600,
                         ),
                   ),
-                  const SizedBox(height: 4),
+                  const SizedBox(height: AppSpacing.xs),
                   Text(
                     value,
                     style: const TextStyle(fontWeight: FontWeight.w600),
@@ -1430,6 +1766,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
   }
 
   Widget _buildNavigationButtons() {
+    final busy = _isNextBusy || _isFetchingAvailability || _isRefreshingPlayers;
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -1444,10 +1781,16 @@ class _NewJobWizardState extends State<NewJobWizard> {
       ),
       child: Row(
         children: [
+          OutlinedButton.icon(
+            onPressed: () => Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false),
+            icon: const Icon(Icons.home),
+            label: const Text('Home'),
+          ),
+          const SizedBox(width: 12),
           if (_currentPage > 0)
             Expanded(
               child: OutlinedButton(
-                onPressed: _previousPage,
+                onPressed: busy ? null : _previousPage,
                 child: const Text('Back'),
               ),
             ),
@@ -1455,8 +1798,14 @@ class _NewJobWizardState extends State<NewJobWizard> {
           Expanded(
             flex: 2,
             child: ElevatedButton(
-              onPressed: _currentPage == 3 ? _saveJob : _nextPage,
-              child: Text(_currentPage == 3 ? 'Create Job' : 'Continue'),
+              onPressed: busy ? null : (_currentPage == 3 ? _saveJob : _nextPage),
+              child: busy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Text(_currentPage == 3 ? 'Create Job' : 'Continue'),
             ),
           ),
         ],

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/services/booking_prefetch_service.dart';
 import 'package:fairway_sniper/services/weather_service.dart';
 import 'package:fairway_sniper/services/golf_news_service.dart';
 import 'package:fairway_sniper/models/booking_job.dart';
@@ -8,6 +9,9 @@ import 'package:fairway_sniper/models/booking_run.dart';
 import 'package:fairway_sniper/screens/mode_selection_screen.dart';
 import 'package:fairway_sniper/screens/admin_dashboard.dart';
 import 'package:fairway_sniper/screens/course_info_screen.dart';
+import 'package:fairway_sniper/widgets/brs_credentials_modal.dart';
+import 'package:fairway_sniper/widgets/dashboard_widgets.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'dart:async';
@@ -22,6 +26,7 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   final _firebaseService = FirebaseService();
+  late final BookingPrefetchService _prefetchService;
   final _weatherService = WeatherService();
   final _golfNewsService = GolfNewsService();
   final _newsScrollController = ScrollController();
@@ -29,12 +34,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Map<String, dynamic>? _weatherForecast;
   List<Map<String, dynamic>>? _newsArticles;
   bool _isDarkMode = false;
+  String? _displayName;
+  Map<String, String>? _savedCreds;
+  bool _loadingCreds = false;
 
   @override
   void initState() {
     super.initState();
+    _prefetchService = BookingPrefetchService(firebaseService: _firebaseService);
     _loadWeather();
     _loadNews();
+    _loadProfile();
+    _prefetchService.run();
   }
 
   @override
@@ -60,6 +71,47 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (mounted) setState(() => _newsArticles = news);
   }
 
+  Future<void> _loadProfile() async {
+    final userId = _firebaseService.currentUserId;
+    if (userId == null) return;
+    setState(() => _loadingCreds = true);
+    final creds = await _firebaseService.loadBRSCredentials(userId);
+    final name = await _firebaseService.getUserDisplayName(userId);
+    if (!mounted) return;
+    setState(() {
+      _savedCreds = creds;
+      _displayName = name ?? _firebaseService.currentUser?.displayName;
+      _loadingCreds = false;
+    });
+  }
+
+  Future<void> _editSavedCreds() async {
+    final uid = _firebaseService.currentUserId;
+    if (uid == null) return;
+
+    final result = await showBRSCredentialsModal(
+      context,
+      initialUsername: _savedCreds?['username'],
+      initialPassword: _savedCreds?['password'],
+      title: 'Edit Saved BRS Login',
+    );
+
+    if (result != null) {
+      await _firebaseService.saveBRSCredentials(uid, result['username']!, result['password']!);
+      if (!mounted) return;
+      setState(() => _savedCreds = result);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Saved BRS login updated.')),
+      );
+      _prefetchService.run(forceRefresh: true);
+    }
+  }
+
+  String _partySizeLabel(BookingJob job) {
+    final size = job.partySize ?? (job.players.length + 1);
+    final unit = size == 1 ? 'player' : 'players';
+    return '$size $unit';
+  }
   DateTime _getNextSaturday() {
     final now = DateTime.now();
     int daysUntilSaturday = (DateTime.saturday - now.weekday) % 7;
@@ -88,7 +140,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: Scaffold(
         backgroundColor: Colors.transparent,
         appBar: AppBar(
-          backgroundColor: Colors.white.withValues(alpha: 0.95),
+          backgroundColor: Colors.white.withValues(alpha: 0.85),
           elevation: 2,
           title: Text('Fairway Sniper',
               style: TextStyle(
@@ -251,6 +303,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
         body: StreamBuilder<List<BookingJob>>(
           stream: _firebaseService.getUserJobs(userId),
           builder: (context, jobSnapshot) {
+            // Debug: Log job statuses from Firestore
+            if (jobSnapshot.hasData) {
+              for (var job in jobSnapshot.data!) {
+                print('🔍 [DASHBOARD] Job ${job.id}: status="${job.status}"');
+              }
+            }
+            
             if (jobSnapshot.connectionState == ConnectionState.waiting) {
               return const Center(child: CircularProgressIndicator());
             }
@@ -270,13 +329,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         style: TextStyle(
                             fontSize: 20, fontWeight: FontWeight.bold),
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: AppSpacing.sm),
                       Text(
                         'Please check your Firestore security rules',
                         textAlign: TextAlign.center,
                         style: TextStyle(color: Colors.grey.shade600),
                       ),
-                      const SizedBox(height: 24),
+                      const SizedBox(height: AppSpacing.xl),
                       ElevatedButton.icon(
                         onPressed: () => setState(() {}),
                         icon: const Icon(Icons.refresh),
@@ -294,6 +353,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               onRefresh: () async {
                 await _loadWeather();
                 await _loadNews();
+                await _loadProfile();
               },
               child: SingleChildScrollView(
                 physics: const AlwaysScrollableScrollPhysics(),
@@ -303,41 +363,68 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.all(20),
+                        padding: const EdgeInsets.all(AppSpacing.xl),
+                        child: DashboardWelcomeCard(
+                          displayName: _displayName,
+                          savedCreds: _savedCreds,
+                          loadingCreds: _loadingCreds,
+                          onEditCreds: _editSavedCreds,
+                          currentUserEmail: _firebaseService.currentUser?.email,
+                        ),
+                      ),
+                    ),
+                    Center(
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 800),
+                        padding: const EdgeInsets.all(AppSpacing.xl),
+                        child: AnimatedBuilder(
+                          animation: _prefetchService,
+                          builder: (context, _) => DashboardPrefetchCard(
+                            state: _prefetchService.state,
+                            isRunning: _prefetchService.isRunning,
+                            onRefresh: () => _prefetchService.run(forceRefresh: true),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Center(
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 800),
+                        padding: const EdgeInsets.all(AppSpacing.xl),
                         child: _buildJobsList(jobs),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
                         child: LocalTimeCard(isDarkMode: _isDarkMode),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
                         child: _buildWeatherCard(jobs),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
                         child: Row(
                           children: [
                             Expanded(child: _buildJokeButton()),
-                            const SizedBox(width: 12),
+                            const SizedBox(width: AppSpacing.md),
                             Expanded(child: _buildCourseInfoButton()),
                           ],
                         ),
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: AppSpacing.xl),
                     _buildGolfNewsSection(),
                     const SizedBox(height: 20),
                     Center(
@@ -358,8 +445,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
           onPressed: () => Navigator.of(context).push(
             MaterialPageRoute(builder: (_) => const ModeSelectionScreen()),
           ),
+          backgroundColor: _prefetchService.state.isReady
+              ? const Color(0xFF2E7D32)
+              : null,
           icon: const Icon(Icons.add),
-          label: const Text('New Booking Job'),
+          label: Text(
+            _prefetchService.state.isReady ? 'Ready to Book' : 'New Booking Job',
+          ),
         ),
       ),
     );
@@ -397,7 +489,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     final cardBg = _isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final textColor = _isDarkMode ? Colors.white : Colors.black87;
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
@@ -1020,7 +1112,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           Card(
             color: _isDarkMode
                 ? Colors.grey.shade900.withValues(alpha: 0.85)
-                : Colors.white.withValues(alpha: 0.95),
+                : Colors.white.withValues(alpha: 0.85),
             child: Padding(
               padding: const EdgeInsets.all(40),
               child: Center(
@@ -1062,7 +1154,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget _buildJobCard(BookingJob job) {
     final cardBg = _isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final textColor = _isDarkMode ? Colors.white : Colors.black87;
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
@@ -1219,7 +1311,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               Icon(Icons.people, size: 14, color: subtextColor),
                               const SizedBox(width: 4),
                               Text(
-                                '${job.players.length} players',
+                                _partySizeLabel(job),
                                 style: TextStyle(
                                     color: subtextColor, fontSize: 13),
                               ),
@@ -1664,7 +1756,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               return Card(
                 color: _isDarkMode
                     ? Colors.grey.shade900.withValues(alpha: 0.85)
-                    : Colors.white.withValues(alpha: 0.95),
+                    : Colors.white.withValues(alpha: 0.85),
                 child: Padding(
                   padding: const EdgeInsets.all(32),
                   child: Center(
@@ -1685,7 +1777,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               return Card(
                 color: _isDarkMode
                     ? Colors.grey.shade900.withValues(alpha: 0.85)
-                    : Colors.white.withValues(alpha: 0.95),
+                    : Colors.white.withValues(alpha: 0.85),
                 child: Padding(
                   padding: const EdgeInsets.all(32),
                   child: Center(
@@ -1717,7 +1809,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final resultColor = _getResultColor(run.result);
     final cardBg = _isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
 
@@ -2334,7 +2426,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const Divider(),
               _buildDetailRow(
                 'Players',
-                job.players.join(', '),
+                _partySizeLabel(job),
                 Icons.people,
               ),
               const Divider(),
@@ -2451,7 +2543,7 @@ class _LocalTimeCardState extends State<LocalTimeCard> {
   Widget build(BuildContext context) {
     final cardBg = widget.isDarkMode
         ? Colors.grey.shade900.withValues(alpha: 0.85)
-        : Colors.white.withValues(alpha: 0.95);
+        : Colors.white.withValues(alpha: 0.85);
     final textColor = widget.isDarkMode ? Colors.white : Colors.black87;
     final subtextColor =
         widget.isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
@@ -2526,3 +2618,4 @@ class _LocalTimeCardState extends State<LocalTimeCard> {
     );
   }
 }
+

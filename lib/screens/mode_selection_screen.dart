@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:fairway_sniper/screens/new_job_wizard.dart';
 import 'package:fairway_sniper/screens/sniper_job_wizard.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/widgets/brs_credentials_modal.dart';
+import 'package:fairway_sniper/theme/app_colors.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 
 class ModeSelectionScreen extends StatefulWidget {
   const ModeSelectionScreen({super.key});
@@ -52,63 +55,21 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
     final uid = _firebaseService.currentUserId;
     if (uid == null || _savedCreds == null) return;
 
-    final usernameController =
-        TextEditingController(text: _savedCreds!['username'] ?? '');
-    final passwordController =
-        TextEditingController(text: _savedCreds!['password'] ?? '');
-
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('Edit saved BRS login'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: usernameController,
-                decoration: const InputDecoration(
-                  labelText: 'BRS Username',
-                  prefixIcon: Icon(Icons.person_outline),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: passwordController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'BRS Password',
-                  prefixIcon: Icon(Icons.lock_outline),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Save'),
-            ),
-          ],
-        );
-      },
+    final result = await showBRSCredentialsModal(
+      context,
+      initialUsername: _savedCreds!['username'],
+      initialPassword: _savedCreds!['password'],
+      title: 'Edit Saved BRS Login',
     );
 
-    if (result == true) {
-      final u = usernameController.text.trim();
-      final p = passwordController.text;
-      if (u.isNotEmpty && p.isNotEmpty) {
-        // Note: club is not available in this context, will be updated from wizard
-        await _firebaseService.saveBRSCredentials(uid, u, p);
-        if (!mounted) return;
-        setState(() => _savedCreds = {'username': u, 'password': p});
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Saved BRS login updated.')),
-        );
-      }
+    if (result != null) {
+      // Note: club is not available in this context, will be updated from wizard
+      await _firebaseService.saveBRSCredentials(uid, result['username']!, result['password']!);
+      if (!mounted) return;
+      setState(() => _savedCreds = result);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Saved BRS login updated.')),
+      );
     }
   }
 
@@ -145,7 +106,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
           color: Colors.black.withValues(alpha: 0.55),
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(AppSpacing.xl),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 1000),
                 child: Column(
@@ -158,9 +119,9 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                         width: bannerWidth,
                         child: Container(
                           decoration: BoxDecoration(
-                            color: Colors.green.shade50,
+                            color: AppColors.successSurface,
                             borderRadius: BorderRadius.circular(16),
-                            border: Border.all(color: Colors.green.shade200),
+                            border: Border.all(color: AppColors.successLight),
                             boxShadow: [
                               BoxShadow(
                                 color: Colors.black.withValues(alpha: 0.12),
@@ -169,13 +130,15 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                               ),
                             ],
                           ),
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 18, vertical: 14),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: AppSpacing.lg,
+                              vertical: AppSpacing.md,
+                            ),
                           child: Row(
                             children: [
                               const Icon(Icons.info_outline,
-                                  color: Color(0xFF2E7D32)),
-                              const SizedBox(width: 12),
+                                  color: AppColors.primaryGreen),
+                              const SizedBox(width: AppSpacing.md),
                               Expanded(
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -188,7 +151,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                                             .titleMedium
                                             ?.copyWith(
                                               fontWeight: FontWeight.w700,
-                                              color: Colors.green.shade800,
+                                              color: Colors.black87,
                                             ),
                                       ),
                                     if (_savedCreds != null)
@@ -198,7 +161,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                                             .textTheme
                                             .bodySmall
                                             ?.copyWith(
-                                              color: Colors.green.shade700,
+                                              color: Colors.grey.shade700,
                                             ),
                                       ),
                                   ],
@@ -208,7 +171,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                                 IconButton(
                                   tooltip: 'Edit saved login',
                                   icon: const Icon(Icons.edit,
-                                      color: Color(0xFF2E7D32)),
+                                      color: AppColors.primaryGreen),
                                   onPressed: _editSavedCreds,
                                 ),
                                 IconButton(
@@ -238,23 +201,27 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                             ],
                           ),
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 12),
+                            horizontal: AppSpacing.lg,
+                            vertical: AppSpacing.md,
+                          ),
                           child: Row(
                             children: [
                               const Icon(Icons.info_outline,
                                   color: Colors.black87),
-                              const SizedBox(width: 10),
+                              const SizedBox(width: AppSpacing.sm),
                               Expanded(
                                 child: Text(
                                   'No saved BRS credentials yet. They will be stored after your first booking job.',
-                                  style: Theme.of(context).textTheme.bodySmall,
+                                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                    color: Colors.black87,
+                                  ),
                                 ),
                               ),
                             ],
                           ),
                         ),
                       ),
-                    const SizedBox(height: 24),
+                    const SizedBox(height: AppSpacing.xl),
                     if (isNarrow)
                       Column(
                         children: [
@@ -270,7 +237,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                               onTap: _startNormal,
                             ),
                           ),
-                          const SizedBox(height: 24),
+                          const SizedBox(height: AppSpacing.xl),
                           SizedBox(
                             width: double.infinity,
                             child: _modeCard(
@@ -301,7 +268,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                                 actionLabel: 'Start Normal Booking',
                                 onTap: _startNormal,
                               ),
-                              const SizedBox(width: 24),
+                              const SizedBox(width: AppSpacing.xl),
                               _modeCard(
                                 title: 'Sniper Mode',
                                 icon: Icons.my_location,
@@ -341,7 +308,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
         elevation: 8,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(AppSpacing.xl),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -352,7 +319,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                     radius: 28,
                     child: Icon(icon, color: color, size: 32),
                   ),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: AppSpacing.lg),
                   Expanded(
                     child: Text(
                       title,
@@ -363,7 +330,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: AppSpacing.lg),
               Text(
                 description,
                 style: theme.textTheme.bodyMedium
@@ -378,7 +345,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                   style: ElevatedButton.styleFrom(
                     backgroundColor: color,
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    padding: const EdgeInsets.symmetric(vertical: AppSpacing.lg),
                   ),
                   onPressed: onTap,
                   child: Text(actionLabel,
