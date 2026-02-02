@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 
@@ -25,13 +26,13 @@ class _AdminDashboardState extends State<AdminDashboard> {
             Text('Admin Dashboard', style: TextStyle(fontWeight: FontWeight.w600)),
           ],
         ),
-        backgroundColor: Colors.purple,
+        backgroundColor: const Color(0xFF2E7D32),
         foregroundColor: Colors.white,
       ),
       body: Column(
         children: [
           Container(
-            color: Colors.purple.shade50,
+            color: Colors.green.shade50,
             child: Row(
               children: [
                 _buildTabButton('All Jobs', 0, Icons.work_outline),
@@ -59,19 +60,19 @@ class _AdminDashboardState extends State<AdminDashboard> {
           decoration: BoxDecoration(
             border: Border(
               bottom: BorderSide(
-                color: isSelected ? Colors.purple : Colors.transparent,
+                color: isSelected ? const Color(0xFF2E7D32) : Colors.transparent,
                 width: 3,
               ),
             ),
           ),
           child: Column(
             children: [
-              Icon(icon, color: isSelected ? Colors.purple : Colors.grey),
+              Icon(icon, color: isSelected ? const Color(0xFF2E7D32) : Colors.grey),
               const SizedBox(height: 4),
               Text(
                 label,
                 style: TextStyle(
-                  color: isSelected ? Colors.purple : Colors.grey,
+                  color: isSelected ? const Color(0xFF2E7D32) : Colors.grey,
                   fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
                   fontSize: 12,
                 ),

@@ -1,0 +1,21 @@
+warning: in the working copy of 'agent/.gitignore', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'agent/index.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'agent/package.json', LF will be replaced by CRLF the next time Git touches it
+ .gitignore                            |  45 [32m+++++++[m[31m-[m
+ agent/.gitignore                      |  23 [32m+++[m[31m-[m
+ agent/index.js                        |  11 [32m++[m
+ agent/package.json                    |  10 [32m+[m[31m-[m
+ agent/test-agent.ps1                  | 146 [31m-----------------------[m
+ agent/test-book-now.js                | 134 [31m----------------------[m
+ agent/test-booking.ps1                |  53 [31m---------[m
+ agent/test-fetch-debug.ps1            |  29 [31m-----[m
+ agent/test-fetch-player-directory.ps1 |  21 [31m----[m
+ agent/test-fetch-range.ps1            |  23 [31m----[m
+ agent/test-fetch-simple.ps1           |  32 [31m------[m
+ agent/test-full-flow.js               | 210 [31m----------------------------------[m
+ agent/test-login.js                   | 189 [31m------------------------------[m
+ agent/test-minimal.js                 |  65 [31m-----------[m
+ agent/test-player-directory.ps1       |  53 [31m---------[m
+ agent/test-server.js                  |  23 [31m----[m
+ agent/test-sniper-4min.ps1            |  59 [31m----------[m
+ 17 files changed, 75 insertions(+), 1051 deletions(-)

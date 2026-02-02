@@ -34,6 +34,11 @@ service cloud.firestore {
       
       // Only admins can delete profiles
       allow delete: if isAdmin();
+
+      // User cache subcollection (e.g., player directory cache)
+      match /cache/{cacheDocId} {
+        allow read, write: if isAuthenticated();
+      }
     }
     
     // Booking Jobs Collection
@@ -58,8 +63,7 @@ service cloud.firestore {
     // Booking Runs Collection - Execution logs
     match /runs/{runId} {
       // Admins can read all runs, users can read runs that have ownerUid matching their uid
-      allow read: if isAdmin() || 
-                     (isAuthenticated() && resource.data.ownerUid == request.auth.uid);
+      allow read: if isAuthenticated();
       
       // Admins and automation agents can create/update runs
       allow create, update: if isAdmin() || isAuthenticated();

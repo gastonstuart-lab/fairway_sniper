@@ -430,6 +430,14 @@ const CONFIG = {
   BRS_USERNAME: process.env.BRS_USERNAME,
   BRS_PASSWORD: process.env.BRS_PASSWORD,
   CAPTCHA_API_KEY: process.env.CAPTCHA_API_KEY || '',
+  SNIPER_RELEASE_WATCH_MS: Number.parseInt(process.env.SNIPER_RELEASE_WATCH_MS || '8000', 10),
+  SNIPER_RELEASE_RETRY_COUNT: Number.parseInt(process.env.SNIPER_RELEASE_RETRY_COUNT || '2', 10),
+  SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS: Number.parseInt(
+    process.env.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS || '750',
+    10,
+  ),
+  SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
+  SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '5', 10),
   DRY_RUN: process.argv.includes('--dry-run'),
 };
 
@@ -733,6 +741,35 @@ function getFireTimeFromJob(job) {
   );
 }
 
+function resolveTargetPlayDate(job) {
+  const direct = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+  if (direct) return direct;
+
+  const targetDay = (job.target_day || job.targetDay || '').toString().trim().toLowerCase();
+  const tz = job.tz || job.timezone || CONFIG.TZ_LONDON;
+  const dayMap = {
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+    sunday: 7,
+  };
+  const targetWeekday = dayMap[targetDay];
+  if (!targetWeekday) return null;
+
+  const now = DateTime.now().setZone(tz).startOf('day');
+  let candidate = now;
+  const daysAhead = (targetWeekday - now.weekday + 7) % 7;
+  if (daysAhead === 0) {
+    candidate = now.plus({ days: 7 });
+  } else {
+    candidate = now.plus({ days: daysAhead });
+  }
+  return candidate.toJSDate();
+}
+
 async function fsClaimSniperJob(jobId) {
   if (!db) return null;
   const ref = db.collection(JOBS_COLLECTION).doc(jobId);
@@ -775,7 +812,7 @@ async function scheduleClaimedJob(job) {
   if (!jobId) return;
   if (jobTimers.has(jobId)) return;
 
-  const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+  const targetPlayDate = resolveTargetPlayDate(job);
   if (!targetPlayDate) {
     await markJobError(jobId, 'missing-target-play-date');
     return;
@@ -836,6 +873,7 @@ async function scheduleClaimedJob(job) {
       const players = Array.isArray(job.players) ? job.players : [];
       const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
       const pushToken = job.push_token || job.pushToken;
+      const dryRun = job.dry_run === true || job.dryRun === true;
 
       console.log(`[RUNNER] runBooking start ${jobId}`);
       const result = await runBooking({
@@ -853,16 +891,26 @@ async function scheduleClaimedJob(job) {
         warmPage,
         useReleaseObserver: true,
         pushToken,
+        dryRun,
       });
 
       console.log(`[RUNNER] runBooking finished ${jobId} booked=${result?.bookedTime || 'n/a'}`);
+      const isSuccess = result?.success === true;
       await fsUpdateJob(jobId, {
-        status: 'finished',
-        state: 'finished',
-        result: result?.result || (result?.success ? 'success' : 'failed'),
+        status: isSuccess ? 'finished' : 'error',
+        state: isSuccess ? 'finished' : 'error',
+        result: result?.result || (isSuccess ? 'success' : 'failed'),
         booked_time: result?.bookedTime || null,
         finished_at: admin.firestore.FieldValue.serverTimestamp(),
-        error_message: result?.success ? null : result?.error || null,
+        error_message: isSuccess ? null : result?.error || 'clicked but no confirmation',
+        click_delta_ms: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
+        verification_url: result?.verification_url ?? result?.verificationUrl ?? null,
+        verification_signal: result?.verification_signal ?? result?.verificationSignal ?? null,
+        booking_links_count_after_click:
+          result?.booking_links_count_after_click ?? result?.bookingLinksCountAfterClick ?? null,
+        snapshot_path: result?.snapshotPath ?? result?.snapshot_path ?? null,
+        release_detect_delta_ms:
+          result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
       });
     } catch (error) {
       console.log(`[RUNNER] runBooking error ${jobId}: ${error?.message || error}`);
@@ -1684,12 +1732,19 @@ function escapeRegex(str) {
  * @param {number} openSlots - Number of available slots (1-4)
  * @returns {Promise<{filled: string[], skippedReason?: string, confirmationText?: string}>}
  */
-async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
+async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun = false) {
   const result = {
     filled: [],
     skippedReason: null,
     confirmationText: null,
   };
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page
+    .waitForSelector('#member_booking_form_confirm_booking, form[name="member_booking_form"]', {
+      timeout: 8000,
+    })
+    .catch(() => {});
 
   // Only try to fill as many players as slots permit (max 3 additional players = slots 2, 3, 4)
   const playersToFill = players.slice(0, Math.min(openSlots, 3));
@@ -1896,15 +1951,19 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
     }
   }
 
+  if (dryRun) {
+    console.log('  💤 Dry-run enabled: skipping Create Booking click');
+    result.confirmationText = 'dry-run-no-confirm';
+    return result;
+  }
+
   // Now click Confirm button
   console.log(`  🎯 Clicking Confirm button...`);
 
   try {
     // Strategy 1: getByRole button with confirm text
     let confirmBtn = page
-      .getByRole('button', {
-        name: /confirm|book|complete|finish|final|create.*booking|proceed/i,
-      })
+      .locator('#member_booking_form_confirm_booking')
       .first();
 
     let btnVisible = await confirmBtn
@@ -1915,7 +1974,7 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
     if (!btnVisible) {
       confirmBtn = page
         .locator(
-          'button:has-text("Confirm"), button:has-text("Book"), button:has-text("Complete")',
+          'button#member_booking_form_confirm_booking, form[name="member_booking_form"] button[type="submit"], button:has-text("Create Booking"), button:has-text("Confirm"), button:has-text("Book"), button:has-text("Complete")',
         )
         .first();
       btnVisible = await confirmBtn
@@ -1924,7 +1983,8 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3) {
     }
 
     if (btnVisible) {
-      await confirmBtn.click({ timeout: 5000 });
+      await confirmBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await confirmBtn.click({ timeout: 5000, force: true });
       console.log(`    ✅ Confirm button clicked`);
 
       // Wait for navigation/response
@@ -2087,18 +2147,39 @@ async function tryBookTime(
   // Call the unified player selection and confirmation helper
   const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
 
+  console.log('  ✅ Clicked booking link');
+  console.log('  🔍 Verification started...');
+  const verification = await verifyBookingConfirmation(page, time, 10000);
+  const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
+  if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
+    verification.confirmed = false;
+    verification.verificationSignal = 'players-missing';
+  }
+  console.log(`  🔍 Verification: URL=${verification.verificationUrl}`);
+  if (verification.confirmed) {
+    console.log(`  ✅ Verification success: ${verification.verificationSignal}`);
+  } else {
+    console.log('  ❌ Verification failed: no confirmation within 10s');
+  }
+
   return {
     booked:
-      confirmResult.confirmationText !== null &&
+      verification.confirmed &&
       confirmResult.confirmationText !== 'confirm-button-not-found',
     playersFilled: confirmResult.filled,
     playersRequested: players.slice(0, Math.min(openSlots, 3)),
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
+    verificationSignal: verification.verificationSignal,
+    verificationUrl: verification.verificationUrl,
+    bookingLinksCountAfterClick: verification.bookingLinksCountAfterClick,
+    clickDeltaMs,
     error:
-      confirmResult.confirmationText === 'confirm-button-not-found'
-        ? 'confirm-button-not-found'
-        : null,
+      !verification.confirmed
+        ? 'clicked-but-no-confirmation'
+        : confirmResult.confirmationText === 'confirm-button-not-found'
+          ? 'confirm-button-not-found'
+          : null,
   };
 }
 
@@ -2148,31 +2229,35 @@ function computeNextFireUTC(
 // BOOKING AUTOMATION LOGIC
 // ========================================
 
-async function executeReleaseBooking(page, locator, additionalPlayers, openSlots, fireTime, jobId) {
+async function executeReleaseBooking(
+  page,
+  locator,
+  additionalPlayers,
+  openSlots,
+  fireTime,
+  jobId,
+  dryRun = false,
+  skipClick = false,
+  clickDeltaOverride = null,
+) {
   const clickStart = Date.now();
   // Log target reached and click delta
   console.log(`[FIRE] Target reached at: ${new Date(fireTime).toISOString()}`);
-  await locator.click();
-  const clickDelta = Date.now() - fireTime;
-  console.log(`[FIRE] Click executed delta: ${clickDelta}ms`);
+  let clickDelta = clickDeltaOverride;
+  if (!skipClick) {
+    await locator.click();
+    clickDelta = Date.now() - fireTime;
+    console.log(`[FIRE] Click executed delta: ${clickDelta}ms`);
+  } else if (typeof clickDelta === 'number') {
+    console.log(`[FIRE] Click executed delta: ${clickDelta}ms`);
+  }
   if (clickDelta > 200) {
     console.warn(`[WARN] Booking click delta >200ms: ${clickDelta}ms`);
     if (jobId) logJobEvent(jobId, `⚠️ FIRE DELTA TOO HIGH (${clickDelta}ms)`);
   }
-  // Fill additional players if needed
-  let playersFilled = [];
-  let confirmResult = null;
-  if (additionalPlayers && additionalPlayers.length > 0 && openSlots > 1) {
-    confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots);
-    playersFilled = confirmResult.filled || [];
-  } else {
-    // Just click confirm if no additional players
-    const confirmBtn = page.locator('button:has-text("Confirm"),input[type="submit"][value*="Confirm"]').first();
-    if (await confirmBtn.isVisible().catch(() => false)) {
-      await confirmBtn.click().catch(() => {});
-    }
-    confirmResult = { confirmationText: 'confirm-clicked', filled: [] };
-  }
+  // Always run the normal booking flow to fill players (if any) and confirm
+  const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun);
+  const playersFilled = confirmResult.filled || [];
   // Wait for confirmation
   let confirmationText = confirmResult.confirmationText || '';
   let booked = false;
@@ -2183,15 +2268,158 @@ async function executeReleaseBooking(page, locator, additionalPlayers, openSlots
     booked = true;
   } catch {
     // fallback to whatever confirmResult gave
-    booked = confirmationText && confirmationText !== 'confirm-button-not-found';
+    booked =
+      confirmationText &&
+      !['confirm-button-not-found', 'confirm-clicked-no-confirmation-text'].includes(
+        confirmationText,
+      );
   }
-  return { booked, confirmationText, playersFilled };
+  return { booked, confirmationText, playersFilled, clickDeltaMs: clickDelta };
+}
+
+async function verifyBookingConfirmation(page, timeLabel, timeoutMs = 10000) {
+  const start = Date.now();
+  const textLocator = page
+    .locator(
+      'text=/Booking confirmed|Booking Successful|Reservation Complete|Booking complete|Successfully booked|Thank\s+you|Reference\s+number/i',
+    )
+    .first();
+  const bookingsHeading = page
+    .getByText(/my.*bookings|your.*bookings|booked.*tee/i)
+    .first();
+
+  const bookingFormNotice = page
+    .locator('text=/Booking Details|complete your booking|minutes to complete your booking/i')
+    .first();
+
+  let verificationSignal = null;
+  let verificationUrl = page.url();
+
+  while (Date.now() - start < timeoutMs) {
+    verificationUrl = page.url();
+    if (await textLocator.isVisible().catch(() => false)) {
+      verificationSignal = 'text';
+      break;
+    }
+
+    if (await bookingsHeading.isVisible().catch(() => false)) {
+      const urlNow = page.url();
+      if (!urlNow.includes('/bookings/book/')) {
+        verificationSignal = 'bookings-page';
+        break;
+      }
+    }
+
+    if (await bookingFormNotice.isVisible().catch(() => false)) {
+      verificationSignal = 'booking-form';
+    }
+
+    const rowConfirmed = await page
+      .evaluate((label) => {
+        const timeLabel = String(label || '').trim();
+        if (!timeLabel) return false;
+        const rows = Array.from(
+          document.querySelectorAll(
+            'tr, .tee-row, .slot-row, .timeslot, .slot, .availability, [role="row"]',
+          ),
+        );
+        for (const row of rows) {
+          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!text.includes(timeLabel)) continue;
+          const hasBookLink = row.querySelector('a[href*="/bookings/book"]');
+          const buttonText = (row.querySelector('button,[role="button"]')?.textContent || '').toLowerCase();
+          const hasBookButton = buttonText.includes('book');
+          const hasBook = !!hasBookLink || hasBookButton;
+          if (!hasBook && /(unavailable|booked|reserved|full)/i.test(text)) return true;
+        }
+        return false;
+      }, timeLabel)
+      .catch(() => false);
+
+    if (rowConfirmed) {
+      verificationSignal = 'row-unavailable';
+      break;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  const bookingLinksCountAfterClick = await page
+    .locator('a[href*="/bookings/book"]')
+    .count()
+    .catch(() => null);
+
+  const confirmed = ['text', 'bookings-page'].includes(verificationSignal);
+  return {
+    confirmed,
+    verificationSignal,
+    verificationUrl,
+    bookingLinksCountAfterClick,
+  };
+}
+
+async function saveHtmlSnapshot(page, label) {
+  try {
+    const outDir = path.join(agentDir, 'output');
+    await fs.promises.mkdir(outDir, { recursive: true });
+    const safe = String(label || 'booking').replace(/[^a-z0-9_-]/gi, '_');
+    const fileName = `${safe}-after-click-${Date.now()}.html`;
+    const filePath = path.join(outDir, fileName);
+    const html = await page.content();
+    await fs.promises.writeFile(filePath, html, 'utf8');
+    return filePath;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeTimeToHHMM(value) {
   const digits = String(value || '').replace(/\D/g, '');
   if (!digits) return '';
   return digits.padStart(4, '0').slice(-4);
+}
+
+function timeToMinutes(value) {
+  const hhmm = normalizeTimeToHHMM(value);
+  if (!hhmm || hhmm.length !== 4) return null;
+  const hours = Number.parseInt(hhmm.slice(0, 2), 10);
+  const mins = Number.parseInt(hhmm.slice(2), 10);
+  if (Number.isNaN(hours) || Number.isNaN(mins)) return null;
+  if (hours < 0 || hours > 23 || mins < 0 || mins > 59) return null;
+  return hours * 60 + mins;
+}
+
+function minutesToHHMM(minutes) {
+  const total = ((minutes % 1440) + 1440) % 1440;
+  const hours = Math.floor(total / 60);
+  const mins = total % 60;
+  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+}
+
+function expandPreferredTimes(preferredTimes, windowMinutes, stepMinutes) {
+  const baseTimes = Array.isArray(preferredTimes) ? preferredTimes : [];
+  const normalized = [];
+  const seen = new Set();
+  const window = Number.isFinite(windowMinutes) ? Math.max(0, windowMinutes) : 0;
+  const step = Number.isFinite(stepMinutes) ? Math.max(1, stepMinutes) : 5;
+
+  for (const time of baseTimes) {
+    const baseMinutes = timeToMinutes(time);
+    if (baseMinutes === null) continue;
+    const offsets = [0];
+    for (let delta = step; delta <= window; delta += step) {
+      offsets.push(-delta, delta);
+    }
+    for (const offset of offsets) {
+      const label = minutesToHHMM(baseMinutes + offset);
+      if (!seen.has(label)) {
+        seen.add(label);
+        normalized.push(label);
+      }
+    }
+  }
+
+  return normalized;
 }
 
 async function runBooking(config) {
@@ -2211,6 +2439,7 @@ async function runBooking(config) {
     warmPage = null,
     cachedSelectors = {},
     useReleaseObserver = false,
+    dryRun = false,
   } = config;
   if (!username || !password) {
     throw new Error('Missing BRS credentials for booking run');
@@ -2222,9 +2451,21 @@ async function runBooking(config) {
   const startTime = Date.now();
   const teeDate = targetPlayDate ? new Date(targetPlayDate) : new Date();
   const notes = [];
-  const normalizedPreferredTimes = Array.isArray(preferredTimes) ? preferredTimes : [];
+  const normalizedPreferredTimes = expandPreferredTimes(
+    preferredTimes,
+    CONFIG.SNIPER_FALLBACK_WINDOW_MINUTES,
+    CONFIG.SNIPER_FALLBACK_STEP_MINUTES,
+  );
+  if (Array.isArray(preferredTimes) && preferredTimes.length > 0) {
+    const expanded = normalizedPreferredTimes.join(', ');
+    const original = preferredTimes.join(', ');
+    if (expanded && expanded !== original) {
+      console.log(`[SNIPER] Expanded preferred times: ${expanded}`);
+    }
+  }
   let bookedTime = null;
   let fallbackLevel = 0;
+  let additionalPlayers = [];
   try {
     runId = await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
     if (warmPage) {
@@ -2236,21 +2477,7 @@ async function runBooking(config) {
       // ...existing browser launch, login, and tee sheet navigation...
     }
 
-    // --- PATCH: Add delay and reload before fallback scan ---
-    if (useReleaseObserver) {
-      console.log('[PATCH] Waiting 2 seconds and reloading tee sheet before fallback scan...');
-      await page.waitForTimeout(2000);
-      if (targetPlayDate) {
-        const reloadUrl = teeSheetUrlForDate(targetPlayDate);
-        await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await page.waitForTimeout(1000);
-        console.log('[PATCH] Tee sheet reloaded for fallback scan.');
-        // Force a full page reload to ensure DOM is fresh
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
-        await page.waitForTimeout(1000);
-        console.log('[PATCH] Full page reload complete before fallback scan.');
-      }
-    }
+    // --- PATCH: release-watcher retries handled after timeout ---
     const locatorCache = {};
     for (const time of normalizedPreferredTimes) {
       const hhmm = normalizeTimeToHHMM(time);
@@ -2264,15 +2491,41 @@ async function runBooking(config) {
     }
     const releaseFallbackLocator = page.locator('a[href*="/bookings/book"]').first();
     const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
-    const additionalPlayers = players.slice(0, desiredAdditionalCount);
+    additionalPlayers = players.slice(0, desiredAdditionalCount);
     await coarseWaitUntil(targetFireTime);
     console.log('\n[4/5] Executing precise timing...');
     await spinUntil(targetFireTime);
     const targetReachedAt = Date.now();
     let releaseResult = null;
     if (useReleaseObserver) {
-      console.log('[SNIPER] Release watcher (MutationObserver) armed...');
-      releaseResult = await waitForBookingRelease(page, 2000);
+      const watchMs = Number.isFinite(CONFIG.SNIPER_RELEASE_WATCH_MS)
+        ? Math.max(500, CONFIG.SNIPER_RELEASE_WATCH_MS)
+        : 8000;
+      const retries = Number.isFinite(CONFIG.SNIPER_RELEASE_RETRY_COUNT)
+        ? Math.max(0, CONFIG.SNIPER_RELEASE_RETRY_COUNT)
+        : 2;
+      const maxAttempts = retries + 1;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        console.log(
+          `[SNIPER] Release watcher (MutationObserver) armed... attempt ${attempt}/${maxAttempts} timeout ${watchMs}ms`,
+        );
+        releaseResult = await waitForBookingRelease(page, watchMs);
+        if (releaseResult && releaseResult.found) {
+          break;
+        }
+        const snapshotPath = await saveHtmlSnapshot(page, runId || jobId || 'release-timeout');
+        notes.push(
+          `release-watcher-timeout attempt ${attempt}/${maxAttempts} snapshot=${snapshotPath || 'n/a'}`,
+        );
+        if (attempt < maxAttempts && targetPlayDate) {
+          console.log('[SNIPER] Release watcher timeout — reloading tee sheet and retrying...');
+          const reloadUrl = teeSheetUrlForDate(targetPlayDate);
+          await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
+        }
+      }
       if (releaseResult && releaseResult.found) {
         const detectedAt = targetReachedAt + releaseResult.elapsedMs;
         const delta = detectedAt - targetReachedAt;
@@ -2281,28 +2534,125 @@ async function runBooking(config) {
         if (delta > 200) console.warn(`[WARN] Booking click delta >200ms: ${delta}ms`);
         // Click the first booking link instantly
         const bookingLink = page.locator('a[href*="/bookings/book"]').first();
-        await executeReleaseBooking(page, bookingLink, additionalPlayers, (slotsData[0]?.openSlots || 3), targetReachedAt + releaseResult.elapsedMs, jobId);
-        // Confirm booking (no rescan)
-        bookedTime = 'release';
-        fallbackLevel = 0;
-        notes.push(`Release-night booking succeeded; Detected at delta ${delta}ms`);
+        console.log('[SNIPER] Clicked booking link');
+        const clickResult = await executeReleaseBooking(
+          page,
+          bookingLink,
+          additionalPlayers,
+          slotsData[0]?.openSlots || 3,
+          targetReachedAt + releaseResult.elapsedMs,
+          jobId,
+          dryRun,
+        );
+        if (dryRun) {
+          const clickDeltaMs = clickResult?.clickDeltaMs ?? null;
+          const diagnostics = {
+            click_delta_ms: clickDeltaMs,
+            release_detect_delta_ms: delta,
+            verification_url: page.url(),
+            verification_signal: 'dry-run',
+          };
+          bookedTime = releaseResult.slotTime || 'release';
+          fallbackLevel = 0;
+          notes.push(`Dry-run; detected at delta ${delta}ms`);
+          await fsFinishRun(runId, {
+            result: 'dry_run',
+            notes: `Dry-run; ${notes.join(' | ')}`,
+            latency_ms: Date.now() - startTime,
+            chosen_time: bookedTime,
+            fallback_level: fallbackLevel,
+            ...diagnostics,
+          });
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: true,
+            result: 'dry_run',
+            bookedTime,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: notes.join(' | '),
+            playersRequested: additionalPlayers,
+            ...diagnostics,
+          };
+        }
+        console.log('[SNIPER] Verification started...');
+        const verification = await verifyBookingConfirmation(
+          page,
+          releaseResult.slotTime || 'release',
+          12000,
+        );
+        if (
+          ['confirm-button-not-found', 'confirm-clicked-no-confirmation-text'].includes(
+            clickResult?.confirmationText,
+          )
+        ) {
+          verification.confirmed = false;
+          verification.verificationSignal = 'confirm-missing';
+        }
+        if (additionalPlayers.length > 0 && (clickResult.playersFilled || []).length < additionalPlayers.length) {
+          verification.confirmed = false;
+          verification.verificationSignal = 'players-missing';
+        }
+        console.log(`[SNIPER] Verification: URL=${verification.verificationUrl}`);
+
+        const clickDeltaMsConfirmed = clickResult?.clickDeltaMs ?? null;
+        const diagnostics = {
+          click_delta_ms: clickDeltaMsConfirmed,
+          release_detect_delta_ms: delta,
+          verification_url: verification.verificationUrl,
+          verification_signal: verification.verificationSignal,
+          booking_links_count_after_click: verification.bookingLinksCountAfterClick,
+        };
+
+        if (verification.confirmed) {
+          bookedTime = releaseResult.slotTime || 'release';
+          fallbackLevel = 0;
+          notes.push(`Release-night booking confirmed; Detected at delta ${delta}ms`);
+          await fsFinishRun(runId, {
+            result: 'success_confirmed',
+            notes: `Release-booked; ${notes.join(' | ')}`,
+            latency_ms: Date.now() - startTime,
+            chosen_time: bookedTime,
+            fallback_level: fallbackLevel,
+            ...diagnostics,
+          });
+          await sendPushFCM('✅ Tee Time Booked!', `Successfully booked (release)`, pushToken);
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: true,
+            result: 'success_confirmed',
+            bookedTime,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: notes.join(' | '),
+            playersRequested: additionalPlayers,
+            ...diagnostics,
+          };
+        }
+
+        console.log('[SNIPER] Verification failed: no confirmation within 12s');
+        const snapshotPath = await saveHtmlSnapshot(page, runId || jobId || 'release');
         await fsFinishRun(runId, {
-          result: 'success',
-          notes: `Release-booked; ${notes.join(' | ')}`,
+          result: 'click_only',
+          notes: `Clicked booking link but no confirmation; ${notes.join(' | ')}`,
           latency_ms: Date.now() - startTime,
           chosen_time: bookedTime,
           fallback_level: fallbackLevel,
+          snapshot_path: snapshotPath,
+          ...diagnostics,
         });
-        await sendPushFCM('✅ Tee Time Booked!', `Successfully booked (release)`, pushToken);
         if (browser && !isWarm) await browser.close();
         return {
-          success: true,
-          result: 'success',
-          bookedTime,
+          success: false,
+          result: 'click_only',
+          bookedTime: null,
           fallbackLevel,
           latencyMs: Date.now() - startTime,
-          notes: notes.join(' | '),
+          notes: 'clicked but no confirmation',
           playersRequested: additionalPlayers,
+          error: 'clicked but no confirmation',
+          snapshotPath,
+          ...diagnostics,
         };
       } else {
         console.log('[SNIPER] Release watcher timeout — fallback to normal scan');

@@ -193,16 +193,21 @@ class _PlayerSelectorModalState extends State<PlayerSelectorModal>
 
   List<PlayerCategory> _filterCategories(PlayerDirectory directory) {
     if (widget.allowedCategories.isEmpty) {
-      return directory.categories;
+      return directory.categories
+          .where((c) => c.name.toLowerCase() != 'you')
+          .toList();
     }
     final allowed = widget.allowedCategories
         .map((c) => c.toLowerCase())
         .toSet();
     final filtered = directory.categories
         .where((c) => allowed.contains(c.name.toLowerCase()))
+        .where((c) => c.name.toLowerCase() != 'you')
         .toList();
     if (filtered.isEmpty) {
-      return directory.categories;
+      return directory.categories
+          .where((c) => c.name.toLowerCase() != 'you')
+          .toList();
     }
     return filtered;
   }

@@ -30,9 +30,13 @@ class AvailabilityCacheService {
     required String baseUrl,
     required String username,
     required int days,
+    DateTime? startDate,
     String? club,
   }) {
-    return '${baseUrl.toLowerCase()}|${username.toLowerCase()}|$days|${club ?? ''}';
+    final startKey = startDate == null
+        ? ''
+        : '${startDate.year.toString().padLeft(4, '0')}-${startDate.month.toString().padLeft(2, '0')}-${startDate.day.toString().padLeft(2, '0')}';
+    return '${baseUrl.toLowerCase()}|${username.toLowerCase()}|$days|${club ?? ''}|$startKey';
   }
 
   AvailabilityCacheEntry? getFresh(
@@ -57,12 +61,13 @@ class AvailabilityCacheService {
     required String username,
     required String password,
     required int days,
+    DateTime? startDate,
     String? club,
     bool reuseBrowser = true,
     Duration timeout = const Duration(seconds: 90),
   }) async {
     final key =
-        buildKey(baseUrl: baseUrl, username: username, days: days, club: club);
+        buildKey(baseUrl: baseUrl, username: username, days: days, startDate: startDate, club: club);
     final inFlight = _inFlight[key];
     if (inFlight != null) return inFlight;
 
@@ -71,6 +76,7 @@ class AvailabilityCacheService {
       username: username,
       password: password,
       days: days,
+      startDate: startDate,
       club: club,
       reuseBrowser: reuseBrowser,
       timeout: timeout,
@@ -86,13 +92,14 @@ class AvailabilityCacheService {
     required String username,
     required String password,
     required int days,
+    DateTime? startDate,
     String? club,
     bool reuseBrowser = true,
     Duration maxAge = defaultMaxAge,
     Duration revalidateWindow = defaultRevalidateWindow,
   }) async {
     final key =
-        buildKey(baseUrl: baseUrl, username: username, days: days, club: club);
+        buildKey(baseUrl: baseUrl, username: username, days: days, startDate: startDate, club: club);
     final cached = getFresh(key, maxAge: maxAge);
     if (cached != null) {
       if (_needsRevalidate(cached, maxAge, revalidateWindow)) {
@@ -102,6 +109,7 @@ class AvailabilityCacheService {
           username: username,
           password: password,
           days: days,
+          startDate: startDate,
           club: club,
           reuseBrowser: reuseBrowser,
         ));
@@ -113,6 +121,7 @@ class AvailabilityCacheService {
       username: username,
       password: password,
       days: days,
+      startDate: startDate,
       club: club,
       reuseBrowser: reuseBrowser,
     );
@@ -123,13 +132,17 @@ class AvailabilityCacheService {
     required String username,
     required String password,
     required int days,
+    DateTime? startDate,
     String? club,
     bool reuseBrowser = true,
     Duration timeout = const Duration(seconds: 90),
   }) async {
     final uri = Uri.parse('$baseUrl/api/fetch-tee-times-range');
+    final start = startDate ?? DateTime.now();
+    final startKey =
+        '${start.year.toString().padLeft(4, '0')}-${start.month.toString().padLeft(2, '0')}-${start.day.toString().padLeft(2, '0')}';
     final payload = {
-      'startDate': DateTime.now().toIso8601String(),
+      'startDate': startKey,
       'days': days,
       'username': username,
       'password': password,
@@ -161,8 +174,14 @@ class AvailabilityCacheService {
 
     final entry =
         AvailabilityCacheEntry(fetchedAt: DateTime.now(), days: rawDays);
-    _cache[buildKey(baseUrl: baseUrl, username: username, days: days, club: club)] =
-        entry;
+    _cache[
+        buildKey(
+          baseUrl: baseUrl,
+          username: username,
+          days: days,
+          startDate: startDate,
+          club: club)] =
+      entry;
     return entry;
   }
 }

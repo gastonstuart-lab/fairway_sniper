@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -182,7 +183,7 @@ class _LoginScreenState extends State<LoginScreen> {
           child: SafeArea(
             child: Center(
               child: SingleChildScrollView(
-                padding: const EdgeInsets.all(20),
+                padding: const EdgeInsets.all(AppSpacing.xxl),
                 child: Center(
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 450),
@@ -190,7 +191,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Container(
-                          padding: const EdgeInsets.all(24),
+                          padding: const EdgeInsets.all(AppSpacing.xl),
                           decoration: BoxDecoration(
                             color: Colors.white.withValues(alpha: 0.15),
                             shape: BoxShape.circle,
@@ -198,7 +199,7 @@ class _LoginScreenState extends State<LoginScreen> {
                           child: const Icon(Icons.golf_course,
                               size: 80, color: Colors.white),
                         ),
-                        const SizedBox(height: 32),
+                        const SizedBox(height: AppSpacing.xxl),
                         Text(
                           "Big Mal the Fairway Sniper",
                           style: GoogleFonts.ubuntu(
@@ -224,10 +225,10 @@ class _LoginScreenState extends State<LoginScreen> {
                                     color: Colors.white.withValues(alpha: 0.9),
                                   ),
                         ),
-                        const SizedBox(height: 48),
+                        const SizedBox(height: AppSpacing.xxl),
                         Container(
                           padding:
-                              EdgeInsets.only(left: 32, top: 32, right: 32),
+                              EdgeInsets.only(left: AppSpacing.xxl, top: AppSpacing.xxl, right: AppSpacing.xxl),
                           decoration: BoxDecoration(
                             color: Colors.white,
                             borderRadius: BorderRadius.circular(24),
@@ -254,7 +255,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                         color: Colors.grey[600]),
                                   ),
                                 ),
-                                const SizedBox(height: 20),
+                                const SizedBox(height: AppSpacing.xl),
                               ],
                               TextField(
                                 controller: _emailController,
@@ -268,7 +269,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                       color: Colors.grey[600]),
                                 ),
                               ),
-                              const SizedBox(height: 20),
+                              const SizedBox(height: AppSpacing.xl),
                               TextField(
                                 controller: _passwordController,
                                 obscureText: true,
@@ -281,7 +282,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                       color: Colors.grey[600]),
                                 ),
                               ),
-                              const SizedBox(height: 8),
+                              const SizedBox(height: AppSpacing.md),
                               CheckboxListTile(
                                 value: _rememberMe,
                                 onChanged: (value) {
@@ -295,7 +296,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                     ListTileControlAffinity.leading,
                                 contentPadding: EdgeInsets.zero,
                               ),
-                              const SizedBox(height: 32),
+                              const SizedBox(height: AppSpacing.xxl),
                               SizedBox(
                                 width: double.infinity,
                                 height: 56,
@@ -314,7 +315,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                         ),
                                 ),
                               ),
-                              const SizedBox(height: 16),
+                              const SizedBox(height: AppSpacing.lg),
                               TextButton(
                                 onPressed: () =>
                                     setState(() => _isSignUp = !_isSignUp),

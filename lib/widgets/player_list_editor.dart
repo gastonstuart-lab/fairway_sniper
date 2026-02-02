@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:fairway_sniper/theme/app_spacing.dart';
 
 /// Widget for displaying and editing a list of selected player names
 /// Shows players with remove buttons and allows reordering
@@ -78,32 +79,33 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
         // Empty state
         if (isEmpty)
           Container(
-            padding: const EdgeInsets.all(32),
+            padding: const EdgeInsets.all(AppSpacing.xxl),
             decoration: BoxDecoration(
-              border: Border.all(color: Colors.grey[300]!),
-              borderRadius: BorderRadius.circular(8),
-              color: Colors.grey[50],
+              border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+              borderRadius: BorderRadius.circular(12),
+              color: Colors.white.withValues(alpha: 0.08),
             ),
             child: Column(
               children: [
                 Icon(Icons.people_outline, size: 48, color: Colors.grey[400]),
-                const SizedBox(height: 16),
+                const SizedBox(height: AppSpacing.xl),
                 Text(
                   'No players selected',
                   style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                        color: Colors.grey[600],
+                        color: Colors.white70,
+                        fontWeight: FontWeight.w600,
                       ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: AppSpacing.md),
                 Text(
                   'Tap "Add Players" to select from directory',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: Colors.grey[500],
+                        color: Colors.white54,
                       ),
                   textAlign: TextAlign.center,
                 ),
                 if (!widget.readOnly) ...[
-                  const SizedBox(height: 16),
+                  const SizedBox(height: AppSpacing.lg),
                   ElevatedButton.icon(
                     onPressed: widget.onAddPlayers,
                     icon: const Icon(Icons.add),
@@ -139,8 +141,9 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
   Widget _buildReadOnlyList() {
     return Container(
       decoration: BoxDecoration(
-        border: Border.all(color: Colors.grey[300]!),
-        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+        borderRadius: BorderRadius.circular(12),
+        color: Colors.white.withValues(alpha: 0.05),
       ),
       child: ListView.separated(
         shrinkWrap: true,
@@ -148,16 +151,16 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
         itemCount: widget.playerNames.length,
         separatorBuilder: (context, index) => Divider(
           height: 1,
-          color: Colors.grey[300],
+          color: Colors.white.withValues(alpha: 0.1),
         ),
         itemBuilder: (context, index) {
           return ListTile(
             leading: CircleAvatar(
-              backgroundColor: Colors.blue[100],
+              backgroundColor: Colors.blue.withValues(alpha: 0.3),
               child: Text(
                 '${index + 1}',
-                style: TextStyle(
-                  color: Colors.blue[900],
+                style: const TextStyle(
+                  color: Colors.white,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -166,7 +169,7 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
               widget.playerLabels?[widget.playerNames[index]] ??
                   widget.playerNames[index],
               style: const TextStyle(
-                color: Colors.black87,
+                color: Colors.white,
                 fontSize: 16,
                 fontWeight: FontWeight.w500,
               ),
@@ -180,8 +183,9 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
   Widget _buildReorderableList() {
     return Container(
       decoration: BoxDecoration(
-        border: Border.all(color: Colors.grey[300]!),
-        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+        borderRadius: BorderRadius.circular(12),
+        color: Colors.white.withValues(alpha: 0.05),
       ),
       child: ReorderableListView.builder(
         shrinkWrap: true,
@@ -209,9 +213,9 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
           return Container(
             key: ValueKey(playerName),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: Colors.white.withValues(alpha: 0.05),
               border: index > 0
-                  ? Border(top: BorderSide(color: Colors.grey[300]!))
+                  ? Border(top: BorderSide(color: Colors.white.withValues(alpha: 0.1)))
                   : null,
             ),
             child: ListTile(
@@ -219,23 +223,23 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   CircleAvatar(
-                    backgroundColor: Colors.blue[100],
+                    backgroundColor: Colors.blue.withValues(alpha: 0.3),
                     child: Text(
                       '${index + 1}',
-                      style: TextStyle(
-                        color: Colors.blue[900],
+                      style: const TextStyle(
+                        color: Colors.white,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  Icon(Icons.drag_handle, color: Colors.grey[400]),
+                  const SizedBox(width: AppSpacing.md),
+                  Icon(Icons.drag_handle, color: Colors.white.withValues(alpha: 0.5)),
                 ],
               ),
               title: Text(
                 displayName,
                 style: const TextStyle(
-                  color: Colors.black87,
+                  color: Colors.white,
                   fontSize: 16,
                   fontWeight: FontWeight.w500,
                 ),

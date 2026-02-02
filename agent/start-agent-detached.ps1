@@ -16,6 +16,9 @@ Set-Location $agentDir
 $logFile = Join-Path $agentDir 'agent_detached.log'
 $pidFile = Join-Path $agentDir 'agent_detached.pid'
 
+# Enable background scheduler for Firestore sniper jobs
+$env:AGENT_RUN_MAIN = 'true'
+
 if (Test-Path $pidFile) {
   $oldPid = Get-Content $pidFile | Select-Object -First 1
   if ($oldPid -and (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) {

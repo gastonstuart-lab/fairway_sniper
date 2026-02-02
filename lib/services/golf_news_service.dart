@@ -2,67 +2,36 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class GolfNewsService {
-  // Try multiple news sources for golf content
+  // Try multiple news sources for golf and football content
   Future<List<Map<String, dynamic>>> getGolfNews() async {
-    // Try The Guardian API (free, no key required)
+    // Try NewsAPI for golf and football (free tier available)
     try {
-      final guardianNews = await _getGuardianGolfNews();
-      if (guardianNews.isNotEmpty) return guardianNews;
-    } catch (e) {
-      print('Guardian API failed: $e');
-    }
-
-    // Try NewsAPI (free tier available)
-    try {
-      final newsApiNews = await _getNewsApiGolfNews();
+      final newsApiNews = await _getNewsApiNews();
       if (newsApiNews.isNotEmpty) return newsApiNews;
     } catch (e) {
       print('NewsAPI failed: $e');
     }
 
-    // Fallback to curated golf news
+    // Try ESPN sports news
+    try {
+      final espnNews = await _getEspnNews();
+      if (espnNews.isNotEmpty) return espnNews;
+    } catch (e) {
+      print('ESPN API failed: $e');
+    }
+
+    // Fallback to curated golf and football news
     return _getFallbackNews();
   }
 
-  Future<List<Map<String, dynamic>>> _getGuardianGolfNews() async {
-    final response = await http.get(
-      Uri.parse(
-        'https://content.guardianapis.com/search?'
-        'section=sport&'
-        'q=golf&'
-        'show-fields=thumbnail,trailText,shortUrl&'
-        'page-size=10&'
-        'order-by=newest&'
-        'api-key=test',
-      ),
-    ).timeout(const Duration(seconds: 10));
-
-    if (response.statusCode == 200) {
-      final data = json.decode(response.body);
-      final results = data['response']?['results'] as List? ?? [];
-      
-      return results.take(10).map((article) {
-        return {
-          'title': article['webTitle'] ?? 'Untitled',
-          'description': article['fields']?['trailText'] ?? 'Latest golf news and updates',
-          'url': article['webUrl'] ?? '',
-          'publishedAt': article['webPublicationDate'] ?? DateTime.now().toIso8601String(),
-          'source': 'The Guardian',
-        };
-      }).toList();
-    }
-    return [];
-  }
-
-  Future<List<Map<String, dynamic>>> _getNewsApiGolfNews() async {
-    // Using multiple golf-related search terms for better coverage
+  Future<List<Map<String, dynamic>>> _getNewsApiNews() async {
     final response = await http.get(
       Uri.parse(
         'https://newsapi.org/v2/everything?'
-        'q=golf OR PGA OR masters OR ryder cup&'
+        'q=(golf OR "PGA Tour" OR "Masters" OR "Ryder Cup" OR football OR NFL OR "Premier League") AND -subscription&'
         'sortBy=publishedAt&'
         'language=en&'
-        'pageSize=10&'
+        'pageSize=15&'
         'apiKey=demo',
       ),
     ).timeout(const Duration(seconds: 10));
@@ -74,15 +43,43 @@ class GolfNewsService {
       return articles.take(10).map((article) {
         return {
           'title': article['title'] ?? 'Untitled',
-          'description': article['description'] ?? 'Latest golf news',
+          'description': article['description'] ?? 'Sports news',
           'url': article['url'] ?? '',
           'publishedAt': article['publishedAt'] ?? DateTime.now().toIso8601String(),
-          'source': article['source']?['name'] ?? 'Golf News',
+          'source': article['source']?['name'] ?? 'Sports News',
         };
       }).toList();
     }
     return [];
   }
+
+  Future<List<Map<String, dynamic>>> _getEspnNews() async {
+    try {
+      final response = await http.get(
+        Uri.parse('https://site.api.espn.com/en/site/api/site/index/news/golf'),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final articles = data['articles'] as List? ?? [];
+        
+        return articles.take(5).map((article) {
+          return {
+            'title': article['headline'] ?? article['description'] ?? 'Untitled',
+            'description': article['description'] ?? 'Latest golf news',
+            'url': article['links']?[0]?['href'] ?? '',
+            'publishedAt': article['published'] ?? DateTime.now().toIso8601String(),
+            'source': 'ESPN Golf',
+          };
+        }).toList();
+      }
+    } catch (e) {
+      print('ESPN parsing error: $e');
+    }
+    return [];
+  }
+
+
 
   List<Map<String, dynamic>> _getFallbackNews() {
     final now = DateTime.now().toIso8601String();
@@ -92,7 +89,14 @@ class GolfNewsService {
         'description': 'The Northern Irish star continues his pursuit of major glory with impressive form heading into the season.',
         'url': 'https://www.bbc.com/sport/golf',
         'publishedAt': now,
-        'source': 'Golf Digest',
+        'source': 'BBC Sport',
+      },
+      {
+        'title': 'Premier League Title Race Heats Up',
+        'description': 'Top teams battle for supremacy with crucial matches coming this weekend. All the latest transfer news and analysis.',
+        'url': 'https://www.bbc.com/sport/football',
+        'publishedAt': now,
+        'source': 'BBC Sport',
       },
       {
         'title': 'PGA Tour Announces New Tournament Schedule',
@@ -102,11 +106,25 @@ class GolfNewsService {
         'source': 'PGA Tour',
       },
       {
+        'title': 'NFL Week 1 Preview: Championship Contenders Emerge',
+        'description': 'The NFL season kicks off with marquee matchups as contenders make their first statements of the year.',
+        'url': 'https://www.espn.com/nfl',
+        'publishedAt': now,
+        'source': 'ESPN',
+      },
+      {
         'title': 'Masters 2025: Early Favorites Emerge',
         'description': 'Augusta National prepares for another thrilling Masters Tournament as betting favorites are revealed.',
         'url': 'https://www.masters.com',
         'publishedAt': now,
         'source': 'Masters.com',
+      },
+      {
+        'title': 'Champions League Group Stage: Drama Unfolds',
+        'description': 'Europe\'s elite clubs battle in intense group stage matches with European football glory on the line.',
+        'url': 'https://www.uefa.com',
+        'publishedAt': now,
+        'source': 'UEFA',
       },
       {
         'title': 'European Tour Expands to New Markets',
@@ -135,13 +153,6 @@ class GolfNewsService {
         'url': 'https://www.rydercup.com',
         'publishedAt': now,
         'source': 'Ryder Cup',
-      },
-      {
-        'title': 'Women\'s Golf Sees Record Growth',
-        'description': 'LPGA Tour reports unprecedented viewership and participation numbers as women\'s golf continues its surge.',
-        'url': 'https://www.lpga.com',
-        'publishedAt': now,
-        'source': 'LPGA',
       },
     ];
   }

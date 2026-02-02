@@ -5,5 +5,44 @@
   "prettier.singleQuote": true,
   "prettier.trailingComma": "all",
   "editor.tabSize": 2,
-  "editor.insertSpaces": true
+  "editor.insertSpaces": true,
+  "chat.tools.terminal.autoApprove": {
+    "/^pwsh -NoProfile -File \"c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent\\\\stop-agent-detached\\.ps1\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^pwsh -NoProfile -File \"c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent\\\\start-agent-detached\\.ps1\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^pwsh -NoProfile -Command \"Set-Location 'c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper'; flutter run -d chrome\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "Y": true,
+    "/^pwsh -NoProfile -Command \"Set-Location 'c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent'; node \\.\\\\test-create-sniper-job\\.js\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^pwsh -NoProfile -Command \"Start-Sleep -Seconds 20; Get-Content -Path 'c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent\\\\agent_detached\\.log' -Tail 200\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^pwsh -NoProfile -Command \"Start-Sleep -Seconds 140; Get-Content -Path 'c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent\\\\agent_detached\\.log' -Tail 160\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^pwsh -NoProfile -Command \"Start-Sleep -Seconds 140; Get-Content -Path 'c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent\\\\agent_detached\\.log' -Tail 180\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^pwsh -NoProfile -Command \"Set-Location 'c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent'; node \\.\\\\test-create-sniper-jobs-3\\.js\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^pwsh -NoProfile -Command \"Start-Sleep -Seconds 520; Get-Content -Path 'c:\\\\Users\\\\stuar\\\\Projects\\\\fairway_sniper\\\\agent\\\\agent_detached\\.log' -Tail 240\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
 }

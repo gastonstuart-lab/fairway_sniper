@@ -141,14 +141,27 @@ class BookingPrefetchService extends ChangeNotifier {
         statusText: 'Fetching availability…',
       ));
 
-      await _availabilityCacheService.getOrFetch(
-        baseUrl: baseUrl,
-        username: username,
-        password: password,
-        days: 5,
-        club: club,
-        reuseBrowser: true,
-      );
+      if (forceRefresh) {
+        await _availabilityCacheService.fetchAndCache(
+          baseUrl: baseUrl,
+          username: username,
+          password: password,
+          days: 5,
+          startDate: DateTime.now(),
+          club: club,
+          reuseBrowser: false,
+        );
+      } else {
+        await _availabilityCacheService.getOrFetch(
+          baseUrl: baseUrl,
+          username: username,
+          password: password,
+          days: 5,
+          startDate: DateTime.now(),
+          club: club,
+          reuseBrowser: false,
+        );
+      }
 
       _setState(BookingPrefetchState(
         step: PrefetchStep.ready,
