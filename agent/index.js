@@ -456,7 +456,7 @@ const CONFIG = {
     10,
   ),
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
-  SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '5', 10),
+  SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '10', 10),
   DRY_RUN: process.argv.includes('--dry-run'),
   TEST_MODE: process.env.TEST_MODE === 'true',
   // Railway cold-start mitigation
