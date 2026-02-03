@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 
-const AGENT_URL = process.env.AGENT_URL || 'http://127.0.0.1:3000';
+const AGENT_URL = process.env.AGENT_URL;
 const TARGET_DATE = process.argv[2] || process.env.TEE_SCRAPE_DATE || '2026-02-08';
 const USERNAME = process.env.BRS_USERNAME;
 const PASSWORD = process.env.BRS_PASSWORD;
+
+if (!AGENT_URL) {
+  console.error('[validate-tee-scrape] Missing AGENT_URL. Set AGENT_URL to the deployed agent URL before running.');
+  process.exitCode = 1;
+  process.exit();
+}
 
 if (!USERNAME || !PASSWORD) {
   console.error('[validate-tee-scrape] Missing BRS credentials (set BRS_USERNAME and BRS_PASSWORD).');
