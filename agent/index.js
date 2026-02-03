@@ -8,6 +8,7 @@ import path from 'path';
 import { DateTime } from 'luxon';
 import * as warmSession from './warm_session.js';
 import { ensureTeeSelected } from './ensureTeeSelected.js';
+import { maybeFallbackToAltTee, selectTeeForJob } from './tee_targeting.js';
 import os from 'os';
 import crypto from 'crypto';
 
@@ -334,7 +335,19 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
 // Immediate booking endpoint (Normal mode)
 app.post('/api/book-now', async (req, res) => {
   try {
-    const { username, password, targetDate, preferredTimes, players = [], partySize, pushToken } = req.body || {};
+    const {
+      username,
+      password,
+      targetDate,
+      preferredTimes,
+      players = [],
+      partySize,
+      pushToken,
+      teeTarget,
+      tee,
+      fallbackTee,
+      dryRun,
+    } = req.body || {};
     if (!username || !password || !targetDate) {
       return res.status(400).json({ success: false, error: 'Missing username/password/targetDate' });
     }
@@ -355,6 +368,9 @@ app.post('/api/book-now', async (req, res) => {
       warmPage,
       useReleaseObserver: false,
       pushToken,
+      teeTarget: parseTeeTarget(teeTarget ?? tee),
+      fallbackTee: parseBooleanFlag(fallbackTee, false),
+      dryRun: parseBooleanFlag(dryRun, false),
     });
 
     return res.json(result);
@@ -720,13 +736,15 @@ async function runSniperJob(jobId, payload) {
     partySize,
     fireTimeUtc,
     minutes,
+    teeTarget,
+    fallbackTee = false,
   } = payload;
 
   const fireTime = parseFireTime(minutes, fireTimeUtc);
   setJob(jobId, {
     status: 'queued',
     scheduledFor: new Date(fireTime).toISOString(),
-    payload: { targetDate, preferredTimes, players, partySize },
+    payload: { targetDate, preferredTimes, players, partySize, teeTarget, fallbackTee },
   });
 
   const delayMs = Math.max(0, fireTime - Date.now());
@@ -753,6 +771,8 @@ async function runSniperJob(jobId, payload) {
         slotsData: [],
         warmPage,
         useReleaseObserver: false,
+        teeTarget,
+        fallbackTee,
       });
 
       setJob(jobId, {
@@ -786,13 +806,26 @@ app.post('/api/sniper-test', async (req, res) => {
     if (jobStore.size >= JOB_MAX_QUEUE) {
       return res.status(429).json({ error: 'job-queue-full' });
     }
-    const { username, password, targetDate, preferredTimes, players, partySize, minutes, fireTimeUtc } = req.body || {};
+    const { username, password, targetDate, preferredTimes, players, partySize, minutes, fireTimeUtc, teeTarget, fallbackTee } = req.body || {};
     if (!username || !password || !targetDate) {
       return res.status(400).json({ error: 'Missing required fields: username, password, targetDate' });
     }
     const jobId = `sniper-${Date.now()}`;
     setJob(jobId, { status: 'queued', createdAt: new Date().toISOString() });
-    await runSniperJob(jobId, { username, password, targetDate, preferredTimes, players, partySize, minutes, fireTimeUtc });
+    const normalizedTeeTarget = parseTeeTarget(teeTarget ?? req.body?.tee);
+    const normalizedFallbackTee = parseBooleanFlag(fallbackTee, false);
+    await runSniperJob(jobId, {
+      username,
+      password,
+      targetDate,
+      preferredTimes,
+      players,
+      partySize,
+      minutes,
+      fireTimeUtc,
+      teeTarget: normalizedTeeTarget,
+      fallbackTee: normalizedFallbackTee,
+    });
     const job = getJob(jobId);
     res.json({ jobId, scheduledFor: job?.scheduledFor, status: job?.status });
   } catch (error) {
@@ -2343,7 +2376,14 @@ async function runBooking(config) {
     useReleaseObserver = false,
     dryRun = false,
     tee = 1,
+    teeMode = 'single',
+    teeTarget,
+    fallbackTee = false,
+    includeUnavailable = false,
   } = config;
+  const normalizedTeeMode = teeMode === 'both' ? 'both' : 'single';
+  const normalizedTeeTarget = parseTeeTarget(teeTarget ?? tee);
+  let teeCtx = null;
   if (!username || !password) {
     throw new Error('Missing BRS credentials for booking run');
   }
@@ -2353,6 +2393,7 @@ async function runBooking(config) {
   let runId;
   const startTime = Date.now();
   const teeDate = targetPlayDate ? new Date(targetPlayDate) : new Date();
+  const targetDateStr = teeDate.toISOString().slice(0, 10);
   const notes = [];
   const normalizedPreferredTimes = expandPreferredTimes(
     preferredTimes,
@@ -2368,6 +2409,7 @@ async function runBooking(config) {
   }
   let bookedTime = null;
   let fallbackLevel = 0;
+  let fallbackTeeUsed = false;
   let additionalPlayers = [];
   try {
     runId = await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
@@ -2380,33 +2422,100 @@ async function runBooking(config) {
       // ...existing browser launch, login, and tee sheet navigation...
     }
 
-    // Ensure correct tee is selected before scraping
-    try {
-      await ensureTeeSelected(page, typeof tee === 'number' ? tee : 1);
-    } catch (err) {
-      console.warn('[TEE] Failed to ensure tee selected:', err?.message || err);
+    if (normalizedTeeMode === 'both') {
+      const tee1 = await collectTeeResult(page, 1, targetDateStr, includeUnavailable);
+      const tee10 = await collectTeeResult(page, 10, targetDateStr, includeUnavailable);
+      const teeResult = {
+        success: true,
+        result: 'tee-data',
+        teeMode: 'both',
+        teeTarget: normalizedTeeTarget,
+        teeData: { tee1, tee10 },
+        selectedTee: normalizedTeeTarget,
+        fallbackTeeUsed: false,
+        notes: `Collected tee data for ${targetDateStr}`,
+      };
+      await fsFinishRun(runId, {
+        result: 'tee-data',
+        notes: teeResult.notes,
+        latency_ms: Date.now() - startTime,
+        chosen_time: null,
+        fallback_level: 0,
+        selected_tee: normalizedTeeTarget,
+        fallback_tee_used: false,
+      });
+      if (browser && !isWarm) await browser.close();
+      return teeResult;
     }
 
-    // --- PATCH: release-watcher retries handled after timeout ---
-    const locatorCache = {};
-    for (const time of normalizedPreferredTimes) {
-      const hhmm = normalizeTimeToHHMM(time);
-      if (!hhmm || hhmm.length !== 4) {
-        console.log(`[WARN] Skipping invalid time format in preferredTimes: "${time}"`);
-        continue;
-      }
-      const fallbackSel = `a[href*="/bookings/book/${hhmm}"]`;
-      const cachedSel = cachedSelectors?.[time] || fallbackSel;
-      locatorCache[time] = page.locator(cachedSel).first();
-    }
-    const releaseFallbackLocator = page.locator('a[href*="/bookings/book"]').first();
+    teeCtx = await selectTeeForJob(page, config);
+    const getTeeLabel = () => {
+      if (!teeCtx) return 'unknown';
+      return teeCtx.teeTarget === 10 ? '10TH TEE' : '1ST TEE';
+    };
+
     const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
     additionalPlayers = players.slice(0, desiredAdditionalCount);
     await coarseWaitUntil(targetFireTime);
     console.log('\n[4/5] Executing precise timing...');
     await spinUntil(targetFireTime);
     const targetReachedAt = Date.now();
+    const buildLocatorCache = () => {
+      const cache = {};
+      for (const time of normalizedPreferredTimes) {
+        const hhmm = normalizeTimeToHHMM(time);
+        if (!hhmm || hhmm.length !== 4) {
+          console.log(`[WARN] Skipping invalid time format in preferredTimes: "${time}"`);
+          continue;
+        }
+        const fallbackSel = `a[href*="/bookings/book/${hhmm}"]`;
+        const cachedSel = cachedSelectors?.[time] || fallbackSel;
+        cache[time] = page.locator(cachedSel).first();
+      }
+      return cache;
+    };
     let releaseResult = null;
+    let locatorCache = {};
+    let releaseFallbackLocator = page.locator('a[href*="/bookings/book"]').first();
+
+    const runPreferredTimesLoop = async () => {
+      locatorCache = buildLocatorCache();
+      releaseFallbackLocator = page.locator('a[href*="/bookings/book"]').first();
+      for (const [index, time] of normalizedPreferredTimes.entries()) {
+        try {
+          console.log(`Trying time slot: ${time}`);
+          const slotInfo = slotsData.find((s) => s.time === time);
+          const openSlots = slotInfo ? slotInfo.openSlots : 3;
+          const bookingResult = await tryBookTime(
+            page,
+            time,
+            additionalPlayers,
+            openSlots,
+            locatorCache[time] || releaseFallbackLocator,
+            targetFireTime,
+            jobId,
+          );
+          if (bookingResult && bookingResult.booked) {
+            bookedTime = time;
+            fallbackLevel = index;
+            notes.push(
+              `Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`,
+            );
+            break;
+          } else if (bookingResult) {
+            const msg = `Could not complete booking for ${time}: ${bookingResult.error || bookingResult.confirmationText}`;
+            console.log(msg);
+            notes.push(msg);
+          }
+        } catch (error) {
+          const msg = `Failed to book ${time}: ${error.message}`;
+          console.error(msg);
+          notes.push(msg);
+        }
+      }
+      return !!bookedTime;
+    };
+
     if (useReleaseObserver) {
       const watchMs = Number.isFinite(CONFIG.SNIPER_RELEASE_WATCH_MS)
         ? Math.max(500, CONFIG.SNIPER_RELEASE_WATCH_MS)
@@ -2492,6 +2601,7 @@ async function runBooking(config) {
             notes: notes.join(' | '),
             playersRequested: additionalPlayers,
             ...diagnostics,
+            ...(dryRun ? { teeSelected: getTeeLabel(), armedAfterTeeSelect: true } : {}),
           };
         }
         console.log('[SNIPER] Verification started...');
@@ -2577,37 +2687,14 @@ async function runBooking(config) {
         console.log('[SNIPER] Release watcher timeout — fallback to normal scan');
       }
     }
-    // === FALLBACK: NORMAL PREFERRED TIMES LOOP ===
-    for (const [index, time] of normalizedPreferredTimes.entries()) {
-      try {
-        console.log(`Trying time slot: ${time}`);
-        const slotInfo = slotsData.find((s) => s.time === time);
-        const openSlots = slotInfo ? slotInfo.openSlots : 3;
-        const bookingResult = await tryBookTime(
-          page,
-          time,
-          additionalPlayers,
-          openSlots,
-          locatorCache[time] || releaseFallbackLocator,
-          targetFireTime,
-          jobId,
-        );
-        if (bookingResult && bookingResult.booked) {
-          bookedTime = time;
-          fallbackLevel = index;
-          notes.push(
-            `Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`,
-          );
-          break;
-        } else if (bookingResult) {
-          const msg = `Could not complete booking for ${time}: ${bookingResult.error || bookingResult.confirmationText}`;
-          console.log(msg);
-          notes.push(msg);
-        }
-      } catch (error) {
-        const msg = `Failed to book ${time}: ${error.message}`;
-        console.error(msg);
-        notes.push(msg);
+    let bookingSuccess = await runPreferredTimesLoop();
+    if (!bookingSuccess && teeCtx?.fallbackTee && !fallbackTeeUsed) {
+      const fallbackResult = await maybeFallbackToAltTee(page, teeCtx, 'preferred_time_not_found');
+      if (fallbackResult.didFallback) {
+        fallbackTeeUsed = true;
+        teeCtx = { ...teeCtx, teeTarget: fallbackResult.teeTarget };
+        notes.push(`[TEE] Fallback to tee ${fallbackResult.teeTarget} after primary tee had no available slots`);
+        bookingSuccess = await runPreferredTimesLoop();
       }
     }
     const success = !!bookedTime;
@@ -2651,6 +2738,7 @@ async function runBooking(config) {
       latencyMs: Date.now() - startTime,
       notes: finalNotes,
       playersRequested: additionalPlayers,
+      ...(dryRun ? { teeSelected: getTeeLabel(), armedAfterTeeSelect: true } : {}),
     };
   } catch (error) {
     const msg = `Booking run failed: ${error.message}`;
@@ -2679,7 +2767,17 @@ async function runBooking(config) {
 // --- Release-night helper endpoint ---
 app.post('/api/release-snipe', async (req, res) => {
   try {
-    const { username, password, targetDate, fireTimeUtc, preferredTimes, partySize } = req.body;
+    const {
+      username,
+      password,
+      targetDate,
+      fireTimeUtc,
+      preferredTimes,
+      partySize,
+      teeTarget,
+      fallbackTee,
+      dryRun = false,
+    } = req.body;
     if (!username || !password || !targetDate) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -2695,6 +2793,8 @@ app.post('/api/release-snipe', async (req, res) => {
       await coarseWaitUntil(fireTime);
     }
     // Run booking with release observer
+    const resolvedTeeTarget = parseTeeTarget(teeTarget ?? req.body?.tee);
+    const resolvedFallbackTee = parseBooleanFlag(fallbackTee, false);
     const result = await runBooking({
       jobId: 'release-snipe-' + Date.now(),
       ownerUid: 'release-night',
@@ -2709,6 +2809,9 @@ app.post('/api/release-snipe', async (req, res) => {
       slotsData: [],
       warmPage,
       useReleaseObserver: true,
+      teeTarget: resolvedTeeTarget,
+      fallbackTee: resolvedFallbackTee,
+      dryRun: parseBooleanFlag(dryRun, false),
     });
     res.json(result);
   } catch (err) {
