@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { DateTime } from 'luxon';
 import * as warmSession from './warm_session.js';
+import { ensureTeeSelected } from './ensureTeeSelected.js';
 import os from 'os';
 import crypto from 'crypto';
 
@@ -122,6 +123,9 @@ app.post('/api/fetch-tee-times', async (req, res) => {
   let browser;
   try {
     const { date, username, password, club, reuseBrowser = true, includeUnavailable = false } = req.body || {};
+    let tee = 1;
+    if (typeof req.body.tee === 'number') tee = req.body.tee;
+    else if (typeof req.query.tee === 'number') tee = req.query.tee;
     if (!date || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing date/username/password' });
     }
@@ -139,14 +143,27 @@ app.post('/api/fetch-tee-times', async (req, res) => {
     await navigateToTeeSheet(page, date, false);
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await page.waitForTimeout(300);
+    // Ensure correct tee is selected before scraping
+    try {
+      await (await import('./ensureTeeSelected.js')).ensureTeeSelected(page, tee);
+    } catch (err) {
+      console.warn('[TEE] Failed to ensure tee selected:', err?.message || err);
+    }
     if (!pageMatchesDate(page, new Date(date))) {
       if (browser) await browser.close();
       return res.json({ success: true, date, count: 0, times: [], slots: [] });
     }
-    const { times, slots } = await scrapeAvailableTimes(page, { includeUnavailable });
+    // Pass tee/date for diagnostics
+    if (page && page.context) {
+      if (!page.context()._dateForDiagnostics) page.context()._dateForDiagnostics = date;
+      if (!page.context()._teeForDiagnostics) page.context()._teeForDiagnostics = tee;
+    }
+    const { times, slots, debug } = await scrapeAvailableTimes(page, { includeUnavailable });
 
     if (browser) await browser.close();
-    return res.json({ success: true, date, count: times.length, times, slots });
+    const resp = { success: true, date, count: times.length, times, slots };
+    if (debug) resp.debug = debug;
+    return res.json(resp);
   } catch (error) {
     if (browser) await browser.close().catch(() => {});
     return res.status(500).json({ success: false, error: error.message });
@@ -158,6 +175,9 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
   let browser;
   try {
     const { startDate, days = 5, username, password, club, reuseBrowser = true } = req.body || {};
+    let tee = 1;
+    if (typeof req.body.tee === 'number') tee = req.body.tee;
+    else if (typeof req.query.tee === 'number') tee = req.query.tee;
     if (!startDate || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing startDate/username/password' });
     }
@@ -185,6 +205,12 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
       await navigateToTeeSheet(page, target, false);
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await page.waitForTimeout(300);
+      // Ensure correct tee is selected before scraping
+      try {
+        await (await import('./ensureTeeSelected.js')).ensureTeeSelected(page, tee);
+      } catch (err) {
+        console.warn('[TEE] Failed to ensure tee selected:', err?.message || err);
+      }
       if (!pageMatchesDate(page, target)) {
         results.push({
           date: target.toISOString().slice(0, 10),
@@ -859,7 +885,7 @@ async function scheduleClaimedJob(job) {
 
   const fireMs = fireTime?.getTime?.() ? fireTime.getTime() : null;
   if (!fireMs || Number.isNaN(fireMs)) {
-    await markJobError(jobId, 'missing-fire-time');
+          await markJobError(jobId, 'missing-target-play-date');
     return;
   }
 
@@ -907,6 +933,7 @@ async function scheduleClaimedJob(job) {
       const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
       const pushToken = job.push_token || job.pushToken;
       const dryRun = job.dry_run === true || job.dryRun === true;
+      const tee = typeof job.tee === 'number' ? job.tee : 1;
 
       console.log(`[RUNNER] runBooking start ${jobId}`);
       const result = await runBooking({
@@ -925,6 +952,7 @@ async function scheduleClaimedJob(job) {
         useReleaseObserver: true,
         pushToken,
         dryRun,
+        tee,
       });
 
       console.log(`[RUNNER] runBooking finished ${jobId} booked=${result?.bookedTime || 'n/a'}`);
@@ -1399,282 +1427,82 @@ async function navigateToTeeSheet(page, date, allowHop = true) {
 
 async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
-  const bookableMap = new Map();
-  const timeRegex = /\b(\d{1,2}:\d{2})\b/;
-  const roots = [page];
+  // Find all rows that could contain times (broadened selectors)
+  const rowHandles = await page.locator('tr, li, .tee-row, .slot-row, .timeslot, .slot, .availability, [data-testid*="tee"], [class*="tee"], [class*="time"], [class*="slot"]').elementHandles();
+  const timeRegex = /\b([01]\d|2[0-3]):[0-5]\d\b/;
+  const timeMap = new Map();
 
-  const extractFromButton = async (handle) => {
-    try {
-      return await page.evaluate((btn) => {
-        const timeRegex = /\b(\d{1,2}:\d{2})\b/;
-        const ignore = [
-          'member',
-          'format',
-          'holes',
-          'back',
-          'nine',
-          'only',
-          'tee',
-          'unavailable',
-          'book now',
-        ];
-        const isName = (text) => {
-          const t = text.trim();
-          if (!t) return false;
-          const lower = t.toLowerCase();
-          if (ignore.some((w) => lower.includes(w))) return false;
-          if (/\d/.test(t)) return false;
-          const commaName = /^[A-Za-z][A-Za-z'\-]+,\s*[A-Za-z][A-Za-z'\-\.]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)*$/.test(t);
-          const spaceName = /^[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-\.]+)+$/.test(t);
-          return commaName || spaceName;
-        };
-        const normalizeName = (name) => {
-          const trimmed = name.trim();
-          if (!trimmed) return '';
-          let normalized = trimmed;
-          if (normalized.includes(',')) {
-            const parts = normalized.split(',');
-            const last = parts[0].trim();
-            const rest = parts.slice(1).join(' ').trim();
-            normalized = `${rest} ${last}`.trim();
-          }
-          normalized = normalized.replace(/\./g, ' ');
-          const tokens = normalized.split(/\s+/).filter(Boolean);
-          if (tokens.length >= 2) {
-            const filtered = tokens.filter((token, idx) => {
-              if (idx === 0 || idx === tokens.length - 1) return true;
-              return token.length > 1;
-            });
-            return filtered.join(' ').toLowerCase();
-          }
-          return normalized.toLowerCase();
-        };
-
-        const extractNames = (text) => {
-          const matches = text.match(/\b[A-Z][a-zA-Z'\-]+(?:,\s*[A-Z][a-zA-Z'\-\.]+(?:\s+[A-Z][a-zA-Z'\-\.]+)*)?\b|\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-\.]+){1,3}\b/g) || [];
-          return matches
-            .map((m) => m.trim())
-            .filter((m) => isName(m));
-        };
-
-        const extractOpenFromText = (text) => {
-          if (!text) return { open: null, total: null };
-          const fraction = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
-          const bookableMap = new Map();
-          const timeRegex = /\b(\d{1,2}:\d{2})\b/;
-
-          // PATCH: Scrape all visible time labels, including those with 'UNAVAILABLE' buttons
-          const rows = await page.locator('tr, .tee-row, .slot-row, .timeslot, .slot, .availability').elementHandles();
-          for (const rowHandle of rows) {
-            const rowData = await rowHandle.evaluate((row, opts) => {
-              const { includeUnavailable } = opts || {};
-              const timeRegex = /\b(\d{1,2}:\d{2})\b/;
-              const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
-              const match = text.match(timeRegex);
-              if (!match) return null;
-              const time = match[1];
-              const hasUnavailable = Array.from(row.querySelectorAll('button, [role="button"]')).some(b => b.textContent?.toLowerCase().includes('unavailable'));
-              const hasBook = Array.from(row.querySelectorAll('button, a, [role="button"]')).some(b => /\bbook( now)?\b/i.test(b.textContent || ''));
-              // Always include if includeUnavailable, otherwise only if bookable
-              if (!hasBook && !includeUnavailable && !hasUnavailable) return null;
-              const status = hasBook ? 'bookable' : 'unavailable';
-              return { time, status };
-            }, { includeUnavailable });
-            if (rowData && rowData.time) {
-              bookableMap.set(rowData.time, rowData);
-            }
-          }
-          const times = Array.from(bookableMap.keys()).sort();
-          const slots = Array.from(bookableMap.values());
-          return { times, slots };
-            for (const key of keys) {
-              const node = root.querySelector(`[${key}]`);
-              if (node) {
-                const n = attrInt(node, [key]);
-                if (n !== null) return n;
-              }
-            }
-            return null;
-          };
-
-          const findRow = (el) => {
-            let node = el;
-            let hops = 0;
-            let best = null;
-            while (node && hops < 8) {
-              const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-              if (timeRegex.test(text)) {
-                best = node;
-                if (node.matches && node.matches('tr, .tee-row, .slot-row, .timeslot, .slot, .availability, [role="row"]')) {
-                  return node;
-                }
-              }
-              node = node.parentElement;
-              hops++;
-            }
-            return best;
-          };
-
-          const row = findRow(timeEl);
-          if (!row) return null;
-          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
-          const match = text.match(timeRegex);
-          if (!match) return null;
-          const time = match[1];
-
-          const buttons = Array.from(row.querySelectorAll('button, a, [role="button"]'));
-          const hasBook = buttons.some((b) => /\bbook( now)?\b/i.test(b.textContent || ''));
-          // PATCH: Always include all visible times if includeUnavailable is true
-          if (!hasBook && !includeUnavailable) return null;
-          if (!hasBook && includeUnavailable) {
-            // Mark as unavailable, but still include the time
-            const playerText = stripToPlayers(text || '');
-            const names = extractNames(playerText);
-            const normalizedNames = names.map(normalizeName).filter(Boolean);
-            const uniqueNames = Array.from(new Set(normalizedNames));
-            const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
-            const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
-            const textCounts = extractOpenFromText(text || '');
-            const textBooked = extractBookedFromText(text || '');
-            const bookedNodes = Array.from(row.querySelectorAll('[data-booked]'));
-            const bookedCount = bookedNodes.filter((el) => {
-              const val = String(el.getAttribute('data-booked') || '').toLowerCase();
-              return val === '1' || val === 'true';
-            }).length;
-            const openKeys = [
-              'data-open-slots',
-              'data-open',
-              'data-available',
-              'data-spaces',
-              'data-spaces-available',
-            ];
-            const totalKeys = [
-              'data-total-slots',
-              'data-total',
-              'data-capacity',
-              'data-players',
-              'data-max-players',
-              'data-bookable-players-number',
-            ];
-            const bookedKeys = [
-              'data-booked',
-              'data-players-booked',
-              'data-booked-count',
-            ];
-            const explicitTotal =
-              attrInt(row, totalKeys) ?? attrIntFromTree(row, totalKeys) ?? textCounts.total ?? textBooked.total;
-            const explicitOpen =
-              attrInt(row, openKeys) ?? attrIntFromTree(row, openKeys) ?? textCounts.open;
-            const explicitBooked =
-              attrInt(row, bookedKeys) ?? attrIntFromTree(row, bookedKeys) ?? textBooked.booked;
-            const totalSlots =
-              explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
-            const filled = explicitBooked !== null
-              ? explicitBooked
-              : explicitOpen !== null && totalSlots !== null
-                ? Math.max(0, totalSlots - explicitOpen)
-                : bookedNodes.length > 0
-                  ? bookedCount
-                  : Math.min(4, Math.max(uniqueNames.length, memberCount + guestCount));
-            const openSlots = explicitOpen !== null
-              ? explicitOpen
-              : totalSlots !== null
-                ? Math.max(0, totalSlots - filled)
-                : null;
-            const status = 'unavailable';
-            return { time, status, openSlots, totalSlots };
-          }
-
-          const playerText = stripToPlayers(text || '');
-          const names = extractNames(playerText);
-          const normalizedNames = names.map(normalizeName).filter(Boolean);
-          const uniqueNames = Array.from(new Set(normalizedNames));
-          const memberCount = (playerText.match(/\bmember\b/gi) || []).length;
-          const guestCount = (playerText.match(/\bguest\b/gi) || []).length;
-          const textCounts = extractOpenFromText(text || '');
-          const textBooked = extractBookedFromText(text || '');
-          const bookedNodes = Array.from(row.querySelectorAll('[data-booked]'));
-          const bookedCount = bookedNodes.filter((el) => {
-            const val = String(el.getAttribute('data-booked') || '').toLowerCase();
-            return val === '1' || val === 'true';
-          }).length;
-
-          const openKeys = [
-            'data-open-slots',
-            'data-open',
-            'data-available',
-            'data-spaces',
-            'data-spaces-available',
-          ];
-          const totalKeys = [
-            'data-total-slots',
-            'data-total',
-            'data-capacity',
-            'data-players',
-            'data-max-players',
-            'data-bookable-players-number',
-          ];
-          const bookedKeys = [
-            'data-booked',
-            'data-players-booked',
-            'data-booked-count',
-          ];
-
-          const explicitTotal =
-            attrInt(row, totalKeys) ?? attrIntFromTree(row, totalKeys) ?? textCounts.total ?? textBooked.total;
-          const explicitOpen =
-            attrInt(row, openKeys) ?? attrIntFromTree(row, openKeys) ?? textCounts.open;
-          const explicitBooked =
-            attrInt(row, bookedKeys) ?? attrIntFromTree(row, bookedKeys) ?? textBooked.booked;
-
-          const totalSlots =
-            explicitTotal ?? (bookedNodes.length > 0 ? bookedNodes.length : 4);
-          const filled = explicitBooked !== null
-            ? explicitBooked
-            : explicitOpen !== null && totalSlots !== null
-              ? Math.max(0, totalSlots - explicitOpen)
-              : bookedNodes.length > 0
-                ? bookedCount
-                : Math.min(4, Math.max(uniqueNames.length, memberCount + guestCount));
-          const openSlots = explicitOpen !== null
-            ? explicitOpen
-            : totalSlots !== null
-              ? Math.max(0, totalSlots - filled)
-              : null;
-
-          const status = hasBook ? 'bookable' : 'unavailable';
-          return { time, status, openSlots, totalSlots };
-        }, handle, { includeUnavailable });
-
-        if (!row) continue;
-        const time = String(row.time || '').padStart(5, '0');
-        if (!bookableMap.has(time)) {
-          bookableMap.set(time, row);
-        }
+  for (const rowHandle of rowHandles) {
+    const rowData = await rowHandle.evaluate((row) => {
+      const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+      const match = text.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
+      if (!match) return null;
+      const time = match[0];
+      const hasUnavailable = /unavailable/i.test(text) || Array.from(row.querySelectorAll('button, [role="button"]')).some(b => b.textContent?.toLowerCase().includes('unavailable') || b.disabled || b.getAttribute('aria-disabled') === 'true');
+      const hasBook = Array.from(row.querySelectorAll('button, a, [role="button"]')).some(b => /\bbook( now)?\b/i.test(b.textContent || '')) && !hasUnavailable;
+      let state = 'unknown';
+      if (hasBook) state = 'bookable';
+      else if (hasUnavailable) state = 'unavailable';
+      return {
+        time,
+        state,
+        href: (hasBook && row.querySelector('a[href*="/bookings/book"]')) ? row.querySelector('a[href*="/bookings/book"]').href : null
+      };
+    });
+    if (rowData && rowData.time) {
+      const prev = timeMap.get(rowData.time);
+      if (!prev || (prev.state !== 'bookable' && rowData.state === 'bookable') || (prev.state === 'unknown' && rowData.state === 'unavailable')) {
+        timeMap.set(rowData.time, rowData);
       }
-    } catch (e) {
-      return;
     }
-  };
-
-  // Scroll through the page to capture virtualized lists
-  const scrollSteps = 10;
-  const scrollBy = 900;
-  for (let i = 0; i < scrollSteps; i++) {
-    await collectRows(page);
-    await page.evaluate((y) => window.scrollTo(0, y), i * scrollBy).catch(() => {});
-    await page.waitForTimeout(250);
   }
-  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
 
-  const times = Array.from(bookableMap.keys()).sort();
-  const slots = Array.from(bookableMap.values());
+  let times = Array.from(timeMap.keys()).sort();
+  let slots = Array.from(timeMap.values());
 
+  // Fallback: if no times found, try extracting from main container text
+  if (timeMap.size === 0) {
+    const fallback = await page.evaluate(() => {
+      let main = document.querySelector('main') || document.querySelector('[role="main"]');
+      if (!main) return null;
+      const text = main.textContent || '';
+      const timeRegex = /\b([01]\d|2[0-3]):[0-5]\d\b/g;
+      const found = Array.from(text.matchAll(timeRegex)).map(m => m[0]);
+      const unique = Array.from(new Set(found));
+      const unavailable = /unavailable/i.test(text);
+      return unique.map(time => ({ time, state: unavailable ? 'unavailable' : 'unknown', href: null }));
+    });
+    if (fallback && fallback.length) {
+      times = fallback.map(f => f.time).sort();
+      slots = fallback;
+    }
+  }
+
+  // 0-times diagnostic
+  let debug = undefined;
   if (times.length === 0) {
-    return { times: [], slots: [] };
+    // Take screenshot
+    const dateStr = (page.context()._dateForDiagnostics || new Date()).toISOString().slice(0, 10);
+    const teeStr = (page.context()._teeForDiagnostics || 'unknown');
+    const diagPath = path.join('output', 'diagnostics', `fetch-tee-times-${dateStr}-tee-${teeStr}.png`);
+    await fs.promises.mkdir(path.dirname(diagPath), { recursive: true }).catch(() => {});
+    await page.screenshot({ path: diagPath, fullPage: true }).catch(() => {});
+
+    const url = page.url();
+    const bodyText = await page.evaluate(() => {
+      const raw = document.body?.innerText || '';
+      return raw.replace(/\s+/g, ' ').trim();
+    });
+    const bodyTextLen = bodyText.length;
+    const first300 = bodyText.slice(0, 300);
+
+    console.log(`[0-times] URL: ${url}`);
+    console.log(`[0-times] bodyTextLen: ${bodyTextLen}`);
+    console.log(`[0-times] first300: ${first300}`);
+    debug = { url, bodyTextLen, first300, screenshotPath: diagPath };
   }
 
-  return { times, slots };
+  return { times, slots, debug };
 }
 
 // ========================================
@@ -2403,6 +2231,7 @@ async function runBooking(config) {
     cachedSelectors = {},
     useReleaseObserver = false,
     dryRun = false,
+    tee = 1,
   } = config;
   if (!username || !password) {
     throw new Error('Missing BRS credentials for booking run');
@@ -2438,6 +2267,13 @@ async function runBooking(config) {
       console.log('[WARM] Using preloaded session/page; skipping login + navigation');
     } else {
       // ...existing browser launch, login, and tee sheet navigation...
+    }
+
+    // Ensure correct tee is selected before scraping
+    try {
+      await ensureTeeSelected(page, typeof tee === 'number' ? tee : 1);
+    } catch (err) {
+      console.warn('[TEE] Failed to ensure tee selected:', err?.message || err);
     }
 
     // --- PATCH: release-watcher retries handled after timeout ---
