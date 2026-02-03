@@ -121,8 +121,8 @@ app.get('/api/self-check', (req, res) => {
 app.get('/api/version', (_req, res) => {
   res.json({
     success: true,
-    gitHash: getGitHash(),
-    branch: process.env.GIT_BRANCH || process.env.GIT_REF_NAME || 'main',
+    gitHash: DEPLOYED_GIT_HASH,
+    branch: DEPLOYED_BRANCH,
     timestamp: new Date().toISOString(),
   });
 });
@@ -548,6 +548,20 @@ function listRegisteredRoutes() {
   }
   return Array.from(routes.values()).sort();
 }
+
+const DEPLOYED_GIT_HASH =
+    process.env.RAILWAY_GIT_COMMIT_SHA ||
+    process.env.RAILWAY_GIT_SHA ||
+    process.env.GIT_SHA ||
+    process.env.SOURCE_VERSION ||
+    'unknown';
+
+const DEPLOYED_BRANCH =
+    process.env.RAILWAY_GIT_BRANCH ||
+    process.env.RAILWAY_GIT_REF_NAME ||
+    process.env.GIT_REF_NAME ||
+    process.env.GIT_BRANCH ||
+    'main';
 
 function logStartupBanner(port) {
   const expected = [
@@ -2639,6 +2653,7 @@ async function fsGetOneActiveJob() {
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
   logStartupBanner(port);
+  console.log(`[BOOT] branch=${DEPLOYED_BRANCH} gitHash=${DEPLOYED_GIT_HASH}`);
 });
 
 export {
