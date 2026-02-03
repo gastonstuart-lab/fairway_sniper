@@ -1571,62 +1571,117 @@ async function navigateToTeeSheet(page, date, allowHop = true) {
 
 async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
-  // Find all rows that could contain times (broadened selectors)
-  const rowHandles = await page.locator('tr, li, .tee-row, .slot-row, .timeslot, .slot, .availability, [data-testid*="tee"], [class*="tee"], [class*="time"], [class*="slot"]').elementHandles();
-  const timeRegex = /\b([01]\d|2[0-3]):[0-5]\d\b/;
-  const timeMap = new Map();
+  const rowSelector =
+    'tr, li, .tee-row, .slot-row, .timeslot, .slot, .availability, [data-testid*="tee"], [class*="tee"], [class*="time"], [class*="slot"]';
+  const containerSelectors = [
+    'table',
+    '[data-testid*="tee"]',
+    '[class*="tee-sheet"]',
+    '.tee-sheet',
+    '.slots-container',
+    '.slot-list',
+    '.availability',
+    '.slot-grid',
+    '.tee-grid',
+    'section',
+  ];
 
-  for (const rowHandle of rowHandles) {
-    const rowData = await rowHandle.evaluate((row) => {
-      const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
-      const match = text.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
-      if (!match) return null;
-      const time = match[0];
-      const hasUnavailable = /unavailable/i.test(text) || Array.from(row.querySelectorAll('button, [role="button"]')).some(b => b.textContent?.toLowerCase().includes('unavailable') || b.disabled || b.getAttribute('aria-disabled') === 'true');
-      const hasBook = Array.from(row.querySelectorAll('button, a, [role="button"]')).some(b => /\bbook( now)?\b/i.test(b.textContent || '')) && !hasUnavailable;
-      let state = 'unknown';
-      if (hasBook) state = 'bookable';
-      else if (hasUnavailable) state = 'unavailable';
-      return {
-        time,
-        state,
-        href: (hasBook && row.querySelector('a[href*="/bookings/book"]')) ? row.querySelector('a[href*="/bookings/book"]').href : null
-      };
-    });
-    if (rowData && rowData.time) {
-      const prev = timeMap.get(rowData.time);
-      if (!prev || (prev.state !== 'bookable' && rowData.state === 'bookable') || (prev.state === 'unknown' && rowData.state === 'unavailable')) {
-        timeMap.set(rowData.time, rowData);
-      }
-    }
-  }
-
-  let times = Array.from(timeMap.keys()).sort();
-  let slots = Array.from(timeMap.values());
-
-  // Fallback: if no times found, try extracting from main container text
-  if (timeMap.size === 0) {
-    const fallback = await page.evaluate(() => {
-      let main = document.querySelector('main') || document.querySelector('[role="main"]');
-      if (!main) return null;
-      const text = main.textContent || '';
+  const rows = await page.evaluate(
+    ({ rowSelector, containerSelectors }) => {
       const timeRegex = /\b([01]\d|2[0-3]):[0-5]\d\b/g;
-      const found = Array.from(text.matchAll(timeRegex)).map(m => m[0]);
-      const unique = Array.from(new Set(found));
-      const unavailable = /unavailable/i.test(text);
-      return unique.map(time => ({ time, state: unavailable ? 'unavailable' : 'unknown', href: null }));
-    });
-    if (fallback && fallback.length) {
-      times = fallback.map(f => f.time).sort();
-      slots = fallback;
+      const gatherButtonInfo = (row) => {
+        return Array.from(row.querySelectorAll('button, a, [role="button"]'));
+      };
+      const containers = [];
+      for (const selector of containerSelectors) {
+        const found = Array.from(document.querySelectorAll(selector));
+        for (const entry of found) {
+          if (entry && !containers.includes(entry)) {
+            containers.push(entry);
+          }
+        }
+      }
+      let bestContainer = document.body;
+      for (const container of containers) {
+        if (!container) continue;
+        const text = (container.textContent || '').replace(/\s+/g, ' ');
+        const matches = Array.from(text.matchAll(timeRegex));
+        if (matches.length < 5) continue;
+        if (!/\b(book( now)?|unavailable|availability)\b/i.test(text)) continue;
+        bestContainer = container;
+        break;
+      }
+
+      const candidateRows = Array.from(bestContainer.querySelectorAll(rowSelector));
+      const results = [];
+      for (const row of candidateRows) {
+        if (!row) continue;
+      const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+        const match = text.match(timeRegex);
+        if (!match) continue;
+        const time = match[0];
+        const buttonElements = gatherButtonInfo(row);
+        const hasUnavailable =
+          /unavailable/i.test(text) ||
+          buttonElements.some(
+            (b) =>
+              (b.textContent || '').toLowerCase().includes('unavailable') ||
+              b.disabled ||
+              b.getAttribute('aria-disabled') === 'true',
+          );
+        const hasBook =
+          buttonElements.some((b) => /\bbook( now)?\b/i.test(b.textContent || '')) && !hasUnavailable;
+        let state = 'unknown';
+        if (hasBook) state = 'bookable';
+        else if (hasUnavailable) state = 'unavailable';
+        const link = hasBook ? row.querySelector('a[href*="/bookings/book"]') : null;
+        results.push({
+          time,
+          state,
+          href: link ? link.href : null,
+        });
+      }
+      return results;
+    },
+    { rowSelector, containerSelectors },
+  );
+
+  const timeMap = new Map();
+  for (const entry of rows) {
+    if (!entry?.time) continue;
+    const prev = timeMap.get(entry.time);
+    if (
+      !prev ||
+      (prev.state !== 'bookable' && entry.state === 'bookable') ||
+      (prev.state === 'unknown' && entry.state === 'unavailable')
+    ) {
+      timeMap.set(entry.time, entry);
     }
   }
+
+  let slots = Array.from(timeMap.values());
+  slots.sort((a, b) => a.time.localeCompare(b.time));
+
+  const sunriseBlacklist = new Set(['08:05', '17:15']);
+  if (slots.length > 2) {
+    slots = slots.filter((slot, index) => {
+      if (slot.state !== 'unknown') return true;
+      if (!sunriseBlacklist.has(slot.time)) return true;
+      if (index !== 0 && index !== slots.length - 1) return true;
+      return false;
+    });
+  }
+  let times = slots.map((slot) => slot.time);
+
 
   // 0-times diagnostic
   let debug = undefined;
   if (times.length === 0) {
-    // Take screenshot
-    const dateStr = (page.context()._dateForDiagnostics || new Date()).toISOString().slice(0, 10);
+    const diagDateValue = page.context()._dateForDiagnostics;
+    const diagDate = diagDateValue ? new Date(diagDateValue) : new Date();
+    const diagIso = Number.isNaN(diagDate.getTime()) ? new Date().toISOString() : diagDate.toISOString();
+    const dateStr = diagIso.slice(0, 10);
     const teeStr = (page.context()._teeForDiagnostics || 'unknown');
     const diagPath = path.join('output', 'diagnostics', `fetch-tee-times-${dateStr}-tee-${teeStr}.png`);
     await fs.promises.mkdir(path.dirname(diagPath), { recursive: true }).catch(() => {});
@@ -1643,7 +1698,13 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
     console.log(`[0-times] URL: ${url}`);
     console.log(`[0-times] bodyTextLen: ${bodyTextLen}`);
     console.log(`[0-times] first300: ${first300}`);
-    debug = { url, bodyTextLen, first300, screenshotPath: diagPath };
+    debug = {
+      reason: 'no tee rows found',
+      url,
+      bodyTextLen,
+      first300,
+      screenshotPath: diagPath,
+    };
   }
 
   return { times, slots, debug };
