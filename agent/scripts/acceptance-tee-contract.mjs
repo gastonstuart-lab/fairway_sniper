@@ -174,6 +174,9 @@ const runDryRunBooking = async (targetDate, time, endpoint, payloadExtras = {}) 
     console.log('Agent URL:', AGENT_URL);
     const version = await fetchJson('/api/version');
     console.log('Agent version:', version);
+    const safeModeInfo = await fetchJson('/api/safe-mode');
+    console.log('SAFE_MODE status:', safeModeInfo.safeMode);
+    assert(safeModeInfo.safeMode === true, 'SAFE_MODE must be enabled in production');
 
     const weekendData = await runWeekendCheck();
     const { data: weekdayData, iso: weekdayUsed } = await findWeekdayData(WEEKDAY_DATE);

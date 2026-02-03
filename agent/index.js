@@ -128,6 +128,13 @@ app.get('/api/version', (_req, res) => {
   });
 });
 
+app.get('/api/safe-mode', (_req, res) => {
+  res.json({
+    success: true,
+    safeMode: SAFE_MODE_ENABLED,
+  });
+});
+
 const parseTeeMode = (value) => {
   const raw = String(value || '').trim().toLowerCase();
   if (raw === 'single') return 'single';
@@ -632,6 +639,14 @@ const CONFIG = {
   WARM_UP_POLL_INTERVAL_MS: Number.parseInt(process.env.WARM_UP_POLL_INTERVAL_MS || '30000', 10),
   AGENT_URL: process.env.AGENT_URL || 'https://fairwaysniper-production.up.railway.app',
 };
+
+const SAFE_MODE_ENABLED = (() => {
+  const raw = (process.env.SAFE_MODE ?? '').toString().trim().toLowerCase();
+  if (raw === '0' || raw === 'false' || raw === 'off') return false;
+  if (raw === '1' || raw === 'true' || raw === 'on') return true;
+  // Default to safe mode on when not explicitly configured
+  return true;
+})();
 
 initFirebaseAdmin();
 
@@ -2563,6 +2578,25 @@ async function runBooking(config) {
       if (!teeCtx) return 'unknown';
       return teeCtx.teeTarget === 10 ? '10TH TEE' : '1ST TEE';
     };
+    const refreshBookingSlots = async () => {
+      markDiagContext(page, targetDateStr, teeCtx?.teeTarget ?? normalizedTeeTarget);
+      try {
+        await waitForTeeRowsRendered(page);
+      } catch (err) {
+        console.warn('[TEE] Booking slots wait:', err?.message || err);
+      }
+      const { slots: scrapedSlots = [] } = await scrapeAvailableTimes(page, { includeUnavailable });
+      return scrapedSlots.map((slot) => ({
+        time: slot.time,
+        state: slot.state,
+        href: slot.href,
+        openSlots: slot.state === 'bookable' ? 3 : 0,
+      }));
+    };
+    let bookingSlots = Array.isArray(slotsData) ? [...slotsData] : [];
+    if (!bookingSlots.length) {
+      bookingSlots = await refreshBookingSlots();
+    }
 
     const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
     additionalPlayers = players.slice(0, desiredAdditionalCount);
@@ -2570,9 +2604,34 @@ async function runBooking(config) {
     console.log('\n[4/5] Executing precise timing...');
     await spinUntil(targetFireTime);
     const targetReachedAt = Date.now();
-    const buildLocatorCache = () => {
+    const availableTimeSet = new Set(bookingSlots.map((slot) => slot.time));
+    let searchTimes = normalizedPreferredTimes.filter((time) => availableTimeSet.has(time));
+    if (!searchTimes.length) {
+      const message = 'no-candidate-times-on-sheet';
+      console.warn(`[SNIPER] ${message}; requested times: ${normalizedPreferredTimes.join(', ')}`);
+      notes.push('No candidate times on tee sheet');
+      await fsFinishRun(runId, {
+        result: message,
+        notes: notes.join(' | ') || message,
+        latency_ms: Date.now() - startTime,
+        chosen_time: null,
+        fallback_level: 0,
+      });
+      if (browser && !isWarm) await browser.close();
+      return {
+        success: false,
+        result: message,
+        bookedTime: null,
+        fallbackLevel: 0,
+        latencyMs: Date.now() - startTime,
+        notes: 'No candidate times available on tee sheet',
+        playersRequested: additionalPlayers,
+        error: message,
+      };
+    }
+    const buildLocatorCache = (timesToTry) => {
       const cache = {};
-      for (const time of normalizedPreferredTimes) {
+      for (const time of timesToTry) {
         const hhmm = normalizeTimeToHHMM(time);
         if (!hhmm || hhmm.length !== 4) {
           console.log(`[WARN] Skipping invalid time format in preferredTimes: "${time}"`);
@@ -2585,16 +2644,42 @@ async function runBooking(config) {
       return cache;
     };
     let releaseResult = null;
+    if (SAFE_MODE_ENABLED && !dryRun) {
+      const safeNotes = 'SAFE_MODE prevented live booking click';
+      notes.push(safeNotes);
+      await fsFinishRun(runId, {
+        result: 'blocked-safe-mode',
+        notes: safeNotes,
+        latency_ms: Date.now() - startTime,
+        chosen_time: null,
+        fallback_level: 0,
+      });
+      if (browser && !isWarm) await browser.close();
+      return {
+        success: false,
+        result: 'blocked-safe-mode',
+        bookedTime: null,
+        fallbackLevel: 0,
+        latencyMs: Date.now() - startTime,
+        notes: safeNotes,
+        playersRequested: additionalPlayers,
+        blocked: true,
+        reason: 'SAFE_MODE enabled',
+        teeSelected: getTeeLabel(),
+        candidateTimes: searchTimes,
+        url: page.url(),
+      };
+    }
     let locatorCache = {};
     let releaseFallbackLocator = page.locator('a[href*="/bookings/book"]').first();
 
-    const runPreferredTimesLoop = async () => {
-      locatorCache = buildLocatorCache();
+    const runPreferredTimesLoop = async (timesToTry) => {
+      locatorCache = buildLocatorCache(timesToTry);
       releaseFallbackLocator = page.locator('a[href*="/bookings/book"]').first();
-      for (const [index, time] of normalizedPreferredTimes.entries()) {
+      for (const [index, time] of timesToTry.entries()) {
         try {
           console.log(`Trying time slot: ${time}`);
-          const slotInfo = slotsData.find((s) => s.time === time);
+          const slotInfo = bookingSlots.find((s) => s.time === time);
           const openSlots = slotInfo ? slotInfo.openSlots : 3;
           const bookingResult = await tryBookTime(
             page,
@@ -2677,7 +2762,7 @@ async function runBooking(config) {
           page,
           null,
           additionalPlayers,
-          slotsData[0]?.openSlots || 3,
+          bookingSlots[0]?.openSlots || 3,
           targetReachedAt,
           jobId,
           dryRun,
@@ -2797,14 +2882,40 @@ async function runBooking(config) {
         console.log('[SNIPER] Release watcher timeout — fallback to normal scan');
       }
     }
-    let bookingSuccess = await runPreferredTimesLoop();
+    let bookingSuccess = await runPreferredTimesLoop(searchTimes);
     if (!bookingSuccess && teeCtx?.fallbackTee && !fallbackTeeUsed) {
       const fallbackResult = await maybeFallbackToAltTee(page, teeCtx, 'preferred_time_not_found');
       if (fallbackResult.didFallback) {
         fallbackTeeUsed = true;
         teeCtx = { ...teeCtx, teeTarget: fallbackResult.teeTarget };
         notes.push(`[TEE] Fallback to tee ${fallbackResult.teeTarget} after primary tee had no available slots`);
-        bookingSuccess = await runPreferredTimesLoop();
+        bookingSlots = await refreshBookingSlots();
+        const fallbackTimeSet = new Set(bookingSlots.map((slot) => slot.time));
+        searchTimes = normalizedPreferredTimes.filter((time) => fallbackTimeSet.has(time));
+        if (!searchTimes.length) {
+          const message = 'no-candidate-times-on-sheet';
+          console.warn(`[SNIPER] ${message} after tee fallback`);
+          notes.push('No candidate times after tee fallback');
+          await fsFinishRun(runId, {
+            result: message,
+            notes: notes.join(' | '),
+            latency_ms: Date.now() - startTime,
+            chosen_time: null,
+            fallback_level: fallbackLevel,
+          });
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: false,
+            result: message,
+            bookedTime: null,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: 'No candidate times available on fallback tee',
+            playersRequested: additionalPlayers,
+            error: message,
+          };
+        }
+        bookingSuccess = await runPreferredTimesLoop(searchTimes);
       }
     }
     const success = !!bookedTime;
@@ -2955,6 +3066,7 @@ const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
   logStartupBanner(port);
   console.log(`[BOOT] branch=${DEPLOYED_BRANCH} gitHash=${DEPLOYED_GIT_HASH}`);
+  console.log(`[BOOT] SAFE_MODE=${SAFE_MODE_ENABLED}`);
 });
 
 export {
