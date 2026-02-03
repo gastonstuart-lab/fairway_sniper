@@ -118,6 +118,15 @@ app.get('/api/self-check', (req, res) => {
   });
 });
 
+app.get('/api/version', (_req, res) => {
+  res.json({
+    success: true,
+    gitHash: getGitHash(),
+    branch: process.env.GIT_BRANCH || process.env.GIT_REF_NAME || 'main',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Fetch available tee times for a single date
 app.post('/api/fetch-tee-times', async (req, res) => {
   let browser;
