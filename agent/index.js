@@ -127,14 +127,60 @@ app.get('/api/version', (_req, res) => {
   });
 });
 
+const parseTeeMode = (value) => {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'single') return 'single';
+  return 'both';
+};
+
+const parseTeeTarget = (value) => {
+  if (value === 10 || String(value || '').trim() === '10') return 10;
+  return 1;
+};
+
+const parseBooleanFlag = (value, fallback = false) => {
+  if (value === true || value === 'true') return true;
+  if (value === false || value === 'false') return false;
+  return fallback;
+};
+
+const markDiagContext = (page, dateStr, tee) => {
+  if (!page || !page.context) return;
+  if (dateStr) page.context()._dateForDiagnostics = dateStr;
+  page.context()._teeForDiagnostics = tee;
+};
+
+async function collectTeeResult(page, tee, dateStr, includeUnavailable = false) {
+  try {
+    await ensureTeeSelected(page, tee);
+  } catch (error) {
+    console.warn('[TEE] Failed to ensure tee selected:', error?.message || error);
+  }
+  markDiagContext(page, dateStr, tee);
+  const { times, slots, debug } = await scrapeAvailableTimes(page, { includeUnavailable });
+  return {
+    tee,
+    count: Array.isArray(times) ? times.length : 0,
+    times,
+    slots,
+    debug,
+  };
+}
+
 // Fetch available tee times for a single date
 app.post('/api/fetch-tee-times', async (req, res) => {
   let browser;
   try {
-    const { date, username, password, club, reuseBrowser = true, includeUnavailable = false } = req.body || {};
-    let tee = 1;
-    if (typeof req.body.tee === 'number') tee = req.body.tee;
-    else if (typeof req.query.tee === 'number') tee = req.query.tee;
+    const { date, username, password, club, reuseBrowser = true } = req.body || {};
+    const teeMode = parseTeeMode(req.body?.teeMode ?? req.query?.teeMode);
+    const teeTarget = parseTeeTarget(
+      req.body?.teeTarget ?? req.query?.teeTarget ?? req.body?.tee ?? req.query?.tee,
+    );
+    const includeUnavailable = parseBooleanFlag(
+      req.body?.includeUnavailable ?? req.query?.includeUnavailable,
+      false,
+    );
+
     if (!date || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing date/username/password' });
     }
@@ -152,27 +198,44 @@ app.post('/api/fetch-tee-times', async (req, res) => {
     await navigateToTeeSheet(page, date, false);
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await page.waitForTimeout(300);
-    // Ensure correct tee is selected before scraping
-    try {
-      await (await import('./ensureTeeSelected.js')).ensureTeeSelected(page, tee);
-    } catch (err) {
-      console.warn('[TEE] Failed to ensure tee selected:', err?.message || err);
-    }
     if (!pageMatchesDate(page, new Date(date))) {
       if (browser) await browser.close();
-      return res.json({ success: true, date, count: 0, times: [], slots: [] });
+      const emptyResponse =
+        teeMode === 'both'
+          ? {
+              success: true,
+              date,
+              teeMode,
+              teeTarget,
+              tee1: { tee: 1, count: 0, times: [], slots: [] },
+              tee10: { tee: 10, count: 0, times: [], slots: [] },
+            }
+          : { success: true, date, teeMode, teeTarget, count: 0, times: [], slots: [] };
+      return res.json(emptyResponse);
     }
-    // Pass tee/date for diagnostics
-    if (page && page.context) {
-      if (!page.context()._dateForDiagnostics) page.context()._dateForDiagnostics = date;
-      if (!page.context()._teeForDiagnostics) page.context()._teeForDiagnostics = tee;
+
+    const response = {
+      success: true,
+      date,
+      teeMode,
+      teeTarget,
+    };
+
+    if (teeMode === 'both') {
+      const tee1 = await collectTeeResult(page, 1, date, includeUnavailable);
+      const tee10 = await collectTeeResult(page, 10, date, includeUnavailable);
+      response.tee1 = tee1;
+      response.tee10 = tee10;
+    } else {
+      const single = await collectTeeResult(page, teeTarget, date, includeUnavailable);
+      response.count = single.count;
+      response.times = single.times;
+      response.slots = single.slots;
+      if (single.debug) response.debug = single.debug;
     }
-    const { times, slots, debug } = await scrapeAvailableTimes(page, { includeUnavailable });
 
     if (browser) await browser.close();
-    const resp = { success: true, date, count: times.length, times, slots };
-    if (debug) resp.debug = debug;
-    return res.json(resp);
+    return res.json(response);
   } catch (error) {
     if (browser) await browser.close().catch(() => {});
     return res.status(500).json({ success: false, error: error.message });
@@ -184,9 +247,14 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
   let browser;
   try {
     const { startDate, days = 5, username, password, club, reuseBrowser = true } = req.body || {};
-    let tee = 1;
-    if (typeof req.body.tee === 'number') tee = req.body.tee;
-    else if (typeof req.query.tee === 'number') tee = req.query.tee;
+    const teeMode = parseTeeMode(req.body?.teeMode ?? req.query?.teeMode);
+    const teeTarget = parseTeeTarget(
+      req.body?.teeTarget ?? req.query?.teeTarget ?? req.body?.tee ?? req.query?.tee,
+    );
+    const includeUnavailable = parseBooleanFlag(
+      req.body?.includeUnavailable ?? req.query?.includeUnavailable,
+      false,
+    );
     if (!startDate || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing startDate/username/password' });
     }
@@ -211,29 +279,48 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
     for (let i = 0; i < daysInt; i++) {
       const target = new Date(start);
       target.setDate(start.getDate() + i);
+      const targetDate = target.toISOString().slice(0, 10);
       await navigateToTeeSheet(page, target, false);
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await page.waitForTimeout(300);
-      // Ensure correct tee is selected before scraping
-      try {
-        await (await import('./ensureTeeSelected.js')).ensureTeeSelected(page, tee);
-      } catch (err) {
-        console.warn('[TEE] Failed to ensure tee selected:', err?.message || err);
-      }
       if (!pageMatchesDate(page, target)) {
-        results.push({
-          date: target.toISOString().slice(0, 10),
-          times: [],
-          slots: [],
-        });
+        const emptyEntry =
+          teeMode === 'both'
+            ? {
+                date: targetDate,
+                teeMode,
+                teeTarget,
+                tee1: { tee: 1, count: 0, times: [], slots: [] },
+                tee10: { tee: 10, count: 0, times: [], slots: [] },
+              }
+            : { date: targetDate, teeMode, teeTarget, count: 0, times: [], slots: [] };
+        results.push(emptyEntry);
         continue;
       }
-      const { times, slots } = await scrapeAvailableTimes(page);
-      results.push({
-        date: target.toISOString().slice(0, 10),
-        times,
-        slots,
-      });
+
+      if (teeMode === 'both') {
+        const tee1 = await collectTeeResult(page, 1, targetDate, includeUnavailable);
+        const tee10 = await collectTeeResult(page, 10, targetDate, includeUnavailable);
+        results.push({
+          date: targetDate,
+          teeMode,
+          teeTarget,
+          tee1,
+          tee10,
+        });
+      } else {
+        const single = await collectTeeResult(page, teeTarget, targetDate, includeUnavailable);
+        const entry = {
+          date: targetDate,
+          teeMode,
+          teeTarget,
+          count: single.count,
+          times: single.times,
+          slots: single.slots,
+        };
+        if (single.debug) entry.debug = single.debug;
+        results.push(entry);
+      }
     }
 
     if (browser) await browser.close();
