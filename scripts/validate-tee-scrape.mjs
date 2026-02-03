@@ -13,9 +13,11 @@ if (!USERNAME || !PASSWORD) {
 
 const tees = [1, 10];
 let failed = false;
+const teeResults = new Map();
 
 const formatCounts = (counts) =>
   Object.entries(counts)
+    .sort()
     .map(([state, count]) => `${state}:${count}`)
     .join(', ') || 'none';
 
@@ -25,6 +27,11 @@ const countStates = (slots = []) => {
     acc[state] = (acc[state] || 0) + 1;
     return acc;
   }, {});
+};
+
+const arraysEqual = (a = [], b = []) => {
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
 };
 
 const fetchTimes = async (tee) => {
@@ -47,28 +54,50 @@ const main = async () => {
   for (const tee of tees) {
     try {
       const result = await fetchTimes(tee);
-      const { success, times, slots } = result || {};
+      const { success, times, slots, debug } = result || {};
       if (!success || !Array.isArray(times)) {
         throw new Error(`unexpected response payload: ${JSON.stringify(result)}`);
       }
       if (times.length === 0) {
-        throw new Error('times array empty');
+        const info = debug
+          ? ` | debug url=${debug.url} bodyTextLen=${debug.bodyTextLen}`
+          : '';
+        throw new Error(`times array empty${info}`);
       }
       const stateCounts = countStates(slots);
+      teeResults.set(tee, { times, stateCounts });
       console.log(
-        `[validate-tee-scrape] tee=${tee} → ${times.length} times (states: ${formatCounts(stateCounts)})`,
+        `[validate-tee-scrape] tee=${tee} → ${times.length} times (states: ${formatCounts(stateCounts)}) | first 5: ${times
+          .slice(0, 5)
+          .join(', ')}`,
       );
     } catch (error) {
       failed = true;
       console.error(`[validate-tee-scrape] tee=${tee} ERROR: ${error.message}`);
     }
   }
+
   if (failed) {
     console.error('[validate-tee-scrape] One or more tee queries failed.');
     process.exitCode = 1;
     return;
   }
-  console.log('[validate-tee-scrape] All tee queries returned times.');
+
+  const tee1 = teeResults.get(1)?.times || [];
+  const tee10 = teeResults.get(10)?.times || [];
+  if (tee1.length === 0 || tee10.length === 0) {
+    console.error('[validate-tee-scrape] Unexpected empty tee results after validation loop.');
+    process.exitCode = 1;
+    return;
+  }
+
+  if (arraysEqual(tee1, tee10)) {
+    console.error('[validate-tee-scrape] tee=1 and tee=10 returned identical times (expected difference).');
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log('[validate-tee-scrape] tee=1 and tee=10 returned distinct time lists.');
 };
 
 main().catch((error) => {
