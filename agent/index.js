@@ -554,6 +554,7 @@ const DEPLOYED_GIT_HASH =
     process.env.RAILWAY_GIT_SHA ||
     process.env.GIT_SHA ||
     process.env.SOURCE_VERSION ||
+    getGitHash() ||
     'unknown';
 
 const DEPLOYED_BRANCH =
