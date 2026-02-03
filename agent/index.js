@@ -151,6 +151,22 @@ const markDiagContext = (page, dateStr, tee) => {
   page.context()._teeForDiagnostics = tee;
 };
 
+const TEE_ROW_SELECTOR =
+  'tr, li, .tee-row, .slot-row, .timeslot, .slot, .availability, [data-testid*="tee"], [class*="tee"], [class*="time"], [class*="slot"]';
+const TEE_CONTAINER_SELECTORS = [
+  'table',
+  '[data-testid*="tee"]',
+  '[class*="tee-sheet"]',
+  '.tee-sheet',
+  '.slots-container',
+  '.slot-list',
+  '.availability',
+  '.slot-grid',
+  '.tee-grid',
+  'section',
+];
+const TEE_TIME_REGEX_SOURCE = '\\b(?:[01]\\d|2[0-3]):[0-5]\\d\\b';
+
 async function collectTeeResult(page, tee, dateStr, includeUnavailable = false) {
   try {
     await ensureTeeSelected(page, tee);
@@ -158,6 +174,11 @@ async function collectTeeResult(page, tee, dateStr, includeUnavailable = false) 
     console.warn('[TEE] Failed to ensure tee selected:', error?.message || error);
   }
   markDiagContext(page, dateStr, tee);
+  try {
+    await waitForTeeRowsRendered(page);
+  } catch (err) {
+    console.warn('[TEE] Waiting for tee rows:', err?.message || err);
+  }
   const { times, slots, debug } = await scrapeAvailableTimes(page, { includeUnavailable });
   return {
     tee,
@@ -1495,6 +1516,39 @@ async function waitForTeeSheet(page, timeout = 30000) {
   throw new Error('Tee sheet not detected within timeout');
 }
 
+async function waitForTeeRowsRendered(page, timeoutMs = 15000) {
+  await page.waitForFunction(
+    ({ containerSelectors, rowSelector, timeRegexSource }) => {
+      const timeRegex = new RegExp(timeRegexSource);
+      const containers = [];
+      for (const selector of containerSelectors) {
+        const found = Array.from(document.querySelectorAll(selector));
+        for (const entry of found) {
+          if (entry && !containers.includes(entry)) {
+            containers.push(entry);
+          }
+        }
+      }
+      if (!containers.length) return false;
+      const loadingText = (document.body?.innerText || '').toLowerCase().includes('loading tee-times');
+      for (const container of containers) {
+        const rows = Array.from(container.querySelectorAll(rowSelector));
+        if (!rows.length) continue;
+        const matchCount = rows.filter((row) => timeRegex.test(row.textContent || '')).length;
+        const hasMarker = rows.some((row) =>
+          /\b(book( now)?|unavailable|availability)\b/i.test(row.textContent || ''),
+        );
+        if (matchCount >= 5) return true;
+        if (hasMarker) return true;
+        if (!loadingText && matchCount > 0) return true;
+      }
+      return false;
+    },
+    { containerSelectors: TEE_CONTAINER_SELECTORS, rowSelector: TEE_ROW_SELECTOR, timeRegexSource: TEE_TIME_REGEX_SOURCE },
+    { timeout: timeoutMs, polling: 400 },
+  );
+}
+
 async function loginToBRS(page, loginUrl, username, password) {
   await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await acceptCookies(page);
@@ -1571,84 +1625,79 @@ async function navigateToTeeSheet(page, date, allowHop = true) {
 
 async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
-  const rowSelector =
-    'tr, li, .tee-row, .slot-row, .timeslot, .slot, .availability, [data-testid*="tee"], [class*="tee"], [class*="time"], [class*="slot"]';
-  const containerSelectors = [
-    'table',
-    '[data-testid*="tee"]',
-    '[class*="tee-sheet"]',
-    '.tee-sheet',
-    '.slots-container',
-    '.slot-list',
-    '.availability',
-    '.slot-grid',
-    '.tee-grid',
-    'section',
-  ];
-
-  const rows = await page.evaluate(
-    ({ rowSelector, containerSelectors }) => {
-      const timeRegex = /\b([01]\d|2[0-3]):[0-5]\d\b/g;
-      const gatherButtonInfo = (row) => {
-        return Array.from(row.querySelectorAll('button, a, [role="button"]'));
-      };
-      const containers = [];
-      for (const selector of containerSelectors) {
-        const found = Array.from(document.querySelectorAll(selector));
-        for (const entry of found) {
-          if (entry && !containers.includes(entry)) {
-            containers.push(entry);
+  const { rows: scrapedRows = [], reason: scrapeReason = 'teeSheetContainerNotFound' } =
+    await page.evaluate(
+      ({ rowSelector, containerSelectors, timeRegexSource }) => {
+        const gatherButtonInfo = (row) => Array.from(row.querySelectorAll('button, a, [role="button"]'));
+        const containers = [];
+        for (const selector of containerSelectors) {
+          const found = Array.from(document.querySelectorAll(selector));
+          for (const entry of found) {
+            if (entry && !containers.includes(entry)) {
+              containers.push(entry);
+            }
           }
         }
-      }
-      let bestContainer = document.body;
-      for (const container of containers) {
-        if (!container) continue;
-        const text = (container.textContent || '').replace(/\s+/g, ' ');
-        const matches = Array.from(text.matchAll(timeRegex));
-        if (matches.length < 5) continue;
-        if (!/\b(book( now)?|unavailable|availability)\b/i.test(text)) continue;
-        bestContainer = container;
-        break;
-      }
-
-      const candidateRows = Array.from(bestContainer.querySelectorAll(rowSelector));
-      const results = [];
-      for (const row of candidateRows) {
-        if (!row) continue;
-      const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!text) continue;
-        const match = text.match(timeRegex);
-        if (!match) continue;
-        const time = match[0];
-        const buttonElements = gatherButtonInfo(row);
-        const hasUnavailable =
-          /unavailable/i.test(text) ||
-          buttonElements.some(
-            (b) =>
-              (b.textContent || '').toLowerCase().includes('unavailable') ||
-              b.disabled ||
-              b.getAttribute('aria-disabled') === 'true',
-          );
-        const hasBook =
-          buttonElements.some((b) => /\bbook( now)?\b/i.test(b.textContent || '')) && !hasUnavailable;
-        let state = 'unknown';
-        if (hasBook) state = 'bookable';
-        else if (hasUnavailable) state = 'unavailable';
-        const link = hasBook ? row.querySelector('a[href*="/bookings/book"]') : null;
-        results.push({
-          time,
-          state,
-          href: link ? link.href : null,
-        });
-      }
-      return results;
-    },
-    { rowSelector, containerSelectors },
-  );
+        const timeRegex = new RegExp(timeRegexSource);
+        let bestContainer = null;
+        for (const container of containers) {
+          if (!container) continue;
+          const candidateRows = Array.from(container.querySelectorAll(rowSelector));
+          if (!candidateRows.length) continue;
+          if (!bestContainer) bestContainer = container;
+          const matchCount = candidateRows.filter((row) => timeRegex.test(row.textContent || '')).length;
+          if (matchCount >= 5) {
+            bestContainer = container;
+            break;
+          }
+        }
+        if (!bestContainer) {
+          return { rows: [], reason: 'teeSheetContainerNotFound' };
+        }
+        const candidateRows = Array.from(bestContainer.querySelectorAll(rowSelector));
+        const results = [];
+        for (const row of candidateRows) {
+          if (!row) continue;
+          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!text) continue;
+          const match = text.match(new RegExp(timeRegexSource));
+          if (!match) continue;
+          const time = match[0];
+          const buttonElements = gatherButtonInfo(row);
+          const hasUnavailable =
+            /unavailable/i.test(text) ||
+            buttonElements.some(
+              (b) =>
+                (b.textContent || '').toLowerCase().includes('unavailable') ||
+                b.disabled ||
+                b.getAttribute('aria-disabled') === 'true',
+            );
+          const hasBook =
+            buttonElements.some((b) => /\bbook( now)?\b/i.test(b.textContent || '')) && !hasUnavailable;
+          let state = 'unknown';
+          if (hasBook) state = 'bookable';
+          else if (hasUnavailable) state = 'unavailable';
+          const link = hasBook ? row.querySelector('a[href*="/bookings/book"]') : null;
+          results.push({
+            time,
+            state,
+            href: link ? link.href : null,
+          });
+        }
+        if (!results.length) {
+          return { rows: [], reason: 'teeSheetContainerNotFound' };
+        }
+        return { rows: results };
+      },
+      {
+        rowSelector: TEE_ROW_SELECTOR,
+        containerSelectors: TEE_CONTAINER_SELECTORS,
+        timeRegexSource: TEE_TIME_REGEX_SOURCE,
+      },
+    );
 
   const timeMap = new Map();
-  for (const entry of rows) {
+  for (const entry of scrapedRows) {
     if (!entry?.time) continue;
     const prev = timeMap.get(entry.time);
     if (
@@ -1663,15 +1712,6 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   let slots = Array.from(timeMap.values());
   slots.sort((a, b) => a.time.localeCompare(b.time));
 
-  const sunriseBlacklist = new Set(['08:05', '17:15']);
-  if (slots.length > 2) {
-    slots = slots.filter((slot, index) => {
-      if (slot.state !== 'unknown') return true;
-      if (!sunriseBlacklist.has(slot.time)) return true;
-      if (index !== 0 && index !== slots.length - 1) return true;
-      return false;
-    });
-  }
   let times = slots.map((slot) => slot.time);
 
 
@@ -1698,8 +1738,17 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
     console.log(`[0-times] URL: ${url}`);
     console.log(`[0-times] bodyTextLen: ${bodyTextLen}`);
     console.log(`[0-times] first300: ${first300}`);
+    let reason = scrapeReason;
+    const lowerText = bodyText.toLowerCase();
+    if (lowerText.includes('tee times could not be loaded')) {
+      reason = 'tee sheet load error';
+    } else if (lowerText.includes('loading tee-times')) {
+      reason = 'tee sheet still loading';
+    } else {
+      reason = 'no tee rows found';
+    }
     debug = {
-      reason: 'no tee rows found',
+      reason,
       url,
       bodyTextLen,
       first300,
