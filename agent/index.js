@@ -2544,7 +2544,20 @@ async function runBooking(config) {
       isWarm = true;
       console.log('[WARM] Using preloaded session/page; skipping login + navigation');
     } else {
-      // ...existing browser launch, login, and tee sheet navigation...
+      browser = await chromium.launch({
+        headless: true,
+        args: ['--disable-blink-features=AutomationControlled'],
+      });
+      const context = await browser.newContext();
+      page = await context.newPage();
+      await loginToBRS(page, loginUrl || CONFIG.CLUB_LOGIN_URL, username, password);
+      await navigateToTeeSheet(page, teeDate, false);
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(300);
+
+      if (!pageMatchesDate(page, teeDate)) {
+        throw new Error(`Unable to open tee sheet for target date ${targetDateStr}`);
+      }
     }
 
     if (normalizedTeeMode === 'both') {
