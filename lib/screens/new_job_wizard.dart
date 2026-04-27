@@ -123,7 +123,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
       final draft = jsonDecode(draftJson) as Map<String, dynamic>;
       final timestamp = DateTime.parse(draft['timestamp'] as String? ?? '');
       final now = DateTime.now();
-      
+
       // Discard draft if older than 24 hours
       if (now.difference(timestamp).inHours > 24) {
         await prefs.remove('new_job_wizard_draft');
@@ -136,13 +136,17 @@ class _NewJobWizardState extends State<NewJobWizard> {
         _club = draft['club'] ?? 'galgorm';
         _releaseDay = draft['releaseDay'] ?? 'Tuesday';
         _releaseTime = draft['releaseTime'] ?? '19:20';
-        _targetDate = draft['targetDate'] != null ? DateTime.parse(draft['targetDate'] as String) : null;
+        _targetDate = draft['targetDate'] != null
+            ? DateTime.parse(draft['targetDate'] as String)
+            : null;
         _selectedTime = draft['selectedTime'];
-        _selectedDate = draft['selectedDate'] != null ? DateTime.parse(draft['selectedDate'] as String) : null;
+        _selectedDate = draft['selectedDate'] != null
+            ? DateTime.parse(draft['selectedDate'] as String)
+            : null;
         _additionalPlayerCount = draft['additionalPlayerCount'] ?? 1;
         _currentUserName = draft['currentUserName'];
         _allowPairing = draft['allowPairing'] ?? true;
-        
+
         final playersJson = draft['selectedPlayers'];
         if (playersJson != null) {
           _selectedPlayers = List<String>.from(jsonDecode(playersJson) as List);
@@ -233,14 +237,18 @@ class _NewJobWizardState extends State<NewJobWizard> {
       'password': diagPass,
       'club': _club,
       'reuseBrowser': true,
+      'teeMode': 'single',
+      'teeTarget': 1,
     };
     print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
     try {
-      final response = await http.post(
-        Uri.parse(fetchUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
-      );
+      final response = await http
+          .post(
+            Uri.parse(fetchUrl),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(payload),
+          )
+          .timeout(const Duration(minutes: 3));
       final body = response.body;
       final snippet = body.substring(0, body.length.clamp(0, 300));
       print(
@@ -302,9 +310,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
       setState(() => _isNextBusy = true);
       _pageController
           .nextPage(
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeInOut,
-          )
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeInOut,
+      )
           .whenComplete(() {
         if (mounted) {
           setState(() => _isNextBusy = false);
@@ -1030,7 +1038,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
       Align(
         alignment: Alignment.centerLeft,
         child: ElevatedButton.icon(
-          onPressed: canScan ? () => _refreshRangeFromAgent(forceRefresh: true) : null,
+          onPressed:
+              canScan ? () => _refreshRangeFromAgent(forceRefresh: true) : null,
           icon: const Icon(Icons.rss_feed),
           label: Text(_availabilityDays.isEmpty
               ? 'Scan Next $_rangeWindowDays Days'
@@ -1053,7 +1062,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: 'Refresh availability',
-              onPressed: canScan ? () => _refreshRangeFromAgent(forceRefresh: true) : null,
+              onPressed: canScan
+                  ? () => _refreshRangeFromAgent(forceRefresh: true)
+                  : null,
             ),
           ],
         ),
@@ -1146,7 +1157,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
                     return open >= _partySize && open == total;
                   }
 
-                  if (!hasSlotData) return true; // keep if no data so user can try
+                  if (!hasSlotData)
+                    return true; // keep if no data so user can try
                   return (summary.openSlots ?? 0) >= _partySize;
                 }).toList();
 
@@ -1330,8 +1342,7 @@ class _NewJobWizardState extends State<NewJobWizard> {
     } catch (e, st) {
       debugPrint('[AvailabilityRange] Exception: $e');
       debugPrint('[AvailabilityRange] Stack: $st');
-      error =
-          'Failed to contact agent at $baseUrl. ${_agentHelpText()} ($e)';
+      error = 'Failed to contact agent at $baseUrl. ${_agentHelpText()} ($e)';
     }
 
     if (!mounted) return;
@@ -1546,10 +1557,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
 
     try {
       final baseUrl = await getAgentBaseUrl();
-      final response =
-          await http.get(Uri.parse('$baseUrl/api/health')).timeout(
-                const Duration(seconds: 8),
-              );
+      final response = await http.get(Uri.parse('$baseUrl/api/health')).timeout(
+            const Duration(seconds: 8),
+          );
       if (!mounted) return;
       if (response.statusCode == 200) {
         setState(() {
@@ -1650,9 +1660,9 @@ class _NewJobWizardState extends State<NewJobWizard> {
       // Refresh player directory in the background to update Player 1 name.
       _playerDirectoryService
           .getDirectory(
-            username: _brsEmailController.text,
-            password: _brsPasswordController.text,
-          )
+        username: _brsEmailController.text,
+        password: _brsPasswordController.text,
+      )
           .then((directory) {
         if (!mounted) return;
         setState(() {
@@ -1782,7 +1792,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
       child: Row(
         children: [
           OutlinedButton.icon(
-            onPressed: () => Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false),
+            onPressed: () => Navigator.of(context)
+                .pushNamedAndRemoveUntil('/', (route) => false),
             icon: const Icon(Icons.home),
             label: const Text('Home'),
           ),
@@ -1798,7 +1809,8 @@ class _NewJobWizardState extends State<NewJobWizard> {
           Expanded(
             flex: 2,
             child: ElevatedButton(
-              onPressed: busy ? null : (_currentPage == 3 ? _saveJob : _nextPage),
+              onPressed:
+                  busy ? null : (_currentPage == 3 ? _saveJob : _nextPage),
               child: busy
                   ? const SizedBox(
                       width: 16,

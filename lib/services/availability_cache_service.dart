@@ -64,10 +64,14 @@ class AvailabilityCacheService {
     DateTime? startDate,
     String? club,
     bool reuseBrowser = true,
-    Duration timeout = const Duration(seconds: 90),
+    Duration? timeout,
   }) async {
-    final key =
-        buildKey(baseUrl: baseUrl, username: username, days: days, startDate: startDate, club: club);
+    final key = buildKey(
+        baseUrl: baseUrl,
+        username: username,
+        days: days,
+        startDate: startDate,
+        club: club);
     final inFlight = _inFlight[key];
     if (inFlight != null) return inFlight;
 
@@ -97,9 +101,14 @@ class AvailabilityCacheService {
     bool reuseBrowser = true,
     Duration maxAge = defaultMaxAge,
     Duration revalidateWindow = defaultRevalidateWindow,
+    Duration? timeout,
   }) async {
-    final key =
-        buildKey(baseUrl: baseUrl, username: username, days: days, startDate: startDate, club: club);
+    final key = buildKey(
+        baseUrl: baseUrl,
+        username: username,
+        days: days,
+        startDate: startDate,
+        club: club);
     final cached = getFresh(key, maxAge: maxAge);
     if (cached != null) {
       if (_needsRevalidate(cached, maxAge, revalidateWindow)) {
@@ -112,6 +121,7 @@ class AvailabilityCacheService {
           startDate: startDate,
           club: club,
           reuseBrowser: reuseBrowser,
+          timeout: timeout,
         ));
       }
       return cached;
@@ -124,6 +134,7 @@ class AvailabilityCacheService {
       startDate: startDate,
       club: club,
       reuseBrowser: reuseBrowser,
+      timeout: timeout,
     );
   }
 
@@ -135,7 +146,7 @@ class AvailabilityCacheService {
     DateTime? startDate,
     String? club,
     bool reuseBrowser = true,
-    Duration timeout = const Duration(seconds: 90),
+    Duration? timeout,
   }) async {
     final uri = Uri.parse('$baseUrl/api/fetch-tee-times-range');
     final start = startDate ?? DateTime.now();
@@ -148,6 +159,8 @@ class AvailabilityCacheService {
       'password': password,
       if (club != null) 'club': club,
       'reuseBrowser': reuseBrowser,
+      'teeMode': 'single',
+      'teeTarget': 1,
     };
 
     final response = await http
@@ -156,7 +169,7 @@ class AvailabilityCacheService {
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode(payload),
         )
-        .timeout(timeout);
+        .timeout(timeout ?? _timeoutForDays(days));
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       return null;
@@ -170,18 +183,41 @@ class AvailabilityCacheService {
     final rawDays = (decoded['days'] as List)
         .whereType<Map>()
         .map((m) => m.cast<String, dynamic>())
+        .map(_normalizeSingleTeeDay)
         .toList();
 
     final entry =
         AvailabilityCacheEntry(fetchedAt: DateTime.now(), days: rawDays);
-    _cache[
-        buildKey(
-          baseUrl: baseUrl,
-          username: username,
-          days: days,
-          startDate: startDate,
-          club: club)] =
-      entry;
+    _cache[buildKey(
+        baseUrl: baseUrl,
+        username: username,
+        days: days,
+        startDate: startDate,
+        club: club)] = entry;
     return entry;
+  }
+
+  Duration _timeoutForDays(int days) {
+    final boundedDays = days.clamp(1, 14).toInt();
+    return Duration(seconds: 45 + (boundedDays * 30));
+  }
+
+  Map<String, dynamic> _normalizeSingleTeeDay(Map<String, dynamic> day) {
+    if (day['times'] is List && day['slots'] is List) {
+      return day;
+    }
+
+    final tee1 = day['tee1'];
+    if (tee1 is Map) {
+      final normalized = Map<String, dynamic>.from(day);
+      normalized['teeMode'] = 'single';
+      normalized['teeTarget'] = 1;
+      normalized['count'] = tee1['count'];
+      normalized['times'] = tee1['times'] ?? const [];
+      normalized['slots'] = tee1['slots'] ?? const [];
+      return normalized;
+    }
+
+    return day;
   }
 }

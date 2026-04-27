@@ -260,9 +260,14 @@ class FirebaseService {
       final data = doc.data();
       final username = data?['brs_username'] as String?;
       final password = data?['brs_password'] as String?;
+      final club = data?['brs_club'] as String?;
 
       if (username != null && password != null) {
-        return {'username': username, 'password': password};
+        return {
+          'username': username,
+          'password': password,
+          if (club != null) 'club': club,
+        };
       }
       return null;
     } catch (e) {

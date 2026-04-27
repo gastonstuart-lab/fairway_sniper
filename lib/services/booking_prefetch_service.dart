@@ -41,7 +41,8 @@ class BookingPrefetchService extends ChangeNotifier {
     AvailabilityCacheService? availabilityCacheService,
   })  : _firebaseService = firebaseService ?? FirebaseService(),
         _playerDirectoryService = playerDirectoryService ??
-            PlayerDirectoryService(firebaseService: firebaseService ?? FirebaseService()),
+            PlayerDirectoryService(
+                firebaseService: firebaseService ?? FirebaseService()),
         _availabilityCacheService =
             availabilityCacheService ?? AvailabilityCacheService();
 
@@ -129,11 +130,14 @@ class BookingPrefetchService extends ChangeNotifier {
         statusText: 'Fetching players…',
       ));
 
-      await _playerDirectoryService.getDirectory(
+      final directory = await _playerDirectoryService.getDirectory(
         forceRefresh: forceRefresh,
         username: username,
         password: password,
       );
+      if (directory == null) {
+        throw StateError('Player directory fetch returned no data');
+      }
 
       _setState(BookingPrefetchState(
         step: PrefetchStep.fetchingAvailability,
@@ -141,26 +145,29 @@ class BookingPrefetchService extends ChangeNotifier {
         statusText: 'Fetching availability…',
       ));
 
-      if (forceRefresh) {
-        await _availabilityCacheService.fetchAndCache(
-          baseUrl: baseUrl,
-          username: username,
-          password: password,
-          days: 5,
-          startDate: DateTime.now(),
-          club: club,
-          reuseBrowser: false,
-        );
-      } else {
-        await _availabilityCacheService.getOrFetch(
-          baseUrl: baseUrl,
-          username: username,
-          password: password,
-          days: 5,
-          startDate: DateTime.now(),
-          club: club,
-          reuseBrowser: false,
-        );
+      final availability = forceRefresh
+          ? await _availabilityCacheService.fetchAndCache(
+              baseUrl: baseUrl,
+              username: username,
+              password: password,
+              days: 5,
+              startDate: DateTime.now(),
+              club: club,
+              reuseBrowser: false,
+              timeout: const Duration(minutes: 4),
+            )
+          : await _availabilityCacheService.getOrFetch(
+              baseUrl: baseUrl,
+              username: username,
+              password: password,
+              days: 5,
+              startDate: DateTime.now(),
+              club: club,
+              reuseBrowser: false,
+              timeout: const Duration(minutes: 4),
+            );
+      if (availability == null) {
+        throw StateError('Availability fetch returned no data');
       }
 
       _setState(BookingPrefetchState(
@@ -181,4 +188,3 @@ class BookingPrefetchService extends ChangeNotifier {
     }
   }
 }
-

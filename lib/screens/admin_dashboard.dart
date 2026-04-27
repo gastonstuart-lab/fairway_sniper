@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
-import 'package:fairway_sniper/theme/app_spacing.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 
@@ -23,7 +22,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
           children: [
             Icon(Icons.admin_panel_settings, size: 20),
             SizedBox(width: 8),
-            Text('Admin Dashboard', style: TextStyle(fontWeight: FontWeight.w600)),
+            Text('Admin Dashboard',
+                style: TextStyle(fontWeight: FontWeight.w600)),
           ],
         ),
         backgroundColor: const Color(0xFF2E7D32),
@@ -60,14 +60,16 @@ class _AdminDashboardState extends State<AdminDashboard> {
           decoration: BoxDecoration(
             border: Border(
               bottom: BorderSide(
-                color: isSelected ? const Color(0xFF2E7D32) : Colors.transparent,
+                color:
+                    isSelected ? const Color(0xFF2E7D32) : Colors.transparent,
                 width: 3,
               ),
             ),
           ),
           child: Column(
             children: [
-              Icon(icon, color: isSelected ? const Color(0xFF2E7D32) : Colors.grey),
+              Icon(icon,
+                  color: isSelected ? const Color(0xFF2E7D32) : Colors.grey),
               const SizedBox(height: 4),
               Text(
                 label,
@@ -141,7 +143,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
           Icons.golf_course,
           color: status == 'active' ? Colors.green : Colors.grey,
         ),
-        title: Text('$targetDay @ $club', style: const TextStyle(fontWeight: FontWeight.w600)),
+        title: Text('$targetDay @ $club',
+            style: const TextStyle(fontWeight: FontWeight.w600)),
         subtitle: Text('Owner: ${ownerUid.substring(0, 8)}... • $status'),
         children: [
           Padding(
@@ -149,26 +152,31 @@ class _AdminDashboardState extends State<AdminDashboard> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Job ID: $jobId', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                Text('Job ID: $jobId',
+                    style: const TextStyle(fontSize: 12, color: Colors.grey)),
                 const SizedBox(height: 8),
                 Text('Status: $status'),
                 if (createdAt != null)
-                  Text('Created: ${DateFormat('MMM dd, yyyy HH:mm').format(createdAt)}'),
+                  Text(
+                      'Created: ${DateFormat('MMM dd, yyyy HH:mm').format(createdAt)}'),
                 const SizedBox(height: 12),
                 Row(
                   children: [
                     ElevatedButton.icon(
                       onPressed: () => _toggleJobStatus(jobId, status),
-                      icon: Icon(status == 'active' ? Icons.pause : Icons.play_arrow),
+                      icon: Icon(
+                          status == 'active' ? Icons.pause : Icons.play_arrow),
                       label: Text(status == 'active' ? 'Pause' : 'Activate'),
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange),
                     ),
                     const SizedBox(width: 8),
                     ElevatedButton.icon(
                       onPressed: () => _deleteJob(jobId),
                       icon: const Icon(Icons.delete),
                       label: const Text('Delete'),
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                      style:
+                          ElevatedButton.styleFrom(backgroundColor: Colors.red),
                     ),
                   ],
                 ),
@@ -343,7 +351,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.purple,
                       foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 32, vertical: 16),
                     ),
                   ),
                 ],
@@ -360,7 +369,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     padding: EdgeInsets.all(16),
                     child: Text(
                       'Recent Agent Commands',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
                     ),
                   ),
                   const Divider(height: 1),
@@ -374,7 +384,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
                       builder: (context, snapshot) {
                         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
                           return const Center(
-                            child: Text('No commands sent yet', style: TextStyle(color: Colors.grey)),
+                            child: Text('No commands sent yet',
+                                style: TextStyle(color: Colors.grey)),
                           );
                         }
 
@@ -385,16 +396,22 @@ class _AdminDashboardState extends State<AdminDashboard> {
                             final data = doc.data() as Map<String, dynamic>;
                             final command = data['command'] ?? 'unknown';
                             final status = data['status'] ?? 'pending';
-                            final createdAt = (data['created_at'] as Timestamp?)?.toDate();
+                            final createdAt =
+                                (data['created_at'] as Timestamp?)?.toDate();
 
                             return ListTile(
                               leading: Icon(
-                                status == 'completed' ? Icons.check_circle : Icons.pending,
-                                color: status == 'completed' ? Colors.green : Colors.orange,
+                                status == 'completed'
+                                    ? Icons.check_circle
+                                    : Icons.pending,
+                                color: status == 'completed'
+                                    ? Colors.green
+                                    : Colors.orange,
                               ),
                               title: Text(command),
                               subtitle: createdAt != null
-                                  ? Text(DateFormat('HH:mm:ss').format(createdAt))
+                                  ? Text(
+                                      DateFormat('HH:mm:ss').format(createdAt))
                                   : null,
                               trailing: Text(status),
                             );
@@ -419,7 +436,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
         children: [
           Icon(icon, size: 64, color: Colors.grey.shade400),
           const SizedBox(height: 16),
-          Text(message, style: TextStyle(color: Colors.grey.shade600, fontSize: 16)),
+          Text(message,
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 16)),
         ],
       ),
     );
@@ -501,7 +519,10 @@ class _AdminDashboardState extends State<AdminDashboard> {
   }
 
   Future<void> _deleteFeedback(String feedbackId) async {
-    await FirebaseFirestore.instance.collection('feedback').doc(feedbackId).delete();
+    await FirebaseFirestore.instance
+        .collection('feedback')
+        .doc(feedbackId)
+        .delete();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Feedback deleted')),

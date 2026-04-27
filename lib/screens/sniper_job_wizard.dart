@@ -120,7 +120,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   ];
 
   List<String> _sniperGridTimes() {
-    return List<String>.from(_fallbackTimes);
+    return List<String>.from(
+      _availableTimes.isNotEmpty ? _availableTimes : _fallbackTimes,
+    );
   }
 
   void _maybeSkipCreds() {
@@ -213,14 +215,18 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       'password': diagPass,
       'club': _club,
       'reuseBrowser': true,
+      'teeMode': 'single',
+      'teeTarget': 1,
     };
     print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
     try {
-      final response = await http.post(
-        Uri.parse(fetchUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
-      );
+      final response = await http
+          .post(
+            Uri.parse(fetchUrl),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(payload),
+          )
+          .timeout(const Duration(minutes: 3));
       final body = response.body;
       final snippet = body.substring(0, body.length.clamp(0, 300));
       print(
@@ -255,7 +261,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       final draft = jsonDecode(draftJson) as Map<String, dynamic>;
       final timestamp = DateTime.parse(draft['timestamp'] as String);
       if (DateTime.now().difference(timestamp).inHours > 24) return;
-      
+
       setState(() {
         _brsUsernameController.text = draft['username'] ?? '';
         _brsPasswordController.text = draft['password'] ?? '';
@@ -270,7 +276,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         _additionalPlayerCount = draft['additionalPlayerCount'] ?? 1;
         _selectedPlayerIds.clear();
         _selectedPlayerIds.addAll(
-          (jsonDecode(draft['selectedPlayerIds'] ?? '[]') as List).cast<String>(),
+          (jsonDecode(draft['selectedPlayerIds'] ?? '[]') as List)
+              .cast<String>(),
         );
       });
     } catch (_) {}
@@ -429,26 +436,27 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         snipeStrategy: strategy,
         status: 'active', // Explicitly set to active
       );
-      
+
       print('🔵 [WIZARD] Job status before save: ${job.status}');
 
       await _firebaseService.saveBRSCredentials(
           uid, _brsUsernameController.text.trim(), _brsPasswordController.text,
           club: _club);
-      
+
       final id = await _firebaseService.createJob(job);
-      
+
       if (!mounted) return;
-      
+
       // Clear draft after successful save
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('sniper_wizard_draft');
-      
+
       Navigator.of(context).pop();
       _showSnack('✓ Sniper job created! ID: $id');
     } catch (e) {
       if (!mounted) return;
-      _showSnack('Error: ${e.toString().length > 80 ? e.toString().substring(0, 80) + '...' : e}');
+      _showSnack(
+          'Error: ${e.toString().length > 80 ? e.toString().substring(0, 80) + '...' : e}');
     } finally {
       if (mounted) {
         setState(() => _isNextBusy = false);
@@ -473,22 +481,26 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       // Sniper mode should always live-check the selected date
       // to avoid showing stale or wrong-day availability.
 
-      final response = await http.post(
-        Uri.parse('$agentUrl/api/fetch-tee-times'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'date': dateStr,
-          'username': _brsUsernameController.text.trim(),
-          'password': _brsPasswordController.text,
-          'includeUnavailable': true,
-        }),
-      );
+      final response = await http
+          .post(
+            Uri.parse('$agentUrl/api/fetch-tee-times'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'date': dateStr,
+              'username': _brsUsernameController.text.trim(),
+              'password': _brsPasswordController.text,
+              'includeUnavailable': true,
+              'teeMode': 'single',
+              'teeTarget': 1,
+            }),
+          )
+          .timeout(const Duration(minutes: 3));
 
       if (!mounted) return;
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        final List<dynamic> times = data['times'] ?? [];
+        final List<dynamic> times = _extractTimes(data);
 
         List<String> normalizeTimes(List<dynamic> raw) {
           final cleaned = raw
@@ -500,22 +512,13 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           cleaned.sort();
 
           if (cleaned.isEmpty) return _fallbackTimes;
-
-          final fallbackSet = _fallbackTimes.toSet();
-          final inFallback = cleaned.where(fallbackSet.contains).toList();
-
-          final looksLikeFallback =
-              inFallback.length >= (_fallbackTimes.length * 0.8) &&
-              inFallback.contains('08:10') &&
-              inFallback.contains('16:10');
-
-          return looksLikeFallback ? inFallback : _fallbackTimes;
+          return cleaned;
         }
 
+        final normalizedTimes = normalizeTimes(times);
         setState(() {
-          _availableTimes = normalizeTimes(times);
-          _preferredTimes.removeWhere(
-              (t) => !_fallbackTimes.contains(t));
+          _availableTimes = normalizedTimes;
+          _preferredTimes.removeWhere((t) => !normalizedTimes.contains(t));
         });
       } else {
         throw Exception('Agent returned ${response.statusCode} at $agentUrl');
@@ -529,6 +532,19 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         _availableTimes = _fallbackTimes;
       });
     }
+  }
+
+  List<dynamic> _extractTimes(dynamic decoded) {
+    if (decoded is! Map) return const [];
+    final topLevel = decoded['times'];
+    if (topLevel is List) return topLevel;
+
+    final tee1 = decoded['tee1'];
+    if (tee1 is Map && tee1['times'] is List) {
+      return tee1['times'] as List;
+    }
+
+    return const [];
   }
 
   @override
@@ -560,18 +576,18 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         child: Column(
           children: [
             // Agent health status (non-blocking badge)
-              if (!_agentHealthOk && _agentHealthBaseUrl != null)
+            if (!_agentHealthOk && _agentHealthBaseUrl != null)
               Container(
                 width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(
-                      horizontal: AppSpacing.lg,
-                      vertical: AppSpacing.sm,
-                    ),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.lg,
+                  vertical: AppSpacing.sm,
+                ),
                 color: Colors.orange.shade50,
                 child: Row(
                   children: [
-                    Icon(Icons.warning_rounded, color: Colors.orange.shade700, size: 20),
+                    Icon(Icons.warning_rounded,
+                        color: Colors.orange.shade700, size: 20),
                     const SizedBox(width: AppSpacing.sm),
                     Expanded(
                       child: Text(
@@ -584,7 +600,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     ),
                     TextButton(
                       onPressed: _testAgentConnection,
-                      child: const Text('Retry', style: TextStyle(fontSize: 12)),
+                      child:
+                          const Text('Retry', style: TextStyle(fontSize: 12)),
                     ),
                   ],
                 ),
@@ -592,17 +609,17 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             _buildStepper(),
             Expanded(
               child: PageView(
-              controller: _pageController,
-              physics: const NeverScrollableScrollPhysics(),
-              onPageChanged: (p) => setState(() => _currentPage = p),
-              children: [
-                _buildCredentialsPage(),
-                _buildDatePage(),
-                _buildPreferredTimesPage(),
-                _buildPartySizePage(),
-                _buildPlayersPage(),
-              ],
-            ),
+                controller: _pageController,
+                physics: const NeverScrollableScrollPhysics(),
+                onPageChanged: (p) => setState(() => _currentPage = p),
+                children: [
+                  _buildCredentialsPage(),
+                  _buildDatePage(),
+                  _buildPreferredTimesPage(),
+                  _buildPartySizePage(),
+                  _buildPlayersPage(),
+                ],
+              ),
             ),
             if (_currentPage == 4)
               Padding(
@@ -617,14 +634,17 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                       children: [
                         Row(
                           children: [
-                            Icon(Icons.checklist, color: Colors.white70, size: 20),
+                            Icon(Icons.checklist,
+                                color: Colors.white70, size: 20),
                             const SizedBox(width: AppSpacing.md),
                             Text(
                               'Review Your Booking',
                               style: Theme.of(context)
                                   .textTheme
                                   .titleSmall
-                                  ?.copyWith(fontWeight: FontWeight.w600, color: Colors.white),
+                                  ?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white),
                             ),
                           ],
                         ),
@@ -634,7 +654,10 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                           '• Release: ${_computedReleaseDateTime != null ? DateFormat('h:mm a').format(_computedReleaseDateTime!) : 'Not calculated'}\n'
                           '• Preferred Times: ${_preferredTimes.isNotEmpty ? _preferredTimes.join(', ') : 'Not selected'}\n'
                           '• Total Players: $_partySize',
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.white70),
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodySmall
+                              ?.copyWith(color: Colors.white70),
                         ),
                       ],
                     ),
@@ -679,10 +702,11 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     final isLastPage = _currentPage == 4;
     final canContinue = _currentPage < 4 && !_isNextBusy;
     final canSave = isLastPage && !_isNextBusy;
-    
+
     return Container(
       decoration: BoxDecoration(
-        border: Border(top: BorderSide(color: Colors.white.withValues(alpha: 0.15))),
+        border: Border(
+            top: BorderSide(color: Colors.white.withValues(alpha: 0.15))),
         color: Colors.transparent,
       ),
       padding: const EdgeInsets.all(AppSpacing.lg),
@@ -693,14 +717,16 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           Row(
             children: [
               OutlinedButton.icon(
-                onPressed: () => Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false),
+                onPressed: () => Navigator.of(context)
+                    .pushNamedAndRemoveUntil('/', (route) => false),
                 icon: const Icon(Icons.home),
                 label: const Text('Home'),
               ),
               const SizedBox(width: AppSpacing.md),
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: _currentPage == 0 || _isNextBusy ? null : _prevPage,
+                  onPressed:
+                      _currentPage == 0 || _isNextBusy ? null : _prevPage,
                   icon: const Icon(Icons.arrow_back),
                   label: const Text('Back'),
                 ),
@@ -708,7 +734,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               const SizedBox(width: AppSpacing.md),
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: canContinue ? _nextPage : (canSave ? _saveJob : null),
+                  onPressed:
+                      canContinue ? _nextPage : (canSave ? _saveJob : null),
                   icon: _isNextBusy
                       ? const SizedBox(
                           width: 16,
@@ -752,8 +779,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       _showSnack('Select a preferred time first');
       return;
     }
-    final time =
-        _preferredTimes.isNotEmpty ? _preferredTimes.first : _availableTimes.first;
+    final time = _preferredTimes.isNotEmpty
+        ? _preferredTimes.first
+        : _availableTimes.first;
 
     setState(() {
       _sniperTestRunning = true;
@@ -983,7 +1011,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   Widget _buildDatePage() {
     final releaseDay = _computedReleaseDateTime?.toLocal() ?? DateTime.now();
     final daysUntilRelease = releaseDay.difference(DateTime.now()).inDays;
-    
+
     return SingleChildScrollView(
       padding: const EdgeInsets.all(AppSpacing.xl),
       child: Column(
@@ -1064,9 +1092,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                   children: [
                     Row(
                       children: [
-                        Icon(Icons.alarm, 
-                          color: Colors.blue.shade700, 
-                          size: 22),
+                        Icon(Icons.alarm,
+                            color: Colors.blue.shade700, size: 22),
                         const SizedBox(width: 8),
                         Text('Release Window',
                             style: Theme.of(context)
@@ -1080,12 +1107,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     const SizedBox(height: AppSpacing.md),
                     Text(
                       DateFormat("EEEE, MMM d 'at' h:mm a").format(releaseDay),
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyLarge
-                          ?.copyWith(
-                              fontWeight: FontWeight.w600,
-                              color: Colors.blue.shade900),
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          color: Colors.blue.shade900),
                     ),
                     const SizedBox(height: 8),
                     if (daysUntilRelease > 0)
@@ -1107,12 +1131,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     const SizedBox(height: AppSpacing.md),
                     Text(
                       '💡 The sniper will automatically log in and attempt to book your preferred times at exactly this moment.',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall
-                          ?.copyWith(
-                              fontStyle: FontStyle.italic,
-                              color: Colors.blue.shade800),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          fontStyle: FontStyle.italic,
+                          color: Colors.blue.shade800),
                     ),
                   ],
                 ),
@@ -1153,9 +1174,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                 children: [
                   Row(
                     children: [
-                      Icon(Icons.info_outline, 
-                        color: Colors.amber.shade700, 
-                        size: 18),
+                      Icon(Icons.info_outline,
+                          color: Colors.amber.shade700, size: 18),
                       const SizedBox(width: AppSpacing.sm),
                       Expanded(
                         child: Text(
@@ -1192,25 +1212,28 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             ...List.generate(
                 _preferredTimes.length,
                 (i) => Padding(
-                  padding: const EdgeInsets.only(bottom: AppSpacing.sm),
-                  child: Card(
-                    color: Colors.blue.shade50,
-                    child: ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor: Colors.blue,
-                        child: Text('${i + 1}',
-                            style: const TextStyle(color: Colors.white)),
+                      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+                      child: Card(
+                        color: Colors.blue.shade50,
+                        child: ListTile(
+                          leading: CircleAvatar(
+                            backgroundColor: Colors.blue,
+                            child: Text('${i + 1}',
+                                style: const TextStyle(color: Colors.white)),
+                          ),
+                          title: Text(_preferredTimes[i],
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 16,
+                                  color: Colors.black87)),
+                          trailing: IconButton(
+                              icon: const Icon(Icons.delete_outline,
+                                  color: Colors.black54),
+                              onPressed: () =>
+                                  setState(() => _preferredTimes.removeAt(i))),
+                        ),
                       ),
-                      title: Text(_preferredTimes[i],
-                          style: const TextStyle(
-                              fontWeight: FontWeight.w600, fontSize: 16, color: Colors.black87)),
-                      trailing: IconButton(
-                          icon: const Icon(Icons.delete_outline, color: Colors.black54),
-                          onPressed: () =>
-                              setState(() => _preferredTimes.removeAt(i))),
-                    ),
-                  ),
-                )),
+                    )),
             const SizedBox(height: AppSpacing.lg),
           ],
           Text('Available Times',
@@ -1225,16 +1248,19 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             children: displayTimes
                 .where((t) => !_preferredTimes.contains(t))
                 .map((t) => ActionChip(
-                  label: Text(t, style: const TextStyle(color: Colors.black87, fontWeight: FontWeight.w600)),
-                  backgroundColor: Colors.white,
-                  onPressed: () {
-                    if (_preferredTimes.length < 3) {
-                      setState(() => _preferredTimes.add(t));
-                    } else {
-                      _showSnack('Maximum 3 times selected');
-                    }
-                  },
-                ))
+                      label: Text(t,
+                          style: const TextStyle(
+                              color: Colors.black87,
+                              fontWeight: FontWeight.w600)),
+                      backgroundColor: Colors.white,
+                      onPressed: () {
+                        if (_preferredTimes.length < 3) {
+                          setState(() => _preferredTimes.add(t));
+                        } else {
+                          _showSnack('Maximum 3 times selected');
+                        }
+                      },
+                    ))
                 .toList(),
           ),
         ],
@@ -1263,28 +1289,30 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             spacing: AppSpacing.md,
             children: [0, 1, 2, 3]
                 .map((count) => ChoiceChip(
-                  label: Text(
-                    count == 0 ? 'Just me' : '+ $count player${count > 1 ? 's' : ''}',
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                  selected: _additionalPlayerCount == count,
-                  selectedColor: Colors.blue,
-                  labelStyle: TextStyle(
-                    color: _additionalPlayerCount == count
-                        ? Colors.white
-                        : Colors.grey.shade700,
-                  ),
-                  onSelected: (_) {
-                    setState(() {
-                      _additionalPlayerCount = count;
-                      final maxAdditional = _additionalPlayerCount;
-                      if (_selectedPlayerIds.length > maxAdditional) {
-                        _selectedPlayerIds =
-                            _selectedPlayerIds.sublist(0, maxAdditional);
-                      }
-                    });
-                  },
-                ))
+                      label: Text(
+                        count == 0
+                            ? 'Just me'
+                            : '+ $count player${count > 1 ? 's' : ''}',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      selected: _additionalPlayerCount == count,
+                      selectedColor: Colors.blue,
+                      labelStyle: TextStyle(
+                        color: _additionalPlayerCount == count
+                            ? Colors.white
+                            : Colors.grey.shade700,
+                      ),
+                      onSelected: (_) {
+                        setState(() {
+                          _additionalPlayerCount = count;
+                          final maxAdditional = _additionalPlayerCount;
+                          if (_selectedPlayerIds.length > maxAdditional) {
+                            _selectedPlayerIds =
+                                _selectedPlayerIds.sublist(0, maxAdditional);
+                          }
+                        });
+                      },
+                    ))
                 .toList(),
           ),
           const SizedBox(height: AppSpacing.xl),
@@ -1297,12 +1325,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                 _additionalPlayerCount == 0
                     ? '🎯 Booking for yourself only'
                     : '🎯 You + $_additionalPlayerCount more = total $_partySize players',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodyMedium
-                    ?.copyWith(
-                        color: Colors.blue.shade900,
-                        fontWeight: FontWeight.w600),
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Colors.blue.shade900, fontWeight: FontWeight.w600),
               ),
             ),
           ),
@@ -1393,8 +1417,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                         color: Colors.white.withValues(alpha: 0.1),
                         shape: BoxShape.circle,
                       ),
-                      child: Icon(Icons.person,
-                          color: Colors.white54, size: 24),
+                      child:
+                          Icon(Icons.person, color: Colors.white54, size: 24),
                     ),
                     const SizedBox(width: AppSpacing.lg),
                     Column(
@@ -1530,10 +1554,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
 
     try {
       final baseUrl = await getAgentBaseUrl();
-      final response =
-          await http.get(Uri.parse('$baseUrl/api/health')).timeout(
-                const Duration(seconds: 8),
-              );
+      final response = await http.get(Uri.parse('$baseUrl/api/health')).timeout(
+            const Duration(seconds: 8),
+          );
       if (!mounted) return;
       if (response.statusCode == 200) {
         setState(() {
@@ -1621,7 +1644,12 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       directoryService: _playerDirectoryService,
       initialSelectedIds: _selectedPlayerIds,
       returnIds: true,
-      allowedCategories: const ['You', 'You and your buddies', 'Members', 'Guests'],
+      allowedCategories: const [
+        'You',
+        'You and your buddies',
+        'Members',
+        'Guests'
+      ],
       maxPlayers: _additionalPlayerCount,
       username: _brsUsernameController.text.trim(),
       password: _brsPasswordController.text,
@@ -1636,9 +1664,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       // Refresh labels in the background; keep UI responsive.
       _playerDirectoryService
           .getDirectory(
-            username: _brsUsernameController.text.trim(),
-            password: _brsPasswordController.text,
-          )
+        username: _brsUsernameController.text.trim(),
+        password: _brsPasswordController.text,
+      )
           .then((directory) {
         if (!mounted) return;
         final map = <String, String>{};

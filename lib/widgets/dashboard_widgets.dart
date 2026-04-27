@@ -44,8 +44,8 @@ class DashboardWelcomeCard extends StatelessWidget {
                 const SizedBox(width: AppSpacing.sm),
                 Text(
                   'Welcome back, $name',
-                  style: theme.textTheme.titleMedium
-                      ?.copyWith(fontWeight: FontWeight.w700, color: Colors.black87),
+                  style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700, color: Colors.black87),
                 ),
               ],
             ),
@@ -118,8 +118,8 @@ class DashboardPrefetchCard extends StatelessWidget {
                 const SizedBox(width: AppSpacing.sm),
                 Text(
                   'Prepare Booking Data',
-                  style: theme.textTheme.titleMedium
-                      ?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
+                  style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600, color: Colors.black87),
                 ),
                 const Spacer(),
                 TextButton(
@@ -157,7 +157,9 @@ class DashboardPrefetchCard extends StatelessWidget {
             if (hasError) ...[
               const SizedBox(height: 6),
               Text(
-                'Prefetch failed. You can still use the app.',
+                state.error?.isNotEmpty == true
+                    ? state.error!
+                    : 'Prefetch failed. You can still use the app.',
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: Colors.grey.shade700),
               ),
@@ -238,7 +240,7 @@ class DashboardWeatherCard extends StatelessWidget {
                       ),
                     ),
                     Text(
-                      '${currentTemp}°F',
+                      '$currentTemp°F',
                       style: theme.textTheme.bodyLarge
                           ?.copyWith(color: Colors.grey.shade700),
                     ),
@@ -257,7 +259,7 @@ class DashboardWeatherCard extends StatelessWidget {
                           color: Colors.grey.shade700,
                         )),
                     const SizedBox(height: AppSpacing.xs),
-                    Text('${currentWind} mph',
+                    Text('$currentWind mph',
                         style: theme.textTheme.bodyMedium?.copyWith(
                           fontWeight: FontWeight.w600,
                           color: Colors.black87,
@@ -316,15 +318,15 @@ class DashboardJobsList extends StatelessWidget {
               Text(
                 'No booking jobs yet',
                 style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  color: Colors.black87,
-                ),
+                      color: Colors.black87,
+                    ),
               ),
               const SizedBox(height: AppSpacing.xs),
               Text(
                 'Create one to get started!',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Colors.grey.shade700,
-                ),
+                      color: Colors.grey.shade700,
+                    ),
               ),
             ],
           ),
@@ -353,8 +355,9 @@ class DashboardJobsList extends StatelessWidget {
   Widget _buildJobCard(BuildContext context, BookingJob job) {
     final theme = Theme.of(context);
     final isActive = job.status == 'active';
-    final statusColor =
-        isActive ? AppColors.success : (job.status == 'completed' ? AppColors.info : Colors.orange);
+    final statusColor = isActive
+        ? AppColors.success
+        : (job.status == 'completed' ? AppColors.info : Colors.orange);
     final playDate = job.targetPlayDate ?? DateTime.now();
     final playerCount = job.partySize ?? job.players.length;
 
