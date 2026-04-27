@@ -81,7 +81,7 @@ test('book-now handles non-warm path without undefined page crash', async () => 
     username,
     password,
     targetDate,
-    preferredTimes: ['08:30', '09:00', '09:30'],
+    preferredTimes: ['23:59'],
     players: [685],
   };
 
