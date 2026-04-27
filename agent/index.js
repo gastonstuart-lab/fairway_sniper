@@ -135,6 +135,21 @@ app.get('/api/safe-mode', (_req, res) => {
   });
 });
 
+app.get('/api/runtime-status', (_req, res) => {
+  res.json({
+    success: true,
+    safeMode: SAFE_MODE_ENABLED,
+    firebaseAdminReady,
+    firebaseAdminError,
+    agentRunMain: process.env.AGENT_RUN_MAIN === 'true',
+    sniperRunnerStarted,
+    activeSniperTimers: jobTimers.size,
+    gitHash: DEPLOYED_GIT_HASH,
+    branch: DEPLOYED_BRANCH,
+    time: new Date().toISOString(),
+  });
+});
+
 const parseTeeMode = (value) => {
   const raw = String(value || '').trim().toLowerCase();
   if (raw === 'single') return 'single';
@@ -584,6 +599,9 @@ process.on('uncaughtException', (err) => {
 // ========================================
 
 let db = null;
+let firebaseAdminReady = false;
+let firebaseAdminError = null;
+let sniperRunnerStarted = false;
 
 function initFirebaseAdmin() {
   const projectId = process.env.FIREBASE_PROJECT_ID;
@@ -608,8 +626,12 @@ function initFirebaseAdmin() {
       });
     }
     db = admin.firestore();
+    firebaseAdminReady = true;
+    firebaseAdminError = null;
     console.log('✅ Firebase Admin initialized');
   } catch (error) {
+    firebaseAdminReady = false;
+    firebaseAdminError = error?.message || String(error);
     console.error('❌ Firebase Admin init failed:', error);
   }
 }
@@ -1306,9 +1328,11 @@ function startWarmUpScheduler() {
 
 function startSniperRunner() {
   if (!db) {
+    sniperRunnerStarted = false;
     console.log('[RUNNER] Firebase Admin not configured; runner disabled');
     return;
   }
+  sniperRunnerStarted = true;
   console.log('[RUNNER] Sniper job runner started');
   resumeRunningJobs().catch((e) => console.error('[RUNNER] resume error:', e.message));
 
