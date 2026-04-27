@@ -745,6 +745,21 @@ const CONFIG = {
     process.env.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS || '750',
     10,
   ),
+  SNIPER_RELEASE_ARM_LEAD_MS: Number.parseInt(process.env.SNIPER_RELEASE_ARM_LEAD_MS || '500', 10),
+  SNIPER_DIRECT_POLL_ENABLED: process.env.SNIPER_DIRECT_POLL_ENABLED !== 'false',
+  SNIPER_DIRECT_POLL_MS: Number.parseInt(process.env.SNIPER_DIRECT_POLL_MS || '6500', 10),
+  SNIPER_DIRECT_POLL_INTERVAL_MS: Number.parseInt(
+    process.env.SNIPER_DIRECT_POLL_INTERVAL_MS || '125',
+    10,
+  ),
+  SNIPER_DIRECT_POLL_REQUEST_TIMEOUT_MS: Number.parseInt(
+    process.env.SNIPER_DIRECT_POLL_REQUEST_TIMEOUT_MS || '2500',
+    10,
+  ),
+  SNIPER_DIRECT_POLL_MAX_IN_FLIGHT: Number.parseInt(
+    process.env.SNIPER_DIRECT_POLL_MAX_IN_FLIGHT || '4',
+    10,
+  ),
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
   SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '10', 10),
   DRY_RUN: process.argv.includes('--dry-run'),
@@ -1775,6 +1790,11 @@ function teeSheetUrlForDate(date) {
   return `https://members.brsgolf.com/galgorm/tee-sheet/1/${year}/${month}/${day}`;
 }
 
+function teeSheetDataUrlForDate(date) {
+  const { year, month, day } = datePartsForTeeSheet(date);
+  return `https://members.brsgolf.com/galgorm/tee-sheet/data/1/${year}/${month}/${day}?_=${Date.now()}`;
+}
+
 function pageMatchesDate(page, date) {
   try {
     const parts = datePartsForTeeSheet(date);
@@ -2544,6 +2564,235 @@ async function executeReleaseBooking(
   return { booked, confirmationText, playersFilled, clickDeltaMs: fireLatencyMs };
 }
 
+async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, targetFireTime) {
+  if (!page?.context) {
+    return { found: false, reason: 'missing-page-context', candidates: [] };
+  }
+
+  const timeoutMs = Number.isFinite(CONFIG.SNIPER_DIRECT_POLL_MS)
+    ? Math.max(500, CONFIG.SNIPER_DIRECT_POLL_MS)
+    : 6500;
+  const intervalMs = Number.isFinite(CONFIG.SNIPER_DIRECT_POLL_INTERVAL_MS)
+    ? Math.max(25, CONFIG.SNIPER_DIRECT_POLL_INTERVAL_MS)
+    : 125;
+  const requestTimeoutMs = Number.isFinite(CONFIG.SNIPER_DIRECT_POLL_REQUEST_TIMEOUT_MS)
+    ? Math.max(500, CONFIG.SNIPER_DIRECT_POLL_REQUEST_TIMEOUT_MS)
+    : 2500;
+  const maxInFlight = Number.isFinite(CONFIG.SNIPER_DIRECT_POLL_MAX_IN_FLIGHT)
+    ? Math.max(1, CONFIG.SNIPER_DIRECT_POLL_MAX_IN_FLIGHT)
+    : 4;
+  const deadline = Date.now() + timeoutMs;
+  const preferredLabels = normalizeStringList(preferredTimes)
+    .map((time) => normalizeTimeLabel(time))
+    .filter(Boolean);
+  let attempt = 0;
+  let lastStatus = null;
+  let lastError = null;
+  let lastCandidateCount = 0;
+  let lastAvailableTimes = [];
+  const inFlight = new Set();
+  let nextLaunchAt = Date.now();
+  let pollResolved = false;
+
+  console.log(
+    `[SNIPER] Direct HTML poll armed for ${targetDateStr}; preferred=${preferredLabels.join(', ')} timeout=${timeoutMs}ms interval=${intervalMs}ms maxInFlight=${maxInFlight}`,
+  );
+
+  const launchAttempt = () => {
+    attempt += 1;
+    const currentAttempt = attempt;
+    const requestStarted = Date.now();
+    const promise = (async () => {
+      try {
+        const response = await page.context().request.get(teeSheetDataUrlForDate(targetDateStr), {
+          headers: {
+            'x-requested-with': 'XMLHttpRequest',
+            accept: 'application/json, text/javascript, */*; q=0.01',
+            'cache-control': 'no-cache, no-store, max-age=0',
+            pragma: 'no-cache',
+          },
+          timeout: requestTimeoutMs,
+        });
+        const httpStatus = response.status();
+        const payloadText = await response.text();
+        const extracted = extractPreferredBookingLinks(payloadText, preferredTimes, targetDateStr);
+        const detectAt = Date.now();
+        if (extracted.found && !pollResolved) {
+          pollResolved = true;
+          console.log(
+            `[SNIPER] Direct HTML poll found ${extracted.candidates.length} preferred link(s) on attempt ${currentAttempt}: ${extracted.availableTimes.join(', ')}`,
+          );
+        }
+        return {
+          found: extracted.found,
+          source: 'direct-html-poll',
+          candidates: extracted.candidates,
+          availableTimes: extracted.availableTimes,
+          preferredTimes: extracted.preferredTimes,
+          attempt: currentAttempt,
+          httpStatus,
+          requestLatencyMs: detectAt - requestStarted,
+          detectDeltaMs:
+            Number.isFinite(targetFireTime) ? detectAt - targetFireTime : null,
+          candidateCount: extracted.candidates.length,
+        };
+      } catch (error) {
+        const message = error?.message || String(error);
+        console.warn(`[SNIPER] Direct HTML poll attempt ${currentAttempt} failed: ${message}`);
+        return {
+          found: false,
+          source: 'direct-html-poll',
+          candidates: [],
+          availableTimes: [],
+          attempt: currentAttempt,
+          error: message,
+          candidateCount: 0,
+        };
+      }
+    })();
+    inFlight.add(promise);
+    promise.finally(() => inFlight.delete(promise));
+  };
+
+  while (Date.now() < deadline || inFlight.size > 0) {
+    while (Date.now() < deadline && inFlight.size < maxInFlight && Date.now() >= nextLaunchAt) {
+      launchAttempt();
+      nextLaunchAt += intervalMs;
+    }
+
+    if (!inFlight.size) {
+      await page.waitForTimeout(Math.min(25, Math.max(1, nextLaunchAt - Date.now())));
+      continue;
+    }
+
+    const waitMs = Date.now() < deadline
+      ? Math.min(25, Math.max(1, nextLaunchAt - Date.now()))
+      : 25;
+    const completed = await Promise.race([
+      ...Array.from(inFlight),
+      new Promise((resolve) => setTimeout(() => resolve(null), waitMs)),
+    ]);
+    if (!completed) continue;
+
+    lastStatus = completed.httpStatus ?? lastStatus;
+    lastError = completed.error ?? lastError;
+    lastCandidateCount = completed.candidateCount ?? lastCandidateCount;
+    lastAvailableTimes = completed.availableTimes?.length ? completed.availableTimes : lastAvailableTimes;
+    if (completed.found) {
+      return completed;
+    }
+  }
+
+  return {
+    found: false,
+    source: 'direct-html-poll',
+    candidates: [],
+    availableTimes: lastAvailableTimes,
+    attempt,
+    httpStatus: lastStatus,
+    error: lastError,
+    candidateCount: lastCandidateCount,
+  };
+}
+
+async function tryDirectBookingHref(
+  page,
+  candidate,
+  players = [],
+  openSlots = 3,
+  targetFireTime = Date.now(),
+  jobId = null,
+  dryRun = false,
+) {
+  const time = candidate?.time || 'release';
+  const href = candidate?.href;
+  if (!href) {
+    return { booked: false, error: 'missing-direct-booking-href' };
+  }
+
+  const clickDeltaMs = Date.now() - targetFireTime;
+  console.log(`[SNIPER] DIRECT BOOKING NAV ${time} delta=${clickDeltaMs}ms`);
+  if (clickDeltaMs > 250) {
+    console.log('⚠️ DIRECT FIRE DELTA TOO HIGH');
+    if (jobId) {
+      logJobEvent(jobId, `⚠️ DIRECT FIRE DELTA TOO HIGH (${clickDeltaMs}ms)`);
+    }
+  }
+
+  const navigationStarted = Date.now();
+  await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 12000 });
+  const navigationMs = Date.now() - navigationStarted;
+  await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
+
+  const formSelector = '#member_booking_form_confirm_booking, form[name="member_booking_form"]';
+  const formVisible = await page
+    .locator(formSelector)
+    .first()
+    .isVisible({ timeout: 2500 })
+    .catch(() => false);
+
+  if (!formVisible) {
+    const bodyText = await page
+      .locator('body')
+      .innerText({ timeout: 1000 })
+      .catch(() => '');
+    const reason = /unavailable|already|not available|fully booked|no longer|error|invalid/i.test(bodyText)
+      ? 'slot-not-bookable-after-direct-nav'
+      : 'booking-form-not-found-after-direct-nav';
+    return {
+      booked: false,
+      error: reason,
+      clickDeltaMs,
+      navigationMs,
+      verificationUrl: page.url(),
+      bodySnippet: bodyText.replace(/\s+/g, ' ').trim().slice(0, 180),
+    };
+  }
+
+  const confirmResult = await fillPlayersAndConfirm(page, players, openSlots, dryRun);
+  if (dryRun) {
+    return {
+      booked: false,
+      dryRun: true,
+      confirmationText: confirmResult.confirmationText,
+      playersFilled: confirmResult.filled,
+      playersRequested: players.slice(0, Math.min(openSlots, 3)),
+      clickDeltaMs,
+      navigationMs,
+      verificationSignal: 'dry-run',
+      verificationUrl: page.url(),
+    };
+  }
+
+  const verification = await verifyBookingConfirmation(page, time, 8000);
+  const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
+  if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
+    verification.confirmed = false;
+    verification.verificationSignal = 'players-missing';
+  }
+
+  return {
+    booked:
+      verification.confirmed &&
+      confirmResult.confirmationText !== 'confirm-button-not-found',
+    playersFilled: confirmResult.filled,
+    playersRequested: players.slice(0, Math.min(openSlots, 3)),
+    confirmationText: confirmResult.confirmationText,
+    skippedReason: confirmResult.skippedReason,
+    verificationSignal: verification.verificationSignal,
+    verificationUrl: verification.verificationUrl,
+    bookingLinksCountAfterClick: verification.bookingLinksCountAfterClick,
+    clickDeltaMs,
+    navigationMs,
+    error:
+      !verification.confirmed
+        ? 'direct-clicked-but-no-confirmation'
+        : confirmResult.confirmationText === 'confirm-button-not-found'
+          ? 'confirm-button-not-found'
+          : null,
+  };
+}
+
 async function verifyBookingConfirmation(page, timeLabel, timeoutMs = 10000) {
   const start = Date.now();
   const textLocator = page
@@ -2644,6 +2893,153 @@ function normalizeTimeToHHMM(value) {
   const digits = String(value || '').replace(/\D/g, '');
   if (!digits) return '';
   return digits.padStart(4, '0').slice(-4);
+}
+
+function normalizeTimeLabel(value) {
+  const hhmm = normalizeTimeToHHMM(value);
+  if (!hhmm || hhmm.length !== 4) return null;
+  const hours = Number.parseInt(hhmm.slice(0, 2), 10);
+  const mins = Number.parseInt(hhmm.slice(2), 10);
+  if (Number.isNaN(hours) || Number.isNaN(mins)) return null;
+  if (hours < 0 || hours > 23 || mins < 0 || mins > 59) return null;
+  return `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`;
+}
+
+function compactDateKey(value) {
+  const normalized = normalizeDateKey(value);
+  return normalized ? normalized.replace(/-/g, '') : null;
+}
+
+function decodeHtmlAttribute(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function extractPreferredBookingLinksFromHtml(html, preferredTimes, targetDateKey) {
+  const targetDateCompact = compactDateKey(targetDateKey);
+  const preferredLabels = Array.from(
+    new Set(
+      normalizeStringList(preferredTimes)
+        .map((time) => normalizeTimeLabel(time))
+        .filter(Boolean),
+    ),
+  );
+  const preferredIndex = new Map(preferredLabels.map((time, index) => [time, index]));
+  const foundByTime = new Map();
+  const hrefRegex = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  let match;
+
+  while ((match = hrefRegex.exec(String(html || ''))) !== null) {
+    const rawHref = decodeHtmlAttribute(match[1] || match[2] || match[3] || '');
+    if (!rawHref.includes('/bookings/book/')) continue;
+
+    let parsed;
+    try {
+      parsed = new URL(rawHref, 'https://members.brsgolf.com');
+    } catch {
+      continue;
+    }
+
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    const timeSegment = segments[segments.length - 1];
+    const dateSegment = segments[segments.length - 2];
+    const timeLabel = normalizeTimeLabel(timeSegment);
+    if (!timeLabel) continue;
+    if (targetDateCompact && dateSegment !== targetDateCompact) continue;
+    if (preferredLabels.length > 0 && !preferredIndex.has(timeLabel)) continue;
+    if (foundByTime.has(timeLabel)) continue;
+
+    foundByTime.set(timeLabel, {
+      time: timeLabel,
+      href: parsed.href,
+      preferredIndex: preferredIndex.has(timeLabel) ? preferredIndex.get(timeLabel) : foundByTime.size,
+    });
+  }
+
+  const candidates = Array.from(foundByTime.values()).sort((a, b) => {
+    if (a.preferredIndex !== b.preferredIndex) return a.preferredIndex - b.preferredIndex;
+    return a.time.localeCompare(b.time);
+  });
+
+  return {
+    found: candidates.length > 0,
+    candidates,
+    availableTimes: candidates.map((candidate) => candidate.time),
+    preferredTimes: preferredLabels,
+  };
+}
+
+function extractPreferredBookingLinksFromTeeData(payload, preferredTimes, targetDateKey) {
+  const preferredLabels = Array.from(
+    new Set(
+      normalizeStringList(preferredTimes)
+        .map((time) => normalizeTimeLabel(time))
+        .filter(Boolean),
+    ),
+  );
+  const preferredIndex = new Map(preferredLabels.map((time, index) => [time, index]));
+  const targetDateCompact = compactDateKey(targetDateKey);
+  const candidates = [];
+  const times = payload?.times && typeof payload.times === 'object' ? payload.times : {};
+  const labelsToCheck = preferredLabels.length ? preferredLabels : Object.keys(times);
+
+  for (const timeLabel of labelsToCheck) {
+    const normalizedTime = normalizeTimeLabel(timeLabel);
+    if (!normalizedTime) continue;
+    const entry = times[normalizedTime] || times[timeLabel];
+    const urlValue = entry?.tee_time?.url || entry?.url || entry?.href;
+    if (!urlValue) continue;
+
+    let parsed;
+    try {
+      parsed = new URL(decodeHtmlAttribute(urlValue), 'https://members.brsgolf.com');
+    } catch {
+      continue;
+    }
+
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    const timeSegment = normalizeTimeLabel(segments[segments.length - 1]);
+    const dateSegment = segments[segments.length - 2];
+    if (timeSegment && timeSegment !== normalizedTime) continue;
+    if (targetDateCompact && dateSegment !== targetDateCompact) continue;
+
+    candidates.push({
+      time: normalizedTime,
+      href: parsed.href,
+      preferredIndex: preferredIndex.has(normalizedTime)
+        ? preferredIndex.get(normalizedTime)
+        : candidates.length,
+      bookable: entry?.tee_time?.bookable ?? entry?.bookable ?? null,
+      editable: entry?.tee_time?.editable ?? entry?.editable ?? null,
+    });
+  }
+
+  candidates.sort((a, b) => {
+    if (a.preferredIndex !== b.preferredIndex) return a.preferredIndex - b.preferredIndex;
+    return a.time.localeCompare(b.time);
+  });
+
+  return {
+    found: candidates.length > 0,
+    candidates,
+    availableTimes: candidates.map((candidate) => candidate.time),
+    preferredTimes: preferredLabels,
+  };
+}
+
+function extractPreferredBookingLinks(payloadText, preferredTimes, targetDateKey) {
+  try {
+    const parsed = JSON.parse(String(payloadText || ''));
+    const extracted = extractPreferredBookingLinksFromTeeData(parsed, preferredTimes, targetDateKey);
+    if (extracted.found) return extracted;
+  } catch {
+    // Fall back to HTML extraction below.
+  }
+  return extractPreferredBookingLinksFromHtml(payloadText, preferredTimes, targetDateKey);
 }
 
 function timeToMinutes(value) {
@@ -2816,7 +3212,7 @@ async function runBooking(config) {
       }));
     };
     let bookingSlots = Array.isArray(slotsData) ? [...slotsData] : [];
-    if (!bookingSlots.length) {
+    if (!bookingSlots.length && !useReleaseObserver) {
       bookingSlots = await refreshBookingSlots();
     }
     const selectPreferredTimesFromSlots = (slots, { bookableOnly = false } = {}) => {
@@ -2833,11 +3229,18 @@ async function runBooking(config) {
 
     const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
     additionalPlayers = players.slice(0, desiredAdditionalCount);
-    await coarseWaitUntil(targetFireTime);
+    const releaseArmLeadMs = useReleaseObserver && Number.isFinite(CONFIG.SNIPER_RELEASE_ARM_LEAD_MS)
+      ? Math.max(0, CONFIG.SNIPER_RELEASE_ARM_LEAD_MS)
+      : 0;
+    const executionArmTime = targetFireTime - releaseArmLeadMs;
+    if (releaseArmLeadMs > 0) {
+      console.log(`[SNIPER] Release path will arm ${releaseArmLeadMs}ms before target fire time`);
+    }
+    await coarseWaitUntil(executionArmTime);
     console.log('\n[4/5] Executing precise timing...');
-    await spinUntil(targetFireTime);
+    await spinUntil(executionArmTime);
     const targetReachedAt = Date.now();
-    let searchTimes = selectPreferredTimesFromSlots(bookingSlots);
+    let searchTimes = bookingSlots.length ? selectPreferredTimesFromSlots(bookingSlots) : [];
     if (!searchTimes.length && useReleaseObserver && normalizedPreferredTimes.length) {
       searchTimes = [...normalizedPreferredTimes];
       notes.push('Release watcher armed without pre-release candidate matches');
@@ -2969,6 +3372,100 @@ async function runBooking(config) {
 
     let bookingSuccess = false;
     if (useReleaseObserver) {
+      if (
+        CONFIG.SNIPER_DIRECT_POLL_ENABLED &&
+        (teeCtx?.teeTarget ?? normalizedTeeTarget) === 1
+      ) {
+        const directPollResult = await pollPreferredBookingLinks(
+          page,
+          targetDateStr,
+          searchTimes,
+          targetFireTime,
+        );
+
+        if (directPollResult.found) {
+          notes.push(
+            `direct-html-poll found ${directPollResult.availableTimes.join(', ')} attempt=${directPollResult.attempt} detect_delta=${directPollResult.detectDeltaMs}ms`,
+          );
+
+          for (const candidate of directPollResult.candidates) {
+            const slotInfo = bookingSlots.find((slot) => slot.time === candidate.time);
+            const openSlots = slotInfo && slotInfo.openSlots > 0 ? slotInfo.openSlots : 3;
+            const directResult = await tryDirectBookingHref(
+              page,
+              candidate,
+              additionalPlayers,
+              openSlots,
+              targetFireTime,
+              jobId,
+              dryRun,
+            );
+
+            if (directResult?.dryRun) {
+              bookedTime = candidate.time;
+              fallbackLevel = candidate.preferredIndex ?? normalizedPreferredTimes.indexOf(candidate.time);
+              notes.push(
+                `Direct dry-run reached booking form for ${candidate.time}; navigation=${directResult.navigationMs}ms`,
+              );
+              await fsFinishRun(runId, {
+                result: 'dry_run',
+                notes: `Direct dry-run; ${notes.join(' | ')}`,
+                latency_ms: Date.now() - startTime,
+                chosen_time: bookedTime,
+                fallback_level: fallbackLevel,
+                click_delta_ms: directResult.clickDeltaMs ?? null,
+                verification_url: directResult.verificationUrl ?? null,
+                verification_signal: directResult.verificationSignal ?? 'dry-run',
+                release_detect_delta_ms: directPollResult.detectDeltaMs ?? null,
+              });
+              if (browser && !isWarm) await browser.close();
+              return {
+                success: true,
+                result: 'dry_run',
+                bookedTime,
+                fallbackLevel,
+                latencyMs: Date.now() - startTime,
+                notes: notes.join(' | '),
+                playersRequested: additionalPlayers,
+                click_delta_ms: directResult.clickDeltaMs ?? null,
+                verification_url: directResult.verificationUrl ?? null,
+                verification_signal: directResult.verificationSignal ?? 'dry-run',
+                release_detect_delta_ms: directPollResult.detectDeltaMs ?? null,
+                teeSelected: getTeeLabel(),
+                armedAfterTeeSelect: true,
+              };
+            }
+
+            if (directResult?.booked) {
+              bookedTime = candidate.time;
+              fallbackLevel = candidate.preferredIndex ?? normalizedPreferredTimes.indexOf(candidate.time);
+              if (fallbackLevel < 0) fallbackLevel = 0;
+              bookingSuccess = true;
+              notes.push(
+                `Direct release booking confirmed for ${candidate.time}; click_delta=${directResult.clickDeltaMs}ms navigation=${directResult.navigationMs}ms`,
+              );
+              break;
+            }
+
+            const directFailure = directResult?.error || directResult?.confirmationText || 'direct-booking-failed';
+            console.log(`Could not complete direct booking for ${candidate.time}: ${directFailure}`);
+            notes.push(`Could not complete direct booking for ${candidate.time}: ${directFailure}`);
+          }
+
+          if (!bookingSuccess) {
+            await reloadTeeSheetForRetry('direct-html-poll-candidates-failed').catch((error) => {
+              console.warn('[SNIPER] Reload after direct poll failure failed:', error?.message || error);
+            });
+          }
+        } else {
+          notes.push(
+            `direct-html-poll timeout attempts=${directPollResult.attempt} status=${directPollResult.httpStatus || 'n/a'} candidates=${directPollResult.candidateCount || 0}`,
+          );
+        }
+      } else if ((teeCtx?.teeTarget ?? normalizedTeeTarget) !== 1) {
+        notes.push('direct-html-poll skipped for non-1st-tee target');
+      }
+
       const watchMs = Number.isFinite(CONFIG.SNIPER_RELEASE_WATCH_MS)
         ? Math.max(500, CONFIG.SNIPER_RELEASE_WATCH_MS)
         : 8000;
@@ -2976,7 +3473,7 @@ async function runBooking(config) {
         ? Math.max(0, CONFIG.SNIPER_RELEASE_RETRY_COUNT)
         : 2;
       const maxAttempts = retries + 1;
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      for (let attempt = 1; !bookingSuccess && attempt <= maxAttempts; attempt += 1) {
         console.log(
           `[SNIPER] Release watcher (MutationObserver) armed... attempt ${attempt}/${maxAttempts} timeout ${watchMs}ms`,
         );
@@ -3000,7 +3497,7 @@ async function runBooking(config) {
           await reloadTeeSheetForRetry('release-watcher-timeout');
         }
       }
-      if (releaseResult && releaseResult.found) {
+      if (!bookingSuccess && releaseResult && releaseResult.found) {
         const fireLatencyMs = releaseResult.fireLatencyMs;
         const releaseDetectDeltaMs = releaseResult.detectDeltaMs ?? null;
         const releaseClickedTime = releaseResult.slotTime || 'release';
@@ -3168,7 +3665,7 @@ async function runBooking(config) {
             ...diagnostics,
           };
         }
-      } else {
+      } else if (!bookingSuccess) {
         console.log('[SNIPER] Release watcher timeout — fallback to normal scan');
         try {
           bookingSlots = await refreshBookingSlots();
