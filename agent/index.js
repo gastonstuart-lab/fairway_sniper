@@ -12,54 +12,139 @@ import { maybeFallbackToAltTee, selectTeeForJob } from './tee_targeting.js';
 import os from 'os';
 import crypto from 'crypto';
 
-// --- Release watcher: Wait for first booking link to appear AND click with latency measurement ---
-async function waitForBookingRelease(page, timeoutMs = 2000, skipClick = false) {
+// --- Release watcher: wait for an ordered preferred booking link and click with latency measurement ---
+async function waitForBookingRelease(
+  page,
+  preferredTimesOrTimeout = [],
+  timeoutMsOrSkipClick = 2000,
+  skipClickMaybe = false,
+) {
+  let preferredTimes = preferredTimesOrTimeout;
+  let timeoutMs = timeoutMsOrSkipClick;
+  let skipClick = skipClickMaybe;
+
+  if (typeof preferredTimesOrTimeout === 'number') {
+    preferredTimes = [];
+    timeoutMs = preferredTimesOrTimeout;
+    skipClick = Boolean(timeoutMsOrSkipClick);
+  }
+
+  const preferredLabels = normalizeStringList(preferredTimes)
+    .map((time) => {
+      const hhmm = normalizeTimeToHHMM(time);
+      if (!hhmm || hhmm.length !== 4) return null;
+      return `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`;
+    })
+    .filter(Boolean);
+
   try {
     return await page.evaluate((args) => {
-      const { timeout, skipClick } = args;
+      const { timeout, skipClick, preferredLabels } = args;
+      const preferredOrder = Array.from(new Set(preferredLabels || []));
+      const observerStartedAt = performance.now();
+
+      const normalizeTimeLabel = (value) => {
+        const digits = String(value || '').replace(/\D/g, '');
+        if (digits.length < 3 || digits.length > 4) return null;
+        const hhmm = digits.padStart(4, '0').slice(-4);
+        const hour = Number.parseInt(hhmm.slice(0, 2), 10);
+        const minute = Number.parseInt(hhmm.slice(2), 10);
+        if (
+          Number.isNaN(hour) ||
+          Number.isNaN(minute) ||
+          hour > 23 ||
+          minute > 59
+        ) {
+          return null;
+        }
+        return `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`;
+      };
+
+      const extractTimeFromHref = (href) => {
+        try {
+          const url = new URL(href, window.location.href);
+          const segments = url.pathname.split('/').filter(Boolean).reverse();
+          for (const segment of segments) {
+            if (!/^\d{3,4}$/.test(segment)) continue;
+            const label = normalizeTimeLabel(segment);
+            if (label) return label;
+          }
+        } catch {
+          // Fall through to regex parsing below.
+        }
+        const match = String(href || '').match(
+          /(?:\/|%2F)([01]?\d|2[0-3])([0-5]\d)(?:[/?#&]|$)/i,
+        );
+        return match ? normalizeTimeLabel(`${match[1]}${match[2]}`) : null;
+      };
+
+      const extractTimeFromText = (element) => {
+        const row = element.closest(
+          'tr, .tee-row, .slot-row, .timeslot, .slot, .availability, [role="row"]',
+        );
+        const text = `${row?.textContent || ''} ${element.textContent || ''}`;
+        const match = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+        return match ? normalizeTimeLabel(`${match[1]}${match[2]}`) : null;
+      };
+
+      const scanCandidates = () => {
+        const links = Array.from(document.querySelectorAll('a[href*="/bookings/book"]'));
+        return links.map((link) => {
+          const href = link.href || link.getAttribute('href') || '';
+          const slotTime = extractTimeFromHref(href) || extractTimeFromText(link);
+          return { link, href, slotTime };
+        });
+      };
+
+      const chooseCandidate = () => {
+        const candidates = scanCandidates();
+        if (!candidates.length) {
+          return { candidate: null, candidates, preferredIndex: null };
+        }
+
+        if (preferredOrder.length > 0) {
+          for (let index = 0; index < preferredOrder.length; index += 1) {
+            const preferredTime = preferredOrder[index];
+            const candidate = candidates.find((entry) => entry.slotTime === preferredTime);
+            if (candidate) return { candidate, candidates, preferredIndex: index };
+          }
+          return { candidate: null, candidates, preferredIndex: null };
+        }
+
+        return { candidate: candidates[0], candidates, preferredIndex: 0 };
+      };
+
+      const buildResult = ({ candidate, candidates, preferredIndex, immediate }) => {
+        const tDetect = performance.now();
+        if (!skipClick) candidate.link.click();
+        const tClick = performance.now();
+        return {
+          found: true,
+          fireLatencyMs: Math.round(tClick - tDetect),
+          detectDeltaMs: Math.round(tDetect - observerStartedAt),
+          slotTime: candidate.slotTime,
+          href: candidate.href,
+          immediate,
+          preferredIndex,
+          candidateCount: candidates.length,
+          availableTimes: candidates.map((entry) => entry.slotTime).filter(Boolean),
+        };
+      };
+
       return new Promise((resolve) => {
         let done = false;
-        const existing = document.querySelector('a[href*="/bookings/book"]');
-        if (existing) {
-          const slotText = existing.textContent || '';
-          const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
-          const slotTime = match ? match[1] : null;
-          console.log('[SNIPER] Booking link already present; using immediate match');
-          
-          // Measure and click atomically
-          const tDetect = performance.now();
-          if (!skipClick) existing.click();
-          const tClick = performance.now();
-          const fireLatencyMs = Math.round(tClick - tDetect);
-          
-          resolve({
-            found: true,
-            fireLatencyMs,
-            slotTime,
-            immediate: true,
-          });
+        const immediateChoice = chooseCandidate();
+        if (immediateChoice.candidate) {
+          console.log('[SNIPER] Preferred booking link already present; using immediate match');
+          resolve(buildResult({ ...immediateChoice, immediate: true }));
           return;
         }
         const observer = new MutationObserver(() => {
           if (done) return;
-          const link = document.querySelector('a[href*="/bookings/book"]');
-          if (link) {
+          const choice = chooseCandidate();
+          if (choice.candidate) {
             done = true;
-            const slotText = link.textContent || '';
-            const match = slotText.match(/\b(\d{1,2}:\d{2})\b/);
-            const slotTime = match ? match[1] : null;
-            
-            // Measure and click atomically
-            const tDetect = performance.now();
-            if (!skipClick) link.click();
-            const tClick = performance.now();
-            const fireLatencyMs = Math.round(tClick - tDetect);
-            
-            resolve({
-              found: true,
-              fireLatencyMs,
-              slotTime,
-            });
+            resolve(buildResult({ ...choice, immediate: false }));
             observer.disconnect();
           }
         });
@@ -68,12 +153,19 @@ async function waitForBookingRelease(page, timeoutMs = 2000, skipClick = false) 
         setTimeout(() => {
           if (!done) {
             done = true;
-            resolve({ found: false, fireLatencyMs: null });
+            const candidates = scanCandidates();
+            resolve({
+              found: false,
+              fireLatencyMs: null,
+              candidateCount: candidates.length,
+              availableTimes: candidates.map((entry) => entry.slotTime).filter(Boolean),
+              preferredTimes: preferredOrder,
+            });
             observer.disconnect();
           }
         }, timeout);
       });
-    }, { timeout: timeoutMs, skipClick });
+    }, { timeout: timeoutMs, skipClick, preferredLabels });
   } catch (error) {
     const msg = error?.message || String(error);
     if (msg.includes('Execution context was destroyed')) {
@@ -1766,12 +1858,15 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
                 b.disabled ||
                 b.getAttribute('aria-disabled') === 'true',
             );
+          const bookingLink = row.querySelector('a[href*="/bookings/book"]');
           const hasBook =
-            buttonElements.some((b) => /\bbook( now)?\b/i.test(b.textContent || '')) && !hasUnavailable;
+            (!!bookingLink ||
+              buttonElements.some((b) => /\bbook( now)?\b/i.test(b.textContent || ''))) &&
+            !hasUnavailable;
           let state = 'unknown';
           if (hasBook) state = 'bookable';
           else if (hasUnavailable) state = 'unavailable';
-          const link = hasBook ? row.querySelector('a[href*="/bookings/book"]') : null;
+          const link = hasBook ? bookingLink : null;
           results.push({
             time,
             state,
@@ -2214,7 +2309,15 @@ async function tryBookTime(
     return { booked: false, error: 'invalid-time-format' };
   }
   const fallbackLocator = page
-    .locator(`a[href*="/bookings/book/${hhmm}"]`)
+    .locator(
+      [
+        `a[href*="/bookings/book/${hhmm}"]`,
+        `a[href*="/bookings/book"][href$="/${hhmm}"]`,
+        `a[href*="/bookings/book"][href$="${hhmm}"]`,
+        `a[href*="/bookings/book"][href*="/${hhmm}?"]`,
+        `a[href*="/bookings/book"][href*="/${hhmm}#"]`,
+      ].join(', '),
+    )
     .first();
   const bookButton = cachedLocator || fallbackLocator;
 
@@ -2716,6 +2819,17 @@ async function runBooking(config) {
     if (!bookingSlots.length) {
       bookingSlots = await refreshBookingSlots();
     }
+    const selectPreferredTimesFromSlots = (slots, { bookableOnly = false } = {}) => {
+      const slotTimeSet = new Set(
+        (Array.isArray(slots) ? slots : [])
+          .filter((slot) => {
+            if (!slot?.time) return false;
+            return !bookableOnly || slot.state === 'bookable' || !!slot.href;
+          })
+          .map((slot) => slot.time),
+      );
+      return normalizedPreferredTimes.filter((time) => slotTimeSet.has(time));
+    };
 
     const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
     additionalPlayers = players.slice(0, desiredAdditionalCount);
@@ -2723,8 +2837,11 @@ async function runBooking(config) {
     console.log('\n[4/5] Executing precise timing...');
     await spinUntil(targetFireTime);
     const targetReachedAt = Date.now();
-    const availableTimeSet = new Set(bookingSlots.map((slot) => slot.time));
-    let searchTimes = normalizedPreferredTimes.filter((time) => availableTimeSet.has(time));
+    let searchTimes = selectPreferredTimesFromSlots(bookingSlots);
+    if (!searchTimes.length && useReleaseObserver && normalizedPreferredTimes.length) {
+      searchTimes = [...normalizedPreferredTimes];
+      notes.push('Release watcher armed without pre-release candidate matches');
+    }
     if (!searchTimes.length) {
       const message = 'no-candidate-times-on-sheet';
       console.warn(`[SNIPER] ${message}; requested times: ${normalizedPreferredTimes.join(', ')}`);
@@ -2756,7 +2873,13 @@ async function runBooking(config) {
           console.log(`[WARN] Skipping invalid time format in preferredTimes: "${time}"`);
           continue;
         }
-        const fallbackSel = `a[href*="/bookings/book/${hhmm}"]`;
+        const fallbackSel = [
+          `a[href*="/bookings/book/${hhmm}"]`,
+          `a[href*="/bookings/book"][href$="/${hhmm}"]`,
+          `a[href*="/bookings/book"][href$="${hhmm}"]`,
+          `a[href*="/bookings/book"][href*="/${hhmm}?"]`,
+          `a[href*="/bookings/book"][href*="/${hhmm}#"]`,
+        ].join(', ');
         const cachedSel = cachedSelectors?.[time] || fallbackSel;
         cache[time] = page.locator(cachedSel).first();
       }
@@ -2799,7 +2922,7 @@ async function runBooking(config) {
         try {
           console.log(`Trying time slot: ${time}`);
           const slotInfo = bookingSlots.find((s) => s.time === time);
-          const openSlots = slotInfo ? slotInfo.openSlots : 3;
+          const openSlots = slotInfo && slotInfo.openSlots > 0 ? slotInfo.openSlots : 3;
           const bookingResult = await tryBookTime(
             page,
             time,
@@ -2811,7 +2934,8 @@ async function runBooking(config) {
           );
           if (bookingResult && bookingResult.booked) {
             bookedTime = time;
-            fallbackLevel = index;
+            const preferenceIndex = normalizedPreferredTimes.indexOf(time);
+            fallbackLevel = preferenceIndex >= 0 ? preferenceIndex : index;
             notes.push(
               `Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`,
             );
@@ -2830,6 +2954,20 @@ async function runBooking(config) {
       return !!bookedTime;
     };
 
+    const reloadTeeSheetForRetry = async (reason) => {
+      console.log(`[SNIPER] Reloading tee sheet for retry after ${reason}...`);
+      const reloadUrl = teeSheetUrlForDate(targetDateStr);
+      await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
+      teeCtx = await selectTeeForJob(page, {
+        teeTarget: teeCtx?.teeTarget ?? normalizedTeeTarget,
+        fallbackTee: teeCtx?.fallbackTee ?? fallbackTee,
+      });
+      bookingSlots = await refreshBookingSlots();
+      return bookingSlots;
+    };
+
+    let bookingSuccess = false;
     if (useReleaseObserver) {
       const watchMs = Number.isFinite(CONFIG.SNIPER_RELEASE_WATCH_MS)
         ? Math.max(500, CONFIG.SNIPER_RELEASE_WATCH_MS)
@@ -2844,7 +2982,7 @@ async function runBooking(config) {
         );
         try {
           await page.waitForLoadState('domcontentloaded');
-          releaseResult = await waitForBookingRelease(page, watchMs, CONFIG.TEST_MODE);
+          releaseResult = await waitForBookingRelease(page, searchTimes, watchMs, CONFIG.TEST_MODE);
         } catch (error) {
           const msg = error?.message || String(error);
           console.warn(`[SNIPER] Release watcher error on attempt ${attempt}/${maxAttempts}: ${msg}`);
@@ -2859,15 +2997,13 @@ async function runBooking(config) {
         );
         if (attempt < maxAttempts && targetDateStr) {
           console.log('[SNIPER] Release watcher timeout — reloading tee sheet and retrying...');
-          const reloadUrl = teeSheetUrlForDate(targetDateStr);
-          await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-          await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
-          await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
+          await reloadTeeSheetForRetry('release-watcher-timeout');
         }
       }
       if (releaseResult && releaseResult.found) {
         const fireLatencyMs = releaseResult.fireLatencyMs;
+        const releaseDetectDeltaMs = releaseResult.detectDeltaMs ?? null;
+        const releaseClickedTime = releaseResult.slotTime || 'release';
         console.log(`[FIRE] FIRE_LATENCY_MS=${fireLatencyMs}`);
         if (fireLatencyMs > 200) {
           console.warn(`[WARN] ⚠️ FIRE_LATENCY_MS >200ms: ${fireLatencyMs}ms`);
@@ -2877,11 +3013,12 @@ async function runBooking(config) {
           console.log(`[TEST_MODE] ⚠️ Booking click executed in page context (TEST_MODE active)`);
         }
         // Click already executed in page context by waitForBookingRelease
+        const releaseSlotInfo = bookingSlots.find((slot) => slot.time === releaseResult.slotTime);
         const clickResult = await executeReleaseBooking(
           page,
           null,
           additionalPlayers,
-          bookingSlots[0]?.openSlots || 3,
+          releaseSlotInfo && releaseSlotInfo.openSlots > 0 ? releaseSlotInfo.openSlots : 3,
           targetReachedAt,
           jobId,
           dryRun,
@@ -2894,7 +3031,7 @@ async function runBooking(config) {
             verification_url: page.url(),
             verification_signal: 'dry-run',
           };
-          bookedTime = releaseResult.slotTime || 'release';
+          bookedTime = releaseClickedTime;
           fallbackLevel = 0;
           notes.push(`Dry-run; fire_latency=${fireLatencyMs}ms`);
           await fsFinishRun(runId, {
@@ -2941,16 +3078,17 @@ async function runBooking(config) {
         const clickDeltaMsConfirmed = clickResult?.clickDeltaMs ?? null;
         const diagnostics = {
           click_delta_ms: clickDeltaMsConfirmed,
-          release_detect_delta_ms: delta,
+          release_detect_delta_ms: releaseDetectDeltaMs,
           verification_url: verification.verificationUrl,
           verification_signal: verification.verificationSignal,
           booking_links_count_after_click: verification.bookingLinksCountAfterClick,
+          release_candidate_count: releaseResult.candidateCount ?? null,
         };
 
         if (verification.confirmed) {
-          bookedTime = releaseResult.slotTime || 'release';
+          bookedTime = releaseClickedTime;
           fallbackLevel = 0;
-          notes.push(`Release-night booking confirmed; Detected at delta ${delta}ms`);
+          notes.push(`Release-night booking confirmed; Detected at delta ${releaseDetectDeltaMs}ms`);
           await fsFinishRun(runId, {
             result: 'success_confirmed',
             notes: `Release-booked; ${notes.join(' | ')}`,
@@ -2975,33 +3113,77 @@ async function runBooking(config) {
 
         console.log('[SNIPER] Verification failed: no confirmation within 12s');
         const snapshotPath = await saveHtmlSnapshot(page, runId || jobId || 'release');
-        await fsFinishRun(runId, {
-          result: 'click_only',
-          notes: `Clicked booking link but no confirmation; ${notes.join(' | ')}`,
-          latency_ms: Date.now() - startTime,
-          chosen_time: bookedTime,
-          fallback_level: fallbackLevel,
-          snapshot_path: snapshotPath,
-          ...diagnostics,
-        });
-        if (browser && !isWarm) await browser.close();
-        return {
-          success: false,
-          result: 'click_only',
-          bookedTime: null,
-          fallbackLevel,
-          latencyMs: Date.now() - startTime,
-          notes: 'clicked but no confirmation',
-          playersRequested: additionalPlayers,
-          error: 'clicked but no confirmation',
-          snapshotPath,
-          ...diagnostics,
-        };
+        notes.push(
+          `Release click for ${releaseClickedTime} failed verification (${verification.verificationSignal || 'no-confirmation'}); snapshot=${snapshotPath || 'n/a'}`,
+        );
+
+        const releaseClickedHHMM = normalizeTimeToHHMM(releaseResult.slotTime);
+        let retryTimes = releaseClickedHHMM
+          ? searchTimes.filter((time) => normalizeTimeToHHMM(time) !== releaseClickedHHMM)
+          : [...searchTimes];
+
+        if (retryTimes.length) {
+          console.log(`[SNIPER] Trying remaining preferred times after failed release click: ${retryTimes.join(', ')}`);
+          try {
+            await reloadTeeSheetForRetry('failed-release-click');
+            const liveRemainingTimes = selectPreferredTimesFromSlots(bookingSlots, { bookableOnly: true })
+              .filter((time) => !releaseClickedHHMM || normalizeTimeToHHMM(time) !== releaseClickedHHMM);
+            if (liveRemainingTimes.length) {
+              retryTimes = liveRemainingTimes;
+            }
+            bookingSuccess = await runPreferredTimesLoop(retryTimes);
+            if (bookingSuccess) {
+              notes.push('Recovered by booking a remaining preferred time after failed release click');
+            }
+          } catch (retryError) {
+            const retryMessage = retryError?.message || String(retryError);
+            console.warn(`[SNIPER] Remaining preferred-time retry failed: ${retryMessage}`);
+            notes.push(`Remaining preferred-time retry failed: ${retryMessage}`);
+          }
+        } else {
+          notes.push('No remaining preferred times to retry after failed release click');
+        }
+
+        if (!bookingSuccess) {
+          await fsFinishRun(runId, {
+            result: 'click_only',
+            notes: `Clicked booking link but no confirmation; ${notes.join(' | ')}`,
+            latency_ms: Date.now() - startTime,
+            chosen_time: bookedTime,
+            fallback_level: fallbackLevel,
+            snapshot_path: snapshotPath,
+            ...diagnostics,
+          });
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: false,
+            result: 'click_only',
+            bookedTime: null,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: 'clicked but no confirmation',
+            playersRequested: additionalPlayers,
+            error: 'clicked but no confirmation',
+            snapshotPath,
+            ...diagnostics,
+          };
+        }
       } else {
         console.log('[SNIPER] Release watcher timeout — fallback to normal scan');
+        try {
+          bookingSlots = await refreshBookingSlots();
+          const liveBookableTimes = selectPreferredTimesFromSlots(bookingSlots, { bookableOnly: true });
+          if (liveBookableTimes.length) {
+            searchTimes = liveBookableTimes;
+          }
+        } catch (refreshError) {
+          console.warn('[SNIPER] Could not refresh slots after release watcher timeout:', refreshError?.message || refreshError);
+        }
       }
     }
-    let bookingSuccess = await runPreferredTimesLoop(searchTimes);
+    if (!bookingSuccess) {
+      bookingSuccess = await runPreferredTimesLoop(searchTimes);
+    }
     if (!bookingSuccess && teeCtx?.fallbackTee && !fallbackTeeUsed) {
       const fallbackResult = await maybeFallbackToAltTee(page, teeCtx, 'preferred_time_not_found');
       if (fallbackResult.didFallback) {
