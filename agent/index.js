@@ -404,7 +404,7 @@ app.post('/api/book-now', async (req, res) => {
       loginUrl: CONFIG.CLUB_LOGIN_URL,
       username,
       password,
-      preferredTimes: Array.isArray(preferredTimes) ? preferredTimes : [],
+      preferredTimes: normalizeStringList(preferredTimes),
       targetFireTime: Date.now() + 500,
       targetPlayDate: targetDate,
       players: Array.isArray(players) ? players : [],
@@ -819,7 +819,7 @@ async function runSniperJob(jobId, payload) {
         loginUrl: CONFIG.CLUB_LOGIN_URL,
         username,
         password,
-        preferredTimes: Array.isArray(preferredTimes) ? preferredTimes : [],
+        preferredTimes: normalizeStringList(preferredTimes),
         targetFireTime: fireTime,
         targetPlayDate: targetDate,
         players,
@@ -991,6 +991,15 @@ function isReadyJob(job) {
 }
 
 function getFireTimeFromJob(job) {
+  const targetDateKey = getTargetDateKeyFromJob(job);
+  if (targetDateKey) {
+    return computeReleaseFireUTCForTargetDate(
+      targetDateKey,
+      job.release_time_local || job.releaseTimeLocal || '19:20',
+      job.tz || job.timezone || CONFIG.TZ_LONDON,
+    );
+  }
+
   return (
     toDateMaybe(job.fireTimeUtc) ||
     toDateMaybe(job.fire_time_utc) ||
@@ -1001,6 +1010,9 @@ function getFireTimeFromJob(job) {
 }
 
 function resolveTargetPlayDate(job) {
+  const targetDateKey = getTargetDateKeyFromJob(job);
+  if (targetDateKey) return dateFromDateKey(targetDateKey);
+
   const direct = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
   if (direct) return direct;
 
@@ -1125,10 +1137,8 @@ async function scheduleClaimedJob(job) {
       const username = job.brs_email || job.brsEmail || job.username;
       const password = job.brs_password || job.brsPassword || job.password;
       const preferredTimes = Array.isArray(job.preferred_times)
-        ? job.preferred_times
-        : Array.isArray(job.preferredTimes)
-          ? job.preferredTimes
-          : [];
+        ? normalizeStringList(job.preferred_times)
+        : normalizeStringList(job.preferredTimes ?? job.preferred_times);
       const players = Array.isArray(job.players) ? job.players : [];
       const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
       const pushToken = job.push_token || job.pushToken;
@@ -1145,6 +1155,7 @@ async function scheduleClaimedJob(job) {
         preferredTimes,
         targetFireTime: fireMs,
         targetPlayDate: targetPlayDate,
+        targetDate: getTargetDateKeyFromJob(job),
         players,
         partySize,
         slotsData: [],
@@ -1277,7 +1288,7 @@ async function warmUpSchedulerTick() {
           }
           
           // Optionally preload tee sheet (warm browser session)
-          const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+          const targetPlayDate = resolveTargetPlayDate(job);
           const username = job.brs_email || job.brsEmail || job.username;
           const password = job.brs_password || job.brsPassword || job.password;
           
@@ -1372,19 +1383,70 @@ function toDateMaybe(value) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+function normalizeDateKey(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (match) return trimmed;
+  }
+  const d = toDateMaybe(value);
+  if (!d) return null;
+  return [
+    d.getUTCFullYear(),
+    String(d.getUTCMonth() + 1).padStart(2, '0'),
+    String(d.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function getTargetDateKeyFromJob(job) {
+  return normalizeDateKey(job?.target_date || job?.targetDate);
+}
+
+function dateFromDateKey(dateKey) {
+  const normalized = normalizeDateKey(dateKey);
+  if (!normalized) return null;
+  return new Date(`${normalized}T12:00:00.000Z`);
+}
+
+function datePartsForTeeSheet(value) {
+  const normalized = normalizeDateKey(value);
+  if (normalized) {
+    const [year, month, day] = normalized.split('-');
+    return { year, month, day };
+  }
+  const d = value instanceof Date ? value : new Date(value);
+  return {
+    year: String(d.getUTCFullYear()),
+    month: String(d.getUTCMonth() + 1).padStart(2, '0'),
+    day: String(d.getUTCDate()).padStart(2, '0'),
+  };
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry || '').trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
 async function runScheduledJob(job) {
   const jobId = job.id;
   const ownerUid = job.ownerUid || job.owner_uid || 'unknown';
   const username = job.brs_email || job.brsEmail || job.username;
   const password = job.brs_password || job.brsPassword || job.password;
   const preferredTimes = Array.isArray(job.preferred_times)
-    ? job.preferred_times
-    : Array.isArray(job.preferredTimes)
-      ? job.preferredTimes
-      : [];
+    ? normalizeStringList(job.preferred_times)
+    : normalizeStringList(job.preferredTimes ?? job.preferred_times);
   const players = Array.isArray(job.players) ? job.players : [];
   const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
-  const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+  const targetPlayDate = resolveTargetPlayDate(job);
   const pushToken = job.push_token || job.pushToken;
 
   if (!username || !password || !targetPlayDate) {
@@ -1407,6 +1469,7 @@ async function runScheduledJob(job) {
       preferredTimes,
       targetFireTime: fireTime,
       targetPlayDate: targetPlayDate,
+      targetDate: getTargetDateKeyFromJob(job),
       players,
       partySize,
       slotsData: [],
@@ -1438,7 +1501,7 @@ async function schedulerTick() {
   const now = Date.now();
   for (const job of jobs) {
     const nextFire = toDateMaybe(job.next_fire_time_utc) || toDateMaybe(job.nextFireTimeUtc);
-    const targetPlayDate = toDateMaybe(job.target_play_date) || toDateMaybe(job.targetPlayDate);
+    const targetPlayDate = resolveTargetPlayDate(job);
 
     let fireTime = nextFire;
     if (!fireTime) {
@@ -1616,20 +1679,14 @@ async function loginToBRS(page, loginUrl, username, password) {
 }
 
 function teeSheetUrlForDate(date) {
-  const d = date instanceof Date ? date : new Date(date);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `https://members.brsgolf.com/galgorm/tee-sheet/1/${y}/${m}/${day}`;
+  const { year, month, day } = datePartsForTeeSheet(date);
+  return `https://members.brsgolf.com/galgorm/tee-sheet/1/${year}/${month}/${day}`;
 }
 
 function pageMatchesDate(page, date) {
   try {
-    const d = date instanceof Date ? date : new Date(date);
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    const needle = `/${y}/${m}/${day}`;
+    const parts = datePartsForTeeSheet(date);
+    const needle = `/${parts.year}/${parts.month}/${parts.day}`;
     const url = page?.url?.() || '';
     return typeof url === 'string' && url.includes(needle);
   } catch {
@@ -1638,12 +1695,12 @@ function pageMatchesDate(page, date) {
 }
 
 async function navigateToTeeSheet(page, date, allowHop = true) {
-  const baseDate = date instanceof Date ? date : new Date(date);
+  const baseDate = dateFromDateKey(date) || (date instanceof Date ? date : new Date(date));
   const maxHops = allowHop ? 2 : 0; // avoid hopping for availability scans
 
   for (let i = 0; i <= maxHops; i++) {
     const target = new Date(baseDate);
-    target.setDate(baseDate.getDate() + i);
+    target.setUTCDate(baseDate.getUTCDate() + i);
     const url = teeSheetUrlForDate(target);
     console.log(`   → Loading tee sheet ${url}`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -2307,6 +2364,31 @@ function computeNextFireUTC(
   return target.toUTC().toJSDate();
 }
 
+function computeReleaseFireUTCForTargetDate(
+  targetDateKey,
+  releaseTimeLocal = '19:20',
+  tz = CONFIG.TZ_LONDON,
+) {
+  const normalizedTargetDate = normalizeDateKey(targetDateKey);
+  if (!normalizedTargetDate) {
+    throw new Error(`Invalid target date: ${targetDateKey}`);
+  }
+
+  const [hh, mm] = (releaseTimeLocal || '19:20').split(':');
+  const hour = Number.parseInt(hh, 10);
+  const minute = Number.parseInt(mm || '0', 10);
+  if (Number.isNaN(hour) || Number.isNaN(minute)) {
+    throw new Error(`Invalid release time: ${releaseTimeLocal}`);
+  }
+
+  const targetDate = DateTime.fromISO(normalizedTargetDate, { zone: tz }).startOf('day');
+  return targetDate
+    .minus({ days: 5 })
+    .set({ hour, minute, second: 0, millisecond: 0 })
+    .toUTC()
+    .toJSDate();
+}
+
 // ========================================
 // BOOKING AUTOMATION LOGIC
 // ========================================
@@ -2515,6 +2597,7 @@ async function runBooking(config) {
     targetFireTime,
     pushToken,
     targetPlayDate,
+    targetDate,
     players = [],
     partySize,
     slotsData = [],
@@ -2539,17 +2622,18 @@ async function runBooking(config) {
   let isWarm = false;
   let runId;
   const startTime = Date.now();
-  const teeDate = targetPlayDate ? new Date(targetPlayDate) : new Date();
-  const targetDateStr = teeDate.toISOString().slice(0, 10);
+  const targetDateStr = normalizeDateKey(targetDate || targetPlayDate) || normalizeDateKey(new Date());
+  const teeDate = dateFromDateKey(targetDateStr) || new Date();
   const notes = [];
+  const requestedPreferredTimes = normalizeStringList(preferredTimes);
   const normalizedPreferredTimes = expandPreferredTimes(
-    preferredTimes,
+    requestedPreferredTimes,
     CONFIG.SNIPER_FALLBACK_WINDOW_MINUTES,
     CONFIG.SNIPER_FALLBACK_STEP_MINUTES,
   );
-  if (Array.isArray(preferredTimes) && preferredTimes.length > 0) {
+  if (requestedPreferredTimes.length > 0) {
     const expanded = normalizedPreferredTimes.join(', ');
-    const original = preferredTimes.join(', ');
+    const original = requestedPreferredTimes.join(', ');
     if (expanded && expanded !== original) {
       console.log(`[SNIPER] Expanded preferred times: ${expanded}`);
     }
@@ -2773,9 +2857,9 @@ async function runBooking(config) {
         notes.push(
           `release-watcher-timeout attempt ${attempt}/${maxAttempts} snapshot=${snapshotPath || 'n/a'}`,
         );
-        if (attempt < maxAttempts && targetPlayDate) {
+        if (attempt < maxAttempts && targetDateStr) {
           console.log('[SNIPER] Release watcher timeout — reloading tee sheet and retrying...');
-          const reloadUrl = teeSheetUrlForDate(targetPlayDate);
+          const reloadUrl = teeSheetUrlForDate(targetDateStr);
           await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
           await page.waitForTimeout(CONFIG.SNIPER_RELEASE_RETRY_RELOAD_DELAY_MS);
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -3107,5 +3191,7 @@ app.listen(port, '0.0.0.0', () => {
 export {
   runBooking,
   computeNextFireUTC,
+  computeReleaseFireUTCForTargetDate,
+  normalizeDateKey,
   fsGetOneActiveJob,
 };

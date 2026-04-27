@@ -320,10 +320,36 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   }
 
   DateTime _computeReleaseDateTime(DateTime targetPlayDate) {
-    // Release is always 5 days before target at 19:20 UK time
-    final releaseDate = targetPlayDate.subtract(const Duration(days: 5));
-    return DateTime(
-        releaseDate.year, releaseDate.month, releaseDate.day, 19, 20);
+    final releaseDate = DateTime.utc(
+      targetPlayDate.year,
+      targetPlayDate.month,
+      targetPlayDate.day,
+    ).subtract(const Duration(days: 5));
+    final utcHour = _isUkDstDate(releaseDate) ? 18 : 19;
+    return DateTime.utc(
+      releaseDate.year,
+      releaseDate.month,
+      releaseDate.day,
+      utcHour,
+      20,
+    );
+  }
+
+  bool _isUkDstDate(DateTime utcDate) {
+    final dateOnly = DateTime.utc(utcDate.year, utcDate.month, utcDate.day);
+    final start = _lastSundayOfMonthUtc(utcDate.year, 3);
+    final end = _lastSundayOfMonthUtc(utcDate.year, 10);
+    return !dateOnly.isBefore(start) && dateOnly.isBefore(end);
+  }
+
+  DateTime _lastSundayOfMonthUtc(int year, int month) {
+    final lastDay = DateTime.utc(year, month + 1, 0);
+    return lastDay.subtract(Duration(days: lastDay.weekday % 7));
+  }
+
+  String _dateKey(DateTime date) {
+    final normalized = DateTime.utc(date.year, date.month, date.day);
+    return DateFormat('yyyy-MM-dd').format(normalized);
   }
 
   Future<void> _nextPage() async {
@@ -417,6 +443,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       final players = _selectedPlayerIds;
       final strategy = _buildStrategy();
       final releaseDateTime = _computeReleaseDateTime(_targetPlayDate!);
+      final targetDateKey = _dateKey(_targetPlayDate!);
 
       final job = BookingJob(
         ownerUid: uid,
@@ -431,8 +458,13 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         players: players,
         partySize: _partySize,
         bookingMode: BookingMode.sniper,
-        targetPlayDate: _targetPlayDate,
-        releaseWindowStart: releaseDateTime.toUtc(),
+        targetDate: targetDateKey,
+        targetPlayDate: DateTime.utc(
+          _targetPlayDate!.year,
+          _targetPlayDate!.month,
+          _targetPlayDate!.day,
+        ),
+        releaseWindowStart: releaseDateTime,
         snipeStrategy: strategy,
         status: 'active', // Explicitly set to active
       );

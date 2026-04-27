@@ -23,6 +23,7 @@ class BookingJob {
   final BookingMode bookingMode;
   // Sniper-specific / extended planning fields
   final DateTime? targetPlayDate; // precise date user wants to play
+  final String? targetDate; // date-only key, yyyy-MM-dd, avoids timezone drift
   final DateTime?
       releaseWindowStart; // when tee times are expected to unlock (UTC)
   final Map<String, dynamic>?
@@ -46,6 +47,7 @@ class BookingJob {
     this.pushToken,
     this.bookingMode = BookingMode.normal,
     this.targetPlayDate,
+    this.targetDate,
     this.releaseWindowStart,
     this.snipeStrategy,
     DateTime? createdAt,
@@ -73,6 +75,7 @@ class BookingJob {
         'created_at': Timestamp.fromDate(createdAt),
         'updated_at': Timestamp.fromDate(updatedAt),
         'mode': bookingMode.name,
+        'target_date': targetDate,
         'target_play_date':
             targetPlayDate != null ? Timestamp.fromDate(targetPlayDate!) : null,
         'release_window_start': releaseWindowStart != null
@@ -107,6 +110,7 @@ class BookingJob {
             ? (json['updated_at'] as Timestamp).toDate()
             : DateTime.now(),
         bookingMode: _parseMode(json['mode']),
+        targetDate: json['target_date'] as String?,
         targetPlayDate: json['target_play_date'] is Timestamp
             ? (json['target_play_date'] as Timestamp).toDate()
             : null,
@@ -150,6 +154,7 @@ class BookingJob {
     DateTime? updatedAt,
     BookingMode? bookingMode,
     DateTime? targetPlayDate,
+    String? targetDate,
     DateTime? releaseWindowStart,
     Map<String, dynamic>? snipeStrategy,
   }) =>
@@ -173,6 +178,7 @@ class BookingJob {
         updatedAt: updatedAt ?? this.updatedAt,
         bookingMode: bookingMode ?? this.bookingMode,
         targetPlayDate: targetPlayDate ?? this.targetPlayDate,
+        targetDate: targetDate ?? this.targetDate,
         releaseWindowStart: releaseWindowStart ?? this.releaseWindowStart,
         snipeStrategy: snipeStrategy ?? this.snipeStrategy,
       );
