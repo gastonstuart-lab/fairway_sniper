@@ -217,7 +217,8 @@ app.post('/api/fetch-tee-times', async (req, res) => {
     let page;
     if (reuseBrowser) {
       page = await warmSession.getWarmPage(date, username, password);
-    } else {
+    }
+    if (!page) {
       browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
       const context = await browser.newContext();
       page = await context.newPage();
@@ -296,7 +297,8 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
     let page;
     if (reuseBrowser) {
       page = await warmSession.getWarmPage(start, username, password);
-    } else {
+    }
+    if (!page) {
       browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
       const context = await browser.newContext();
       page = await context.newPage();
