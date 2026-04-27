@@ -641,11 +641,7 @@ const CONFIG = {
 };
 
 const SAFE_MODE_ENABLED = (() => {
-  const raw = (process.env.SAFE_MODE ?? '').toString().trim().toLowerCase();
-  if (raw === '0' || raw === 'false' || raw === 'off') return false;
-  if (raw === '1' || raw === 'true' || raw === 'on') return true;
-  // Default to safe mode on when not explicitly configured
-  return true;
+  return false;
 })();
 
 initFirebaseAdmin();
