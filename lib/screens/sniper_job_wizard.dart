@@ -310,13 +310,10 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   }
 
   bool _isValidSniperDate(DateTime date) {
-    final now = DateTime.now();
-    // Must be at least 5 days in future (releases 5 days before at 7:20 PM)
-    final minDate = now.add(const Duration(days: 5));
-    final minDay = DateTime(minDate.year, minDate.month, minDate.day);
-    final candidateDay = DateTime(date.year, date.month, date.day);
-    return candidateDay.isAtSameMomentAs(minDay) ||
-        candidateDay.isAfter(minDay);
+    // Validity is based on the UK release instant, not the user's local date.
+    // This matters when the operator is ahead of the UK, e.g. Taiwan.
+    final releaseTimeUtc = _computeReleaseDateTime(date);
+    return !releaseTimeUtc.isBefore(DateTime.now().toUtc());
   }
 
   DateTime _computeReleaseDateTime(DateTime targetPlayDate) {
@@ -340,6 +337,16 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     final start = _lastSundayOfMonthUtc(utcDate.year, 3);
     final end = _lastSundayOfMonthUtc(utcDate.year, 10);
     return !dateOnly.isBefore(start) && dateOnly.isBefore(end);
+  }
+
+  DateTime _ukWallClock(DateTime utcDateTime) {
+    final utc = utcDateTime.toUtc();
+    return _isUkDstDate(utc) ? utc.add(const Duration(hours: 1)) : utc;
+  }
+
+  String _formatUkRelease(DateTime utcDateTime) {
+    final suffix = _isUkDstDate(utcDateTime.toUtc()) ? 'BST' : 'GMT';
+    return '${DateFormat("EEEE, MMM d 'at' h:mm a").format(_ukWallClock(utcDateTime))} UK ($suffix)';
   }
 
   DateTime _lastSundayOfMonthUtc(int year, int month) {
@@ -367,7 +374,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         return;
       }
       if (!_isValidSniperDate(_targetPlayDate!)) {
-        _showSnack('Date must be at least 5 days in future');
+        _showSnack('Release time has already passed in the UK');
         return;
       }
       setState(() => _isNextBusy = true);
@@ -1041,8 +1048,11 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   }
 
   Widget _buildDatePage() {
-    final releaseDay = _computedReleaseDateTime?.toLocal() ?? DateTime.now();
-    final daysUntilRelease = releaseDay.difference(DateTime.now()).inDays;
+    final releaseUtc = _computedReleaseDateTime;
+    final minutesUntilRelease = releaseUtc == null
+        ? 0
+        : releaseUtc.difference(DateTime.now().toUtc()).inMinutes;
+    final daysUntilRelease = minutesUntilRelease ~/ (24 * 60);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(AppSpacing.xl),
@@ -1064,12 +1074,16 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           InkWell(
             onTap: () async {
               final now = DateTime.now();
-              final minDate = now.add(const Duration(days: 5));
+              final minDate = DateTime(now.year, now.month, now.day);
+              final initialDate = _targetPlayDate != null &&
+                      !_targetPlayDate!.isBefore(minDate)
+                  ? _targetPlayDate!
+                  : minDate;
               final picked = await showDatePicker(
                 context: context,
                 firstDate: minDate,
                 lastDate: now.add(const Duration(days: 90)),
-                initialDate: minDate,
+                initialDate: initialDate,
               );
               if (picked != null) {
                 setState(() {
@@ -1138,15 +1152,17 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     ),
                     const SizedBox(height: AppSpacing.md),
                     Text(
-                      DateFormat("EEEE, MMM d 'at' h:mm a").format(releaseDay),
+                      _formatUkRelease(_computedReleaseDateTime!),
                       style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                           fontWeight: FontWeight.w600,
                           color: Colors.blue.shade900),
                     ),
                     const SizedBox(height: 8),
-                    if (daysUntilRelease > 0)
+                    if (minutesUntilRelease > 0)
                       Text(
-                        'Booking opens in $daysUntilRelease days',
+                        daysUntilRelease > 0
+                            ? 'Booking opens in $daysUntilRelease days'
+                            : 'Booking opens in $minutesUntilRelease minutes',
                         style: Theme.of(context)
                             .textTheme
                             .bodySmall
