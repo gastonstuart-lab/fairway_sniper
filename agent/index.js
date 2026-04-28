@@ -1327,6 +1327,7 @@ async function scheduleClaimedJob(job) {
         booking_links_count_after_click:
           result?.booking_links_count_after_click ?? result?.bookingLinksCountAfterClick ?? null,
         snapshot_path: result?.snapshotPath ?? result?.snapshot_path ?? null,
+        screenshot_path: result?.screenshotPath ?? result?.screenshot_path ?? null,
         release_detect_delta_ms:
           result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
       });
@@ -2790,6 +2791,7 @@ async function tryDirectBookingHref(
     const reason = /unavailable|already|not available|fully booked|no longer|error|invalid/i.test(bodyText)
       ? 'slot-not-bookable-after-direct-nav'
       : 'booking-form-not-found-after-direct-nav';
+    const evidence = await savePageEvidence(page, `${jobId || 'direct'}-${time}-${reason}`);
     return {
       booked: false,
       error: reason,
@@ -2797,11 +2799,13 @@ async function tryDirectBookingHref(
       navigationMs,
       verificationUrl: page.url(),
       bodySnippet: bodyText.replace(/\s+/g, ' ').trim().slice(0, 180),
+      ...evidence,
     };
   }
 
   const confirmResult = await fillPlayersAndConfirm(page, players, openSlots, dryRun);
   if (dryRun) {
+    const evidence = await savePageEvidence(page, `${jobId || 'direct'}-${time}-dry-run`);
     return {
       booked: false,
       dryRun: true,
@@ -2812,6 +2816,7 @@ async function tryDirectBookingHref(
       navigationMs,
       verificationSignal: 'dry-run',
       verificationUrl: page.url(),
+      ...evidence,
     };
   }
 
@@ -2821,6 +2826,10 @@ async function tryDirectBookingHref(
     verification.confirmed = false;
     verification.verificationSignal = 'players-missing';
   }
+  const evidence = await savePageEvidence(
+    page,
+    `${jobId || 'direct'}-${time}-${verification.confirmed ? 'confirmed' : verification.verificationSignal || 'failed'}`,
+  );
 
   return {
     booked:
@@ -2841,6 +2850,7 @@ async function tryDirectBookingHref(
         : confirmResult.confirmationText === 'confirm-button-not-found'
           ? 'confirm-button-not-found'
           : null,
+    ...evidence,
   };
 }
 
@@ -2938,6 +2948,28 @@ async function saveHtmlSnapshot(page, label) {
   } catch {
     return null;
   }
+}
+
+async function savePageScreenshot(page, label) {
+  try {
+    const outDir = path.join(agentDir, 'output');
+    await fs.promises.mkdir(outDir, { recursive: true });
+    const safe = String(label || 'booking').replace(/[^a-z0-9_-]/gi, '_');
+    const fileName = `${safe}-page-${Date.now()}.png`;
+    const filePath = path.join(outDir, fileName);
+    await page.screenshot({ path: filePath, fullPage: true });
+    return filePath;
+  } catch {
+    return null;
+  }
+}
+
+async function savePageEvidence(page, label) {
+  const [snapshotPath, screenshotPath] = await Promise.all([
+    saveHtmlSnapshot(page, label),
+    savePageScreenshot(page, label),
+  ]);
+  return { snapshotPath, screenshotPath };
 }
 
 function normalizeTimeToHHMM(value) {
@@ -3422,6 +3454,12 @@ async function runBooking(config) {
     };
 
     let bookingSuccess = false;
+    let finalClickDeltaMs = null;
+    let finalVerificationUrl = null;
+    let finalVerificationSignal = null;
+    let finalReleaseDetectDeltaMs = null;
+    let finalSnapshotPath = null;
+    let finalScreenshotPath = null;
     if (useReleaseObserver) {
       if (
         CONFIG.SNIPER_DIRECT_POLL_ENABLED &&
@@ -3468,6 +3506,8 @@ async function runBooking(config) {
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
                 release_detect_delta_ms: directPollResult.detectDeltaMs ?? null,
+                snapshot_path: directResult.snapshotPath ?? null,
+                screenshot_path: directResult.screenshotPath ?? null,
               });
               if (browser && !isWarm) await browser.close();
               return {
@@ -3482,6 +3522,8 @@ async function runBooking(config) {
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
                 release_detect_delta_ms: directPollResult.detectDeltaMs ?? null,
+                snapshotPath: directResult.snapshotPath ?? null,
+                screenshotPath: directResult.screenshotPath ?? null,
                 teeSelected: getTeeLabel(),
                 armedAfterTeeSelect: true,
               };
@@ -3495,6 +3537,12 @@ async function runBooking(config) {
               notes.push(
                 `Direct release booking confirmed for ${candidate.time}; click_delta=${directResult.clickDeltaMs}ms navigation=${directResult.navigationMs}ms`,
               );
+              finalClickDeltaMs = directResult.clickDeltaMs ?? null;
+              finalVerificationUrl = directResult.verificationUrl ?? null;
+              finalVerificationSignal = directResult.verificationSignal ?? null;
+              finalReleaseDetectDeltaMs = directPollResult.detectDeltaMs ?? null;
+              finalSnapshotPath = directResult.snapshotPath ?? null;
+              finalScreenshotPath = directResult.screenshotPath ?? null;
               break;
             }
 
@@ -3634,8 +3682,15 @@ async function runBooking(config) {
         };
 
         if (verification.confirmed) {
+          const evidence = await savePageEvidence(page, runId || jobId || 'release-confirmed');
           bookedTime = releaseClickedTime;
           fallbackLevel = 0;
+          finalClickDeltaMs = clickDeltaMsConfirmed;
+          finalVerificationUrl = verification.verificationUrl;
+          finalVerificationSignal = verification.verificationSignal;
+          finalReleaseDetectDeltaMs = releaseDetectDeltaMs;
+          finalSnapshotPath = evidence.snapshotPath;
+          finalScreenshotPath = evidence.screenshotPath;
           notes.push(`Release-night booking confirmed; Detected at delta ${releaseDetectDeltaMs}ms`);
           await fsFinishRun(runId, {
             result: 'success_confirmed',
@@ -3643,6 +3698,8 @@ async function runBooking(config) {
             latency_ms: Date.now() - startTime,
             chosen_time: bookedTime,
             fallback_level: fallbackLevel,
+            snapshot_path: evidence.snapshotPath,
+            screenshot_path: evidence.screenshotPath,
             ...diagnostics,
           });
           await sendPushFCM('✅ Tee Time Booked!', `Successfully booked (release)`, pushToken);
@@ -3655,14 +3712,16 @@ async function runBooking(config) {
             latencyMs: Date.now() - startTime,
             notes: notes.join(' | '),
             playersRequested: additionalPlayers,
+            snapshotPath: evidence.snapshotPath,
+            screenshotPath: evidence.screenshotPath,
             ...diagnostics,
           };
         }
 
         console.log('[SNIPER] Verification failed: no confirmation within 12s');
-        const snapshotPath = await saveHtmlSnapshot(page, runId || jobId || 'release');
+        const evidence = await savePageEvidence(page, runId || jobId || 'release');
         notes.push(
-          `Release click for ${releaseClickedTime} failed verification (${verification.verificationSignal || 'no-confirmation'}); snapshot=${snapshotPath || 'n/a'}`,
+          `Release click for ${releaseClickedTime} failed verification (${verification.verificationSignal || 'no-confirmation'}); snapshot=${evidence.snapshotPath || 'n/a'} screenshot=${evidence.screenshotPath || 'n/a'}`,
         );
 
         const releaseClickedHHMM = normalizeTimeToHHMM(releaseResult.slotTime);
@@ -3699,7 +3758,8 @@ async function runBooking(config) {
             latency_ms: Date.now() - startTime,
             chosen_time: bookedTime,
             fallback_level: fallbackLevel,
-            snapshot_path: snapshotPath,
+            snapshot_path: evidence.snapshotPath,
+            screenshot_path: evidence.screenshotPath,
             ...diagnostics,
           });
           if (browser && !isWarm) await browser.close();
@@ -3712,7 +3772,8 @@ async function runBooking(config) {
             notes: 'clicked but no confirmation',
             playersRequested: additionalPlayers,
             error: 'clicked but no confirmation',
-            snapshotPath,
+            snapshotPath: evidence.snapshotPath,
+            screenshotPath: evidence.screenshotPath,
             ...diagnostics,
           };
         }
@@ -3782,6 +3843,12 @@ async function runBooking(config) {
       latency_ms: Date.now() - startTime,
       chosen_time: bookedTime,
       fallback_level: fallbackLevel,
+      click_delta_ms: finalClickDeltaMs,
+      verification_url: finalVerificationUrl,
+      verification_signal: finalVerificationSignal,
+      release_detect_delta_ms: finalReleaseDetectDeltaMs,
+      snapshot_path: finalSnapshotPath,
+      screenshot_path: finalScreenshotPath,
     });
 
     if (success) {
@@ -3808,6 +3875,12 @@ async function runBooking(config) {
       latencyMs: Date.now() - startTime,
       notes: finalNotes,
       playersRequested: additionalPlayers,
+      click_delta_ms: finalClickDeltaMs,
+      verification_url: finalVerificationUrl,
+      verification_signal: finalVerificationSignal,
+      release_detect_delta_ms: finalReleaseDetectDeltaMs,
+      snapshotPath: finalSnapshotPath,
+      screenshotPath: finalScreenshotPath,
       ...(dryRun ? { teeSelected: getTeeLabel(), armedAfterTeeSelect: true } : {}),
     };
   } catch (error) {
