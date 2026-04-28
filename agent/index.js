@@ -760,6 +760,10 @@ const CONFIG = {
     process.env.SNIPER_DIRECT_POLL_MAX_IN_FLIGHT || '4',
     10,
   ),
+  SNIPER_RUNNING_RESUME_GRACE_MS: Number.parseInt(
+    process.env.SNIPER_RUNNING_RESUME_GRACE_MS || '120000',
+    10,
+  ),
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
   SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '10', 10),
   DRY_RUN: process.argv.includes('--dry-run'),
@@ -1097,6 +1101,15 @@ function isReadyJob(job) {
   return READY_JOB_STATUSES.includes(status);
 }
 
+function isRunningSniperJob(job) {
+  if (!job) return false;
+  const status = getJobStatus(job);
+  const state = String(job.state || '').toLowerCase();
+  const mode = String(job.mode || job.bookingMode || '').toLowerCase();
+  if (mode && mode !== 'sniper') return false;
+  return status === 'running' || state === 'running';
+}
+
 function getFireTimeFromJob(job) {
   const targetDateKey = getTargetDateKeyFromJob(job);
   if (targetDateKey) {
@@ -1172,6 +1185,32 @@ async function fsClaimSniperJob(jobId) {
     });
   } catch (error) {
     console.error('Error claiming job:', error);
+    return null;
+  }
+}
+
+async function fsResumeRunningSniperJob(jobId) {
+  if (!db) return null;
+  const ref = db.collection(JOBS_COLLECTION).doc(jobId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
+      const data = snap.data() || {};
+      if (!isRunningSniperJob(data)) return null;
+      const runId = data.run_id || data.runId || makeRunId();
+      tx.update(ref, {
+        claimed_at: admin.firestore.FieldValue.serverTimestamp(),
+        claimed_by: AGENT_ID,
+        resumed_at: admin.firestore.FieldValue.serverTimestamp(),
+        resume_count: admin.firestore.FieldValue.increment(1),
+        run_id: runId,
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { id: snap.id, ...data, claimed_by: AGENT_ID, run_id: runId };
+    });
+  } catch (error) {
+    console.error('Error resuming running job:', error);
     return null;
   }
 }
@@ -1314,18 +1353,30 @@ async function resumeRunningJobs() {
   try {
     const snapshot = await db
       .collection(JOBS_COLLECTION)
+      .where('mode', '==', 'sniper')
       .where('status', '==', 'running')
-      .where('claimed_by', '==', AGENT_ID)
       .get();
     if (snapshot.empty) return;
 
     const now = Date.now();
     for (const doc of snapshot.docs) {
       const job = { id: doc.id, ...doc.data() };
+      if (jobTimers.has(job.id)) continue;
       const fireTime = getFireTimeFromJob(job);
       const fireMs = fireTime?.getTime?.() ? fireTime.getTime() : null;
-      if (fireMs && fireMs > now) {
-        await scheduleClaimedJob(job);
+      if (!fireMs || Number.isNaN(fireMs)) {
+        await markJobError(job.id, 'missing-fire-time-after-restart');
+        continue;
+      }
+
+      const pastFireMs = now - fireMs;
+      if (fireMs > now || pastFireMs <= CONFIG.SNIPER_RUNNING_RESUME_GRACE_MS) {
+        const resumed = await fsResumeRunningSniperJob(job.id);
+        if (!resumed) continue;
+        console.log(
+          `[RUNNER] Resuming running job ${job.id} claimed_by=${job.claimed_by || 'n/a'} fireTime=${fireTime.toISOString()}`,
+        );
+        await scheduleClaimedJob({ ...job, ...resumed });
       } else {
         await markJobError(job.id, 'agent restart during run');
       }
