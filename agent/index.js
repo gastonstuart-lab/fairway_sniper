@@ -766,6 +766,10 @@ const CONFIG = {
   ),
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
   SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '10', 10),
+  SNIPER_NEAREST_SLOT_WINDOW_MINUTES: Number.parseInt(
+    process.env.SNIPER_NEAREST_SLOT_WINDOW_MINUTES || '6',
+    10,
+  ),
   DRY_RUN: process.argv.includes('--dry-run'),
   TEST_MODE: process.env.TEST_MODE === 'true',
   // Railway cold-start mitigation
@@ -2052,11 +2056,23 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     })
     .catch(() => {});
 
+  const normalizedOpenSlots = Number.isFinite(Number(openSlots))
+    ? Math.max(0, Number(openSlots))
+    : 3;
+  if (players.length > normalizedOpenSlots) {
+    console.log(
+      `  ⚠️ Full party does not fit: ${players.length} additional player(s), ${normalizedOpenSlots} open slot(s).`,
+    );
+    result.skippedReason = 'insufficient-open-slots';
+    result.confirmationText = 'insufficient-open-slots';
+    return result;
+  }
+
   // Only try to fill as many players as slots permit (max 3 additional players = slots 2, 3, 4)
-  const playersToFill = players.slice(0, Math.min(openSlots, 3));
+  const playersToFill = players.slice(0, Math.min(normalizedOpenSlots, 3));
 
   console.log(
-    `  👥 Attempting to fill ${playersToFill.length} player(s) (${openSlots} slot(s) available)...`,
+    `  👥 Attempting to fill ${playersToFill.length} player(s) (${normalizedOpenSlots} slot(s) available)...`,
   );
 
   // If no additional players needed, skip directly to confirmation
@@ -2250,11 +2266,19 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
         console.log(
           `    ⚠️ Player ${playerNum} field not found or player not selectable`,
         );
-        // Do not fail the booking; this is expected when openSlots < required players
       }
     } catch (error) {
       console.log(`    ❌ Error filling Player ${playerNum}: ${error.message}`);
     }
+  }
+
+  if (result.filled.length < playersToFill.length) {
+    console.log(
+      `  ⚠️ Not confirming: filled ${result.filled.length}/${playersToFill.length} requested player(s).`,
+    );
+    result.skippedReason = 'players-missing-before-confirm';
+    result.confirmationText = 'players-missing-before-confirm';
+    return result;
   }
 
   if (dryRun) {
@@ -2425,17 +2449,18 @@ async function tryBookTime(
     await page.waitForTimeout(2000);
 
     const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
+    const rowBooked =
+      confirmResult.confirmationText !== null &&
+      !confirmationBlocked(confirmResult.confirmationText);
     return {
-      booked:
-        confirmResult.confirmationText !== null &&
-        confirmResult.confirmationText !== 'confirm-button-not-found',
+      booked: rowBooked,
       playersFilled: confirmResult.filled,
       playersRequested: players.slice(0, Math.min(openSlots, 3)),
       confirmationText: confirmResult.confirmationText,
       skippedReason: confirmResult.skippedReason,
       error:
-        confirmResult.confirmationText === 'confirm-button-not-found'
-          ? 'confirm-button-not-found'
+        !rowBooked
+          ? confirmResult.confirmationText || 'booking-not-confirmed'
           : null,
     };
   }
@@ -2479,7 +2504,7 @@ async function tryBookTime(
   return {
     booked:
       verification.confirmed &&
-      confirmResult.confirmationText !== 'confirm-button-not-found',
+      !confirmationBlocked(confirmResult.confirmationText),
     playersFilled: confirmResult.filled,
     playersRequested: players.slice(0, Math.min(openSlots, 3)),
     confirmationText: confirmResult.confirmationText,
@@ -2491,8 +2516,8 @@ async function tryBookTime(
     error:
       !verification.confirmed
         ? 'clicked-but-no-confirmation'
-        : confirmResult.confirmationText === 'confirm-button-not-found'
-          ? 'confirm-button-not-found'
+        : confirmationBlocked(confirmResult.confirmationText)
+          ? confirmResult.confirmationText
           : null,
   };
 }
@@ -2607,16 +2632,12 @@ async function executeReleaseBooking(
     booked = true;
   } catch {
     // fallback to whatever confirmResult gave
-    booked =
-      confirmationText &&
-      !['confirm-button-not-found', 'confirm-clicked-no-confirmation-text'].includes(
-        confirmationText,
-      );
+    booked = Boolean(confirmationText) && !confirmationBlocked(confirmationText);
   }
   return { booked, confirmationText, playersFilled, clickDeltaMs: fireLatencyMs };
 }
 
-async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, targetFireTime) {
+async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, targetFireTime, options = {}) {
   if (!page?.context) {
     return { found: false, reason: 'missing-page-context', candidates: [] };
   }
@@ -2634,20 +2655,22 @@ async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, ta
     ? Math.max(1, CONFIG.SNIPER_DIRECT_POLL_MAX_IN_FLIGHT)
     : 4;
   const deadline = Date.now() + timeoutMs;
-  const preferredLabels = normalizeStringList(preferredTimes)
-    .map((time) => normalizeTimeLabel(time))
-    .filter(Boolean);
+  const preferredLabels = normalizePreferredTimeLabels(preferredTimes);
+  const requiredPartySize = Number.isFinite(Number(options.partySize))
+    ? Math.max(1, Number(options.partySize))
+    : 1;
   let attempt = 0;
   let lastStatus = null;
   let lastError = null;
   let lastCandidateCount = 0;
+  let lastSkippedInsufficientSlots = 0;
   let lastAvailableTimes = [];
   const inFlight = new Set();
   let nextLaunchAt = Date.now();
   let pollResolved = false;
 
   console.log(
-    `[SNIPER] Direct HTML poll armed for ${targetDateStr}; preferred=${preferredLabels.join(', ')} timeout=${timeoutMs}ms interval=${intervalMs}ms maxInFlight=${maxInFlight}`,
+    `[SNIPER] Direct HTML poll armed for ${targetDateStr}; preferred=${preferredLabels.join(', ')} partySize=${requiredPartySize} nearestWindow=${CONFIG.SNIPER_NEAREST_SLOT_WINDOW_MINUTES}m timeout=${timeoutMs}ms interval=${intervalMs}ms maxInFlight=${maxInFlight}`,
   );
 
   const launchAttempt = () => {
@@ -2667,7 +2690,10 @@ async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, ta
         });
         const httpStatus = response.status();
         const payloadText = await response.text();
-        const extracted = extractPreferredBookingLinks(payloadText, preferredTimes, targetDateStr);
+        const extracted = extractPreferredBookingLinks(payloadText, preferredTimes, targetDateStr, {
+          partySize: requiredPartySize,
+          nearestWindowMinutes: CONFIG.SNIPER_NEAREST_SLOT_WINDOW_MINUTES,
+        });
         const detectAt = Date.now();
         if (extracted.found && !pollResolved) {
           pollResolved = true;
@@ -2687,6 +2713,7 @@ async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, ta
           detectDeltaMs:
             Number.isFinite(targetFireTime) ? detectAt - targetFireTime : null,
           candidateCount: extracted.candidates.length,
+          skippedInsufficientSlots: extracted.skippedInsufficientSlots ?? 0,
         };
       } catch (error) {
         const message = error?.message || String(error);
@@ -2729,6 +2756,8 @@ async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, ta
     lastStatus = completed.httpStatus ?? lastStatus;
     lastError = completed.error ?? lastError;
     lastCandidateCount = completed.candidateCount ?? lastCandidateCount;
+    lastSkippedInsufficientSlots =
+      completed.skippedInsufficientSlots ?? lastSkippedInsufficientSlots;
     lastAvailableTimes = completed.availableTimes?.length ? completed.availableTimes : lastAvailableTimes;
     if (completed.found) {
       return completed;
@@ -2744,6 +2773,7 @@ async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, ta
     httpStatus: lastStatus,
     error: lastError,
     candidateCount: lastCandidateCount,
+    skippedInsufficientSlots: lastSkippedInsufficientSlots,
   };
 }
 
@@ -2834,7 +2864,7 @@ async function tryDirectBookingHref(
   return {
     booked:
       verification.confirmed &&
-      confirmResult.confirmationText !== 'confirm-button-not-found',
+      !confirmationBlocked(confirmResult.confirmationText),
     playersFilled: confirmResult.filled,
     playersRequested: players.slice(0, Math.min(openSlots, 3)),
     confirmationText: confirmResult.confirmationText,
@@ -2847,8 +2877,8 @@ async function tryDirectBookingHref(
     error:
       !verification.confirmed
         ? 'direct-clicked-but-no-confirmation'
-        : confirmResult.confirmationText === 'confirm-button-not-found'
-          ? 'confirm-button-not-found'
+        : confirmationBlocked(confirmResult.confirmationText)
+          ? confirmResult.confirmationText
           : null,
     ...evidence,
   };
@@ -2988,6 +3018,99 @@ function normalizeTimeLabel(value) {
   return `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`;
 }
 
+function normalizePreferredTimeLabels(preferredTimes) {
+  const seen = new Set();
+  const labels = [];
+  for (const time of normalizeStringList(preferredTimes)) {
+    const label = normalizeTimeLabel(time);
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  return labels;
+}
+
+function confirmationBlocked(confirmationText) {
+  return [
+    'confirm-button-not-found',
+    'confirm-clicked-no-confirmation-text',
+    'players-missing-before-confirm',
+    'insufficient-open-slots',
+  ].includes(confirmationText);
+}
+
+function countOpenParticipantSlots(participants) {
+  if (!Array.isArray(participants)) return null;
+  return participants.filter((participant) => {
+    const name = participant?.name;
+    return name === null || name === undefined || String(name).trim() === '';
+  }).length;
+}
+
+function getEntryOpenSlots(entry) {
+  const teeTime = entry?.tee_time || entry;
+  const participantSlots = countOpenParticipantSlots(teeTime?.participants || entry?.participants);
+  if (participantSlots !== null) return participantSlots;
+  const direct = teeTime?.open_slots ?? teeTime?.openSlots ?? entry?.open_slots ?? entry?.openSlots;
+  const parsed = Number.parseInt(direct, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function preferredSlotRank(timeLabel, preferredLabels, nearestWindowMinutes = Number.POSITIVE_INFINITY) {
+  const slotMinutes = timeToMinutes(timeLabel);
+  if (slotMinutes === null || !preferredLabels.length) {
+    return {
+      preferredIndex: preferredLabels.length ? Number.MAX_SAFE_INTEGER : 0,
+      deltaMinutes: 0,
+      direction: 0,
+      inWindow: true,
+    };
+  }
+
+  let best = null;
+  let nearest = null;
+  preferredLabels.forEach((preferred, index) => {
+    const preferredMinutes = timeToMinutes(preferred);
+    if (preferredMinutes === null) return;
+    const direction = slotMinutes - preferredMinutes;
+    const deltaMinutes = Math.abs(direction);
+    const candidate = {
+      preferredIndex: index,
+      deltaMinutes,
+      direction,
+      inWindow: deltaMinutes <= nearestWindowMinutes,
+    };
+    if (
+      !nearest ||
+      candidate.deltaMinutes < nearest.deltaMinutes ||
+      (candidate.deltaMinutes === nearest.deltaMinutes && candidate.preferredIndex < nearest.preferredIndex)
+    ) {
+      nearest = candidate;
+    }
+    if (!candidate.inWindow) return;
+    if (
+      !best ||
+      candidate.preferredIndex < best.preferredIndex ||
+      (candidate.preferredIndex === best.preferredIndex && candidate.deltaMinutes < best.deltaMinutes) ||
+      (
+        candidate.preferredIndex === best.preferredIndex &&
+        candidate.deltaMinutes === best.deltaMinutes &&
+        candidate.direction <= 0 &&
+        best.direction > 0
+      )
+    ) {
+      best = candidate;
+    }
+  });
+
+  return best || nearest || {
+    preferredIndex: Number.MAX_SAFE_INTEGER,
+    deltaMinutes: Number.MAX_SAFE_INTEGER,
+    direction: 0,
+    inWindow: false,
+  };
+}
+
 function compactDateKey(value) {
   const normalized = normalizeDateKey(value);
   return normalized ? normalized.replace(/-/g, '') : null;
@@ -3002,16 +3125,12 @@ function decodeHtmlAttribute(value) {
     .replace(/&gt;/g, '>');
 }
 
-function extractPreferredBookingLinksFromHtml(html, preferredTimes, targetDateKey) {
+function extractPreferredBookingLinksFromHtml(html, preferredTimes, targetDateKey, options = {}) {
   const targetDateCompact = compactDateKey(targetDateKey);
-  const preferredLabels = Array.from(
-    new Set(
-      normalizeStringList(preferredTimes)
-        .map((time) => normalizeTimeLabel(time))
-        .filter(Boolean),
-    ),
-  );
-  const preferredIndex = new Map(preferredLabels.map((time, index) => [time, index]));
+  const preferredLabels = normalizePreferredTimeLabels(preferredTimes);
+  const nearestWindowMinutes = Number.isFinite(options.nearestWindowMinutes)
+    ? Math.max(0, options.nearestWindowMinutes)
+    : CONFIG.SNIPER_NEAREST_SLOT_WINDOW_MINUTES;
   const foundByTime = new Map();
   const hrefRegex = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
   let match;
@@ -3033,18 +3152,25 @@ function extractPreferredBookingLinksFromHtml(html, preferredTimes, targetDateKe
     const timeLabel = normalizeTimeLabel(timeSegment);
     if (!timeLabel) continue;
     if (targetDateCompact && dateSegment !== targetDateCompact) continue;
-    if (preferredLabels.length > 0 && !preferredIndex.has(timeLabel)) continue;
+    const rank = preferredSlotRank(timeLabel, preferredLabels, nearestWindowMinutes);
+    if (preferredLabels.length > 0 && !rank.inWindow) continue;
     if (foundByTime.has(timeLabel)) continue;
 
     foundByTime.set(timeLabel, {
       time: timeLabel,
       href: parsed.href,
-      preferredIndex: preferredIndex.has(timeLabel) ? preferredIndex.get(timeLabel) : foundByTime.size,
+      preferredIndex: rank.preferredIndex,
+      preferenceDeltaMinutes: rank.deltaMinutes,
+      preferenceDirection: rank.direction,
+      openSlots: null,
     });
   }
 
   const candidates = Array.from(foundByTime.values()).sort((a, b) => {
     if (a.preferredIndex !== b.preferredIndex) return a.preferredIndex - b.preferredIndex;
+    if (a.preferenceDeltaMinutes !== b.preferenceDeltaMinutes) {
+      return a.preferenceDeltaMinutes - b.preferenceDeltaMinutes;
+    }
     return a.time.localeCompare(b.time);
   });
 
@@ -3053,29 +3179,39 @@ function extractPreferredBookingLinksFromHtml(html, preferredTimes, targetDateKe
     candidates,
     availableTimes: candidates.map((candidate) => candidate.time),
     preferredTimes: preferredLabels,
+    skippedInsufficientSlots: 0,
   };
 }
 
-function extractPreferredBookingLinksFromTeeData(payload, preferredTimes, targetDateKey) {
-  const preferredLabels = Array.from(
-    new Set(
-      normalizeStringList(preferredTimes)
-        .map((time) => normalizeTimeLabel(time))
-        .filter(Boolean),
-    ),
-  );
-  const preferredIndex = new Map(preferredLabels.map((time, index) => [time, index]));
+function extractPreferredBookingLinksFromTeeData(payload, preferredTimes, targetDateKey, options = {}) {
+  const preferredLabels = normalizePreferredTimeLabels(preferredTimes);
+  const requiredPartySize = Number.isFinite(Number(options.partySize))
+    ? Math.max(1, Number(options.partySize))
+    : 1;
+  const nearestWindowMinutes = Number.isFinite(options.nearestWindowMinutes)
+    ? Math.max(0, options.nearestWindowMinutes)
+    : CONFIG.SNIPER_NEAREST_SLOT_WINDOW_MINUTES;
   const targetDateCompact = compactDateKey(targetDateKey);
   const candidates = [];
   const times = payload?.times && typeof payload.times === 'object' ? payload.times : {};
-  const labelsToCheck = preferredLabels.length ? preferredLabels : Object.keys(times);
+  let skippedInsufficientSlots = 0;
 
-  for (const timeLabel of labelsToCheck) {
+  for (const timeLabel of Object.keys(times)) {
     const normalizedTime = normalizeTimeLabel(timeLabel);
     if (!normalizedTime) continue;
     const entry = times[normalizedTime] || times[timeLabel];
+    const teeTime = entry?.tee_time || entry;
+    const bookable = teeTime?.bookable ?? entry?.bookable;
+    if (bookable === false) continue;
     const urlValue = entry?.tee_time?.url || entry?.url || entry?.href;
     if (!urlValue) continue;
+    const openSlots = getEntryOpenSlots(entry);
+    if (openSlots !== null && openSlots < requiredPartySize) {
+      skippedInsufficientSlots += 1;
+      continue;
+    }
+    const rank = preferredSlotRank(normalizedTime, preferredLabels, nearestWindowMinutes);
+    if (preferredLabels.length > 0 && !rank.inWindow) continue;
 
     let parsed;
     try {
@@ -3093,16 +3229,21 @@ function extractPreferredBookingLinksFromTeeData(payload, preferredTimes, target
     candidates.push({
       time: normalizedTime,
       href: parsed.href,
-      preferredIndex: preferredIndex.has(normalizedTime)
-        ? preferredIndex.get(normalizedTime)
-        : candidates.length,
-      bookable: entry?.tee_time?.bookable ?? entry?.bookable ?? null,
-      editable: entry?.tee_time?.editable ?? entry?.editable ?? null,
+      preferredIndex: rank.preferredIndex,
+      preferenceDeltaMinutes: rank.deltaMinutes,
+      preferenceDirection: rank.direction,
+      openSlots,
+      bookable: teeTime?.bookable ?? entry?.bookable ?? null,
+      editable: teeTime?.editable ?? entry?.editable ?? null,
     });
   }
 
   candidates.sort((a, b) => {
     if (a.preferredIndex !== b.preferredIndex) return a.preferredIndex - b.preferredIndex;
+    if (a.preferenceDeltaMinutes !== b.preferenceDeltaMinutes) {
+      return a.preferenceDeltaMinutes - b.preferenceDeltaMinutes;
+    }
+    if ((b.openSlots ?? 0) !== (a.openSlots ?? 0)) return (b.openSlots ?? 0) - (a.openSlots ?? 0);
     return a.time.localeCompare(b.time);
   });
 
@@ -3111,18 +3252,30 @@ function extractPreferredBookingLinksFromTeeData(payload, preferredTimes, target
     candidates,
     availableTimes: candidates.map((candidate) => candidate.time),
     preferredTimes: preferredLabels,
+    skippedInsufficientSlots,
   };
 }
 
-function extractPreferredBookingLinks(payloadText, preferredTimes, targetDateKey) {
+function extractPreferredBookingLinks(payloadText, preferredTimes, targetDateKey, options = {}) {
   try {
     const parsed = JSON.parse(String(payloadText || ''));
-    const extracted = extractPreferredBookingLinksFromTeeData(parsed, preferredTimes, targetDateKey);
+    const extracted = extractPreferredBookingLinksFromTeeData(parsed, preferredTimes, targetDateKey, options);
+    if (parsed?.times && typeof parsed.times === 'object') return extracted;
     if (extracted.found) return extracted;
   } catch {
     // Fall back to HTML extraction below.
   }
-  return extractPreferredBookingLinksFromHtml(payloadText, preferredTimes, targetDateKey);
+  if (Number(options.partySize || 1) > 1) {
+    return {
+      found: false,
+      candidates: [],
+      availableTimes: [],
+      preferredTimes: normalizePreferredTimeLabels(preferredTimes),
+      skippedInsufficientSlots: 0,
+      reason: 'capacity-unknown-html-response',
+    };
+  }
+  return extractPreferredBookingLinksFromHtml(payloadText, preferredTimes, targetDateKey, options);
 }
 
 function timeToMinutes(value) {
@@ -3208,18 +3361,7 @@ async function runBooking(config) {
   const teeDate = dateFromDateKey(targetDateStr) || new Date();
   const notes = [];
   const requestedPreferredTimes = normalizeStringList(preferredTimes);
-  const normalizedPreferredTimes = expandPreferredTimes(
-    requestedPreferredTimes,
-    CONFIG.SNIPER_FALLBACK_WINDOW_MINUTES,
-    CONFIG.SNIPER_FALLBACK_STEP_MINUTES,
-  );
-  if (requestedPreferredTimes.length > 0) {
-    const expanded = normalizedPreferredTimes.join(', ');
-    const original = requestedPreferredTimes.join(', ');
-    if (expanded && expanded !== original) {
-      console.log(`[SNIPER] Expanded preferred times: ${expanded}`);
-    }
-  }
+  const normalizedPreferredTimes = normalizePreferredTimeLabels(requestedPreferredTimes);
   let bookedTime = null;
   let fallbackLevel = 0;
   let fallbackTeeUsed = false;
@@ -3291,7 +3433,11 @@ async function runBooking(config) {
         time: slot.time,
         state: slot.state,
         href: slot.href,
-        openSlots: slot.state === 'bookable' ? 3 : 0,
+        openSlots: Number.isFinite(Number(slot.openSlots))
+          ? Number(slot.openSlots)
+          : slot.state === 'bookable'
+            ? 3
+            : 0,
       }));
     };
     let bookingSlots = Array.isArray(slotsData) ? [...slotsData] : [];
@@ -3303,6 +3449,11 @@ async function runBooking(config) {
         (Array.isArray(slots) ? slots : [])
           .filter((slot) => {
             if (!slot?.time) return false;
+            const requiredPartySize =
+              typeof partySize === 'number' ? Math.max(1, partySize) : Math.max(1, players.length + 1);
+            if (Number.isFinite(Number(slot.openSlots)) && Number(slot.openSlots) < requiredPartySize) {
+              return false;
+            }
             return !bookableOnly || slot.state === 'bookable' || !!slot.href;
           })
           .map((slot) => slot.time),
@@ -3311,6 +3462,7 @@ async function runBooking(config) {
     };
 
     const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
+    const desiredPartySize = desiredAdditionalCount + 1;
     additionalPlayers = players.slice(0, desiredAdditionalCount);
     const releaseArmLeadMs = useReleaseObserver && Number.isFinite(CONFIG.SNIPER_RELEASE_ARM_LEAD_MS)
       ? Math.max(0, CONFIG.SNIPER_RELEASE_ARM_LEAD_MS)
@@ -3470,16 +3622,22 @@ async function runBooking(config) {
           targetDateStr,
           searchTimes,
           targetFireTime,
+          { partySize: desiredPartySize },
         );
 
         if (directPollResult.found) {
           notes.push(
-            `direct-html-poll found ${directPollResult.availableTimes.join(', ')} attempt=${directPollResult.attempt} detect_delta=${directPollResult.detectDeltaMs}ms`,
+            `direct-html-poll found ${directPollResult.availableTimes.join(', ')} attempt=${directPollResult.attempt} detect_delta=${directPollResult.detectDeltaMs}ms skipped_insufficient=${directPollResult.skippedInsufficientSlots || 0}`,
           );
 
           for (const candidate of directPollResult.candidates) {
             const slotInfo = bookingSlots.find((slot) => slot.time === candidate.time);
-            const openSlots = slotInfo && slotInfo.openSlots > 0 ? slotInfo.openSlots : 3;
+            const openSlots =
+              Number.isFinite(Number(candidate.openSlots)) && Number(candidate.openSlots) > 0
+                ? Number(candidate.openSlots)
+                : slotInfo && slotInfo.openSlots > 0
+                  ? slotInfo.openSlots
+                  : 3;
             const directResult = await tryDirectBookingHref(
               page,
               candidate,
@@ -3558,21 +3716,30 @@ async function runBooking(config) {
           }
         } else {
           notes.push(
-            `direct-html-poll timeout attempts=${directPollResult.attempt} status=${directPollResult.httpStatus || 'n/a'} candidates=${directPollResult.candidateCount || 0}`,
+            `direct-html-poll timeout attempts=${directPollResult.attempt} status=${directPollResult.httpStatus || 'n/a'} candidates=${directPollResult.candidateCount || 0} skipped_insufficient=${directPollResult.skippedInsufficientSlots || 0}`,
           );
         }
       } else if ((teeCtx?.teeTarget ?? normalizedTeeTarget) !== 1) {
         notes.push('direct-html-poll skipped for non-1st-tee target');
       }
 
-      const watchMs = Number.isFinite(CONFIG.SNIPER_RELEASE_WATCH_MS)
-        ? Math.max(500, CONFIG.SNIPER_RELEASE_WATCH_MS)
-        : 8000;
-      const retries = Number.isFinite(CONFIG.SNIPER_RELEASE_RETRY_COUNT)
-        ? Math.max(0, CONFIG.SNIPER_RELEASE_RETRY_COUNT)
-        : 2;
-      const maxAttempts = retries + 1;
-      for (let attempt = 1; !bookingSuccess && attempt <= maxAttempts; attempt += 1) {
+      const allowDomReleaseWatcher =
+        desiredPartySize <= 1 ||
+        !CONFIG.SNIPER_DIRECT_POLL_ENABLED ||
+        (teeCtx?.teeTarget ?? normalizedTeeTarget) !== 1;
+      if (!allowDomReleaseWatcher) {
+        notes.push(
+          'release-dom-watcher skipped for multi-player job; direct BRS data required to prove open slots',
+        );
+      } else {
+        const watchMs = Number.isFinite(CONFIG.SNIPER_RELEASE_WATCH_MS)
+          ? Math.max(500, CONFIG.SNIPER_RELEASE_WATCH_MS)
+          : 8000;
+        const retries = Number.isFinite(CONFIG.SNIPER_RELEASE_RETRY_COUNT)
+          ? Math.max(0, CONFIG.SNIPER_RELEASE_RETRY_COUNT)
+          : 2;
+        const maxAttempts = retries + 1;
+        for (let attempt = 1; !bookingSuccess && attempt <= maxAttempts; attempt += 1) {
         console.log(
           `[SNIPER] Release watcher (MutationObserver) armed... attempt ${attempt}/${maxAttempts} timeout ${watchMs}ms`,
         );
@@ -3657,11 +3824,7 @@ async function runBooking(config) {
           releaseResult.slotTime || 'release',
           12000,
         );
-        if (
-          ['confirm-button-not-found', 'confirm-clicked-no-confirmation-text'].includes(
-            clickResult?.confirmationText,
-          )
-        ) {
+        if (confirmationBlocked(clickResult?.confirmationText)) {
           verification.confirmed = false;
           verification.verificationSignal = 'confirm-missing';
         }
@@ -3787,6 +3950,7 @@ async function runBooking(config) {
           }
         } catch (refreshError) {
           console.warn('[SNIPER] Could not refresh slots after release watcher timeout:', refreshError?.message || refreshError);
+        }
         }
       }
     }
