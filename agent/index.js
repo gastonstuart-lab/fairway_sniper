@@ -3672,6 +3672,8 @@ async function runBooking(config) {
     let finalReleaseDetectDeltaMs = null;
     let finalSnapshotPath = null;
     let finalScreenshotPath = null;
+    let finalBookingLinksCountAfterClick = null;
+    let finalError = null;
     if (useReleaseObserver) {
       if (
         CONFIG.SNIPER_DIRECT_POLL_ENABLED &&
@@ -3767,7 +3769,29 @@ async function runBooking(config) {
 
             const directFailure = directResult?.error || directResult?.confirmationText || 'direct-booking-failed';
             console.log(`Could not complete direct booking for ${candidate.time}: ${directFailure}`);
-            notes.push(`Could not complete direct booking for ${candidate.time}: ${directFailure}`);
+            finalError = finalError || directFailure;
+            finalClickDeltaMs = finalClickDeltaMs ?? directResult?.clickDeltaMs ?? null;
+            finalVerificationUrl = finalVerificationUrl ?? directResult?.verificationUrl ?? null;
+            finalVerificationSignal = finalVerificationSignal ?? directResult?.verificationSignal ?? null;
+            finalReleaseDetectDeltaMs = finalReleaseDetectDeltaMs ?? directPollResult.detectDeltaMs ?? null;
+            finalSnapshotPath = finalSnapshotPath ?? directResult?.snapshotPath ?? null;
+            finalScreenshotPath = finalScreenshotPath ?? directResult?.screenshotPath ?? null;
+            finalBookingLinksCountAfterClick =
+              finalBookingLinksCountAfterClick ?? directResult?.bookingLinksCountAfterClick ?? null;
+            notes.push(
+              `Could not complete direct booking for ${candidate.time}: ${directFailure}; ` +
+                `url=${directResult?.verificationUrl || page.url()}; ` +
+                `signal=${directResult?.verificationSignal || 'n/a'}; ` +
+                `snapshot=${directResult?.snapshotPath || 'n/a'}; ` +
+                `screenshot=${directResult?.screenshotPath || 'n/a'}; ` +
+                `body=${directResult?.bodySnippet || 'n/a'}`,
+            );
+
+            if (!dryRun) {
+              await reloadTeeSheetForRetry(`direct-booking-failed-${candidate.time}`).catch((error) => {
+                console.warn('[SNIPER] Reload after direct candidate failure failed:', error?.message || error);
+              });
+            }
           }
 
           if (!bookingSuccess) {
@@ -4071,6 +4095,7 @@ async function runBooking(config) {
       click_delta_ms: finalClickDeltaMs,
       verification_url: finalVerificationUrl,
       verification_signal: finalVerificationSignal,
+      booking_links_count_after_click: finalBookingLinksCountAfterClick,
       release_detect_delta_ms: finalReleaseDetectDeltaMs,
       snapshot_path: finalSnapshotPath,
       screenshot_path: finalScreenshotPath,
@@ -4106,9 +4131,11 @@ async function runBooking(config) {
       click_delta_ms: finalClickDeltaMs,
       verification_url: finalVerificationUrl,
       verification_signal: finalVerificationSignal,
+      booking_links_count_after_click: finalBookingLinksCountAfterClick,
       release_detect_delta_ms: finalReleaseDetectDeltaMs,
       snapshotPath: finalSnapshotPath,
       screenshotPath: finalScreenshotPath,
+      error: success ? null : finalError,
       ...(dryRun ? { teeSelected: getTeeLabel(), armedAfterTeeSelect: true } : {}),
     };
   } catch (error) {
