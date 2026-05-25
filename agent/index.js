@@ -1314,20 +1314,32 @@ async function scheduleClaimedJob(job) {
   const timeoutId = setTimeout(async () => {
     jobTimers.delete(jobId);
     try {
-      const ownerUid = job.ownerUid || job.owner_uid || 'unknown';
-      const username = job.brs_email || job.brsEmail || job.username;
-      const password = job.brs_password || job.brsPassword || job.password;
-      const preferredTimes = Array.isArray(job.preferred_times)
-        ? normalizeStringList(job.preferred_times)
-        : normalizeStringList(job.preferredTimes ?? job.preferred_times);
-      const players = Array.isArray(job.players) ? job.players : [];
-      const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
-      const pushToken = job.push_token || job.pushToken;
-      const dryRun = job.dry_run === true || job.dryRun === true;
-      const tee = typeof job.tee === 'number' ? job.tee : 1;
+      let runJob = job;
+      if (db) {
+        try {
+          const latestSnap = await db.collection(JOBS_COLLECTION).doc(jobId).get();
+          if (latestSnap.exists) {
+            runJob = { id: latestSnap.id, ...latestSnap.data() };
+            console.log(`[RUNNER] Re-read latest job fields before run ${jobId}`);
+          }
+        } catch (latestError) {
+          console.warn(`[RUNNER] Could not re-read latest job ${jobId}: ${latestError?.message || latestError}`);
+        }
+      }
+      const ownerUid = runJob.ownerUid || runJob.owner_uid || 'unknown';
+      const username = runJob.brs_email || runJob.brsEmail || runJob.username;
+      const password = runJob.brs_password || runJob.brsPassword || runJob.password;
+      const preferredTimes = Array.isArray(runJob.preferred_times)
+        ? normalizeStringList(runJob.preferred_times)
+        : normalizeStringList(runJob.preferredTimes ?? runJob.preferred_times);
+      const players = Array.isArray(runJob.players) ? runJob.players : [];
+      const partySize = typeof runJob.party_size === 'number' ? runJob.party_size : runJob.partySize;
+      const pushToken = runJob.push_token || runJob.pushToken;
+      const dryRun = runJob.dry_run === true || runJob.dryRun === true;
+      const tee = typeof runJob.tee === 'number' ? runJob.tee : 1;
 
       console.log(`[RUNNER] runBooking start ${jobId}`);
-      console.log(`[RUNNER] Target play date: ${targetDateKey}`);
+      console.log(`[RUNNER] Target play date: ${getTargetDateKeyFromJob(runJob) || targetDateKey}`);
       console.log(`[RUNNER] Preferred times: ${preferredTimes.join(', ') || '(none)'}`);
       console.log(`[RUNNER] Fire time UTC: ${scheduleAt.toISOString()}`);
       const result = await runBooking({
@@ -1338,8 +1350,8 @@ async function scheduleClaimedJob(job) {
         password,
         preferredTimes,
         targetFireTime: fireMs,
-        targetPlayDate: targetPlayDate,
-        targetDate: getTargetDateKeyFromJob(job),
+        targetPlayDate: resolveTargetPlayDate(runJob) || targetPlayDate,
+        targetDate: getTargetDateKeyFromJob(runJob) || getTargetDateKeyFromJob(job),
         players,
         partySize,
         slotsData: [],
