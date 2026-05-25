@@ -2096,6 +2096,7 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     filled: [],
     skippedReason: null,
     confirmationText: null,
+    fieldDiagnostics: [],
   };
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
@@ -2149,8 +2150,41 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
         const selectId = `#member_booking_form_player_${playerNum}`;
         const selectElem = page.locator(selectId).first();
         if (await selectElem.count()) {
+          const fieldInfo = await selectElem
+            .evaluate((el, requestedValue) => {
+              const options = Array.from(el.options || []).map((option) => ({
+                value: option.value,
+                text: (option.textContent || '').replace(/\s+/g, ' ').trim(),
+                disabled: option.disabled,
+              }));
+              return {
+                id: el.id,
+                disabled: !!el.disabled,
+                visible:
+                  getComputedStyle(el).display !== 'none' &&
+                  getComputedStyle(el).visibility !== 'hidden',
+                optionCount: options.length,
+                hasRequestedValue: options.some((option) => option.value === String(requestedValue)),
+                selectedValue: el.value || '',
+                selectedText:
+                  el.selectedOptions && el.selectedOptions[0]
+                    ? (el.selectedOptions[0].textContent || '').replace(/\s+/g, ' ').trim()
+                    : '',
+              };
+            }, playerName)
+            .catch((error) => ({ error: error?.message || String(error) }));
+          result.fieldDiagnostics.push({ playerNum, requested: playerName, ...fieldInfo });
+          if (fieldInfo?.disabled) {
+            console.log(`    ⚠️ Player ${playerNum}: field ${selectId} is disabled`);
+            continue;
+          }
+          if (fieldInfo && fieldInfo.hasRequestedValue === false) {
+            console.log(`    ⚠️ Player ${playerNum}: value ${playerName} not present in ${selectId}`);
+            continue;
+          }
           try {
-            await selectElem.selectOption({ value: playerName });
+            await selectElem.selectOption({ value: playerName }, { timeout: 2000 });
+            await page.waitForTimeout(500);
             console.log(
               `    ✅ Player ${playerNum}: ${playerName} (select by id)`,
             );
@@ -2442,6 +2476,7 @@ async function tryBookTime(
   cachedLocator = null,
   targetFireTime = Date.now(),
   jobId = null,
+  dryRun = false,
 ) {
   // Wait for tee sheet rows to exist
   console.log(`  ⏳ Waiting for tee sheet to load...`);
@@ -2497,7 +2532,22 @@ async function tryBookTime(
     console.log(`[FIRE] Delta ms: ${clickTime - targetFireTime}ms`);
     await page.waitForTimeout(2000);
 
-    const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
+    const confirmResult = await fillPlayersAndConfirm(page, players, openSlots, dryRun);
+    const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
+    const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+    if (dryRun) {
+      return {
+        booked: false,
+        dryRun: true,
+        formValidated,
+        playersFilled: confirmResult.filled,
+        playersRequested: players.slice(0, Math.min(openSlots, 3)),
+        confirmationText: confirmResult.confirmationText,
+        skippedReason: confirmResult.skippedReason,
+        fieldDiagnostics: confirmResult.fieldDiagnostics,
+        error: formValidated ? null : 'dry-run-players-missing',
+      };
+    }
     const rowBooked =
       confirmResult.confirmationText !== null &&
       !confirmationBlocked(confirmResult.confirmationText);
@@ -2507,6 +2557,7 @@ async function tryBookTime(
       playersRequested: players.slice(0, Math.min(openSlots, 3)),
       confirmationText: confirmResult.confirmationText,
       skippedReason: confirmResult.skippedReason,
+      fieldDiagnostics: confirmResult.fieldDiagnostics,
       error:
         !rowBooked
           ? confirmResult.confirmationText || 'booking-not-confirmed'
@@ -2533,12 +2584,27 @@ async function tryBookTime(
   page.on('dialog', (dialog) => dialog.accept());
 
   // Call the unified player selection and confirmation helper
-  const confirmResult = await fillPlayersAndConfirm(page, players, openSlots);
+  const confirmResult = await fillPlayersAndConfirm(page, players, openSlots, dryRun);
+  const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
+  const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+  if (dryRun) {
+    return {
+      booked: false,
+      dryRun: true,
+      formValidated,
+      playersFilled: confirmResult.filled,
+      playersRequested: players.slice(0, Math.min(openSlots, 3)),
+      confirmationText: confirmResult.confirmationText,
+      skippedReason: confirmResult.skippedReason,
+      fieldDiagnostics: confirmResult.fieldDiagnostics,
+      clickDeltaMs,
+      error: formValidated ? null : 'dry-run-players-missing',
+    };
+  }
 
   console.log('  ✅ Clicked booking link');
   console.log('  🔍 Verification started...');
   const verification = await verifyBookingConfirmation(page, time, 10000);
-  const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
   if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
     verification.confirmed = false;
     verification.verificationSignal = 'players-missing';
@@ -2558,6 +2624,7 @@ async function tryBookTime(
     playersRequested: players.slice(0, Math.min(openSlots, 3)),
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
+    fieldDiagnostics: confirmResult.fieldDiagnostics,
     verificationSignal: verification.verificationSignal,
     verificationUrl: verification.verificationUrl,
     bookingLinksCountAfterClick: verification.bookingLinksCountAfterClick,
@@ -2683,7 +2750,13 @@ async function executeReleaseBooking(
     // fallback to whatever confirmResult gave
     booked = Boolean(confirmationText) && !confirmationBlocked(confirmationText);
   }
-  return { booked, confirmationText, playersFilled, clickDeltaMs: fireLatencyMs };
+  return {
+    booked,
+    confirmationText,
+    playersFilled,
+    fieldDiagnostics: confirmResult.fieldDiagnostics,
+    clickDeltaMs: fireLatencyMs,
+  };
 }
 
 async function pollPreferredBookingLinks(page, targetDateStr, preferredTimes, targetFireTime, options = {}) {
@@ -2883,14 +2956,19 @@ async function tryDirectBookingHref(
   }
 
   const confirmResult = await fillPlayersAndConfirm(page, players, openSlots, dryRun);
+  const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
   if (dryRun) {
+    const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
     const evidence = await savePageEvidence(page, `${jobId || 'direct'}-${time}-dry-run`);
     return {
       booked: false,
       dryRun: true,
+      formValidated,
+      error: formValidated ? null : 'dry-run-players-missing',
       confirmationText: confirmResult.confirmationText,
       playersFilled: confirmResult.filled,
       playersRequested: players.slice(0, Math.min(openSlots, 3)),
+      fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs,
       navigationMs,
       verificationSignal: 'dry-run',
@@ -2900,7 +2978,6 @@ async function tryDirectBookingHref(
   }
 
   const verification = await verifyBookingConfirmation(page, time, 8000);
-  const expectedPlayersCount = players.slice(0, Math.min(openSlots, 3)).length;
   if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
     verification.confirmed = false;
     verification.verificationSignal = 'players-missing';
@@ -2918,6 +2995,7 @@ async function tryDirectBookingHref(
     playersRequested: players.slice(0, Math.min(openSlots, 3)),
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
+    fieldDiagnostics: confirmResult.fieldDiagnostics,
     verificationSignal: verification.verificationSignal,
     verificationUrl: verification.verificationUrl,
     bookingLinksCountAfterClick: verification.bookingLinksCountAfterClick,
@@ -3085,6 +3163,7 @@ function confirmationBlocked(confirmationText) {
     'confirm-clicked-no-confirmation-text',
     'players-missing-before-confirm',
     'insufficient-open-slots',
+    'dry-run-no-confirm',
   ].includes(confirmationText);
 }
 
@@ -3629,6 +3708,7 @@ async function runBooking(config) {
             locatorCache[time] || releaseFallbackLocator,
             targetFireTime,
             jobId,
+            dryRun,
           );
           if (bookingResult && bookingResult.booked) {
             bookedTime = time;
@@ -3638,10 +3718,28 @@ async function runBooking(config) {
               `Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`,
             );
             break;
+          } else if (bookingResult?.dryRun && bookingResult?.formValidated) {
+            bookedTime = time;
+            const preferenceIndex = normalizedPreferredTimes.indexOf(time);
+            fallbackLevel = preferenceIndex >= 0 ? preferenceIndex : index;
+            notes.push(
+              `Dry-run validated ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}`,
+            );
+            break;
           } else if (bookingResult) {
             const msg = `Could not complete booking for ${time}: ${bookingResult.error || bookingResult.confirmationText}`;
             console.log(msg);
-            notes.push(msg);
+            finalError = finalError || bookingResult.error || bookingResult.confirmationText || 'booking-failed';
+            notes.push(
+              bookingResult.fieldDiagnostics
+                ? `${msg}; fields=${JSON.stringify(bookingResult.fieldDiagnostics)}`
+                : msg,
+            );
+            if (index < timesToTry.length - 1) {
+              await reloadTeeSheetForRetry(`preferred-time-failed-${time}`).catch((error) => {
+                console.warn('[SNIPER] Reload after preferred time failure failed:', error?.message || error);
+              });
+            }
           }
         } catch (error) {
           const msg = `Failed to book ${time}: ${error.message}`;
@@ -3674,7 +3772,14 @@ async function runBooking(config) {
     let finalScreenshotPath = null;
     let finalBookingLinksCountAfterClick = null;
     let finalError = null;
+    let directCapacityRequired = false;
+    let directCapacityFailed = false;
+    let directCandidatesExhausted = false;
     if (useReleaseObserver) {
+      directCapacityRequired =
+        desiredPartySize > 1 &&
+        CONFIG.SNIPER_DIRECT_POLL_ENABLED &&
+        (teeCtx?.teeTarget ?? normalizedTeeTarget) === 1;
       if (
         CONFIG.SNIPER_DIRECT_POLL_ENABLED &&
         (teeCtx?.teeTarget ?? normalizedTeeTarget) === 1
@@ -3710,7 +3815,7 @@ async function runBooking(config) {
               dryRun,
             );
 
-            if (directResult?.dryRun) {
+            if (directResult?.dryRun && directResult?.formValidated) {
               bookedTime = candidate.time;
               fallbackLevel = candidate.preferredIndex ?? normalizedPreferredTimes.indexOf(candidate.time);
               notes.push(
@@ -3738,6 +3843,7 @@ async function runBooking(config) {
                 latencyMs: Date.now() - startTime,
                 notes: notes.join(' | '),
                 playersRequested: additionalPlayers,
+                fieldDiagnostics: directResult.fieldDiagnostics ?? null,
                 click_delta_ms: directResult.clickDeltaMs ?? null,
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
@@ -3784,6 +3890,7 @@ async function runBooking(config) {
                 `signal=${directResult?.verificationSignal || 'n/a'}; ` +
                 `snapshot=${directResult?.snapshotPath || 'n/a'}; ` +
                 `screenshot=${directResult?.screenshotPath || 'n/a'}; ` +
+                `fields=${directResult?.fieldDiagnostics ? JSON.stringify(directResult.fieldDiagnostics) : 'n/a'}; ` +
                 `body=${directResult?.bodySnippet || 'n/a'}`,
             );
 
@@ -3795,11 +3902,16 @@ async function runBooking(config) {
           }
 
           if (!bookingSuccess) {
+            directCandidatesExhausted = true;
             await reloadTeeSheetForRetry('direct-html-poll-candidates-failed').catch((error) => {
               console.warn('[SNIPER] Reload after direct poll failure failed:', error?.message || error);
             });
           }
         } else {
+          if (directCapacityRequired) {
+            directCapacityFailed = true;
+            finalError = finalError || 'direct-capacity-proof-failed';
+          }
           notes.push(
             `direct-html-poll timeout attempts=${directPollResult.attempt} status=${directPollResult.httpStatus || 'n/a'} candidates=${directPollResult.candidateCount || 0} skipped_insufficient=${directPollResult.skippedInsufficientSlots || 0}`,
           );
@@ -4039,7 +4151,17 @@ async function runBooking(config) {
         }
       }
     }
-    if (!bookingSuccess) {
+    const skipUnsafeMultiPlayerDomFallback =
+      directCapacityRequired && (directCapacityFailed || directCandidatesExhausted);
+    if (!bookingSuccess && skipUnsafeMultiPlayerDomFallback) {
+      const reason = directCapacityFailed
+        ? 'no direct BRS capacity proof for full party'
+        : 'direct BRS candidates exhausted for full party';
+      console.warn(`[SNIPER] Skipping DOM fallback for multi-player job: ${reason}`);
+      notes.push(`Skipped DOM fallback for multi-player job: ${reason}`);
+      finalError = finalError || (directCapacityFailed ? 'direct-capacity-proof-failed' : 'direct-candidates-exhausted');
+    }
+    if (!bookingSuccess && !skipUnsafeMultiPlayerDomFallback) {
       bookingSuccess = await runPreferredTimesLoop(searchTimes);
     }
     if (!bookingSuccess && teeCtx?.fallbackTee && !fallbackTeeUsed) {
