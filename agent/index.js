@@ -695,6 +695,13 @@ let firebaseAdminReady = false;
 let firebaseAdminError = null;
 let sniperRunnerStarted = false;
 
+function normalizeFirebasePrivateKey(value) {
+  return String(value || '')
+    .replace(/\\\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .trim();
+}
+
 function initFirebaseAdmin() {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
@@ -713,7 +720,7 @@ function initFirebaseAdmin() {
         credential: admin.credential.cert({
           projectId,
           clientEmail,
-          privateKey: privateKey.replace(/\\n/g, '\n'),
+          privateKey: normalizeFirebasePrivateKey(privateKey),
         }),
       });
     }
@@ -760,6 +767,7 @@ const CONFIG = {
     process.env.SNIPER_DIRECT_POLL_MAX_IN_FLIGHT || '4',
     10,
   ),
+  SNIPER_PREP_LEAD_MS: Number.parseInt(process.env.SNIPER_PREP_LEAD_MS || '240000', 10),
   SNIPER_RUNNING_RESUME_GRACE_MS: Number.parseInt(
     process.env.SNIPER_RUNNING_RESUME_GRACE_MS || '120000',
     10,
@@ -851,6 +859,14 @@ function logStartupBanner(port) {
   console.log(`Node: ${process.version}`);
   console.log(`Git: ${getGitHash()}`);
   console.log(`LISTENING :${port}`);
+  console.log('[STARTUP] Agent started');
+  console.log(`[STARTUP] Health route available: http://127.0.0.1:${port}/api/health`);
+  console.log(
+    firebaseAdminReady
+      ? '[STARTUP] Firebase connected'
+      : `[STARTUP] Firebase local-only/disabled${firebaseAdminError ? `: ${firebaseAdminError}` : ''}`,
+  );
+  console.log(`[STARTUP] Firestore runner enabled: ${process.env.AGENT_RUN_MAIN === 'true'}`);
   console.log('Routes loaded (expected):');
   expected.forEach((r) => console.log(`  - ${r}`));
   const actual = listRegisteredRoutes();
@@ -1252,10 +1268,25 @@ async function scheduleClaimedJob(job) {
   }
 
   const now = Date.now();
-  const delayMs = Math.max(0, fireMs - now);
+  const prepLeadMs = Number.isFinite(CONFIG.SNIPER_PREP_LEAD_MS)
+    ? Math.max(0, CONFIG.SNIPER_PREP_LEAD_MS)
+    : 240000;
+  const startMs = Math.max(now, fireMs - prepLeadMs);
+  const delayMs = Math.max(0, startMs - now);
   const scheduleAt = new Date(fireMs);
+  const targetDateKey = getTargetDateKeyFromJob(job) || normalizeDateKey(targetPlayDate);
+  const preferredTimesForLog = Array.isArray(job.preferred_times)
+    ? normalizeStringList(job.preferred_times)
+    : normalizeStringList(job.preferredTimes ?? job.preferred_times);
+  const ukNow = DateTime.now().setZone(job.tz || job.timezone || CONFIG.TZ_LONDON).toISO();
 
-  console.log(`[RUNNER] Fire time resolved for ${jobId}: ${scheduleAt.toISOString()} (in ${delayMs}ms)`);
+  console.log(`[RUNNER] Job found ${jobId}`);
+  console.log(`[RUNNER] Target play date: ${targetDateKey}`);
+  console.log(`[RUNNER] Preferred times: ${preferredTimesForLog.join(', ') || '(none)'}`);
+  console.log(`[RUNNER] Fire time UTC: ${scheduleAt.toISOString()}`);
+  console.log(`[RUNNER] Current UK time: ${ukNow}`);
+  console.log(`[RUNNER] Fire time resolved for ${jobId}: ${scheduleAt.toISOString()}`);
+  console.log(`[RUNNER] Booking prep starts at ${new Date(startMs).toISOString()} (in ${delayMs}ms; lead ${prepLeadMs}ms)`);
 
   await fsUpdateJob(jobId, {
     scheduled_for: admin.firestore.Timestamp.fromDate(scheduleAt),
@@ -1296,6 +1327,9 @@ async function scheduleClaimedJob(job) {
       const tee = typeof job.tee === 'number' ? job.tee : 1;
 
       console.log(`[RUNNER] runBooking start ${jobId}`);
+      console.log(`[RUNNER] Target play date: ${targetDateKey}`);
+      console.log(`[RUNNER] Preferred times: ${preferredTimes.join(', ') || '(none)'}`);
+      console.log(`[RUNNER] Fire time UTC: ${scheduleAt.toISOString()}`);
       const result = await runBooking({
         jobId,
         ownerUid,
@@ -1316,7 +1350,9 @@ async function scheduleClaimedJob(job) {
         tee,
       });
 
-      console.log(`[RUNNER] runBooking finished ${jobId} booked=${result?.bookedTime || 'n/a'}`);
+      console.log(
+        `[RUNNER] Final result ${jobId}: success=${result?.success === true} result=${result?.result || 'n/a'} booked=${result?.bookedTime || 'n/a'} notes=${result?.notes || ''}`,
+      );
       const isSuccess = result?.success === true;
       await fsUpdateJob(jobId, {
         status: isSuccess ? 'finished' : 'error',
@@ -1876,6 +1912,7 @@ async function navigateToTeeSheet(page, date, allowHop = true) {
 
     try {
       await waitForTeeSheet(page, 15000);
+      console.log(`[TEE] Tee sheet date reached: ${normalizeDateKey(target) || target.toISOString().slice(0, 10)}`);
       return target;
     } catch (e) {
       console.log(`   ⚠️ Tee sheet not ready on hop ${i}: ${e.message}`);
@@ -3367,6 +3404,12 @@ async function runBooking(config) {
   let fallbackTeeUsed = false;
   let additionalPlayers = [];
   try {
+    console.log(`[BOOKING] Target play date: ${targetDateStr}`);
+    console.log(`[BOOKING] Preferred times: ${normalizedPreferredTimes.join(', ') || '(none)'}`);
+    if (Number.isFinite(targetFireTime)) {
+      console.log(`[BOOKING] Fire time UTC: ${new Date(targetFireTime).toISOString()}`);
+    }
+    console.log(`[BOOKING] Current UK time: ${DateTime.now().setZone(CONFIG.TZ_LONDON).toISO()}`);
     runId = await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
     if (warmPage) {
       page = warmPage;
@@ -3443,6 +3486,11 @@ async function runBooking(config) {
     let bookingSlots = Array.isArray(slotsData) ? [...slotsData] : [];
     if (!bookingSlots.length && !useReleaseObserver) {
       bookingSlots = await refreshBookingSlots();
+    }
+    if (bookingSlots.length) {
+      console.log(
+        `[TEE] Available booking times detected: ${bookingSlots.map((slot) => slot.time).filter(Boolean).join(', ') || '(none)'}`,
+      );
     }
     const selectPreferredTimesFromSlots = (slots, { bookableOnly = false } = {}) => {
       const slotTimeSet = new Set(
@@ -3692,6 +3740,7 @@ async function runBooking(config) {
               fallbackLevel = candidate.preferredIndex ?? normalizedPreferredTimes.indexOf(candidate.time);
               if (fallbackLevel < 0) fallbackLevel = 0;
               bookingSuccess = true;
+              console.log(`[SNIPER] Selected/clicked tee time: ${candidate.time}`);
               notes.push(
                 `Direct release booking confirmed for ${candidate.time}; click_delta=${directResult.clickDeltaMs}ms navigation=${directResult.navigationMs}ms`,
               );
@@ -4031,6 +4080,9 @@ async function runBooking(config) {
 
     if (browser && !isWarm) await browser.close();
 
+    console.log(
+      `[BOOKING] Final result: success=${success} result=${resultType} booked=${bookedTime || 'n/a'} notes=${finalNotes}`,
+    );
     return {
       success,
       result: resultType,
