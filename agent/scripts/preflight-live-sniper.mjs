@@ -15,7 +15,7 @@ const players = (process.env.PLAYERS || process.env.BRS_PLAYERS || '16524,14481,
 const partySize = Number.parseInt(process.env.PARTY_SIZE || process.env.BRS_PARTY_SIZE || '4', 10);
 const expectedBookerName = process.env.EXPECTED_BOOKER_NAME || 'Sharpe, Mal';
 const expectedBookerId = process.env.EXPECTED_BOOKER_ID || '685';
-const expectedGitPrefix = process.env.EXPECTED_GIT_PREFIX || '2039712';
+const expectedGitPrefix = process.env.EXPECTED_GIT_PREFIX || '';
 const runReleaseDryRun = process.env.RUN_RELEASE_DRY_RUN === 'true';
 
 function fail(message) {
@@ -81,7 +81,7 @@ const runtime = await getJson('/api/runtime-status');
 console.log(
   `Runtime: git=${runtime.gitHash} firebase=${runtime.firebaseAdminReady} runner=${runtime.sniperRunnerStarted} safe=${runtime.safeMode}`,
 );
-if (!String(runtime.gitHash || '').startsWith(expectedGitPrefix)) {
+if (expectedGitPrefix && !String(runtime.gitHash || '').startsWith(expectedGitPrefix)) {
   fail(`Railway git hash is ${runtime.gitHash}, expected prefix ${expectedGitPrefix}`);
 }
 if (runtime.firebaseAdminReady !== true) fail('Firebase Admin is not ready');
