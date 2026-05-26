@@ -400,8 +400,13 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       if (mounted) setState(() => _isNextBusy = false);
     }
     if (_currentPage == 4) {
-      if (_additionalPlayerCount > 0 && _selectedPlayerIds.isEmpty) {
-        _showSnack('Select at least one additional player');
+      if (_selectedPlayerIds.length != _additionalPlayerCount) {
+        _showSnack(
+            'Select exactly $_additionalPlayerCount additional player${_additionalPlayerCount == 1 ? '' : 's'}');
+        return;
+      }
+      if (_selectedPlayerIds.toSet().length != _selectedPlayerIds.length) {
+        _showSnack('Remove duplicate players');
         return;
       }
     }
@@ -441,6 +446,15 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     }
     if (_preferredTimes.isEmpty) {
       _showSnack('At least one preferred time required');
+      return;
+    }
+    if (_selectedPlayerIds.length != _additionalPlayerCount) {
+      _showSnack(
+          'Select exactly $_additionalPlayerCount additional player${_additionalPlayerCount == 1 ? '' : 's'}');
+      return;
+    }
+    if (_selectedPlayerIds.toSet().length != _selectedPlayerIds.length) {
+      _showSnack('Remove duplicate players');
       return;
     }
 
@@ -1075,10 +1089,10 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             onTap: () async {
               final now = DateTime.now();
               final minDate = DateTime(now.year, now.month, now.day);
-              final initialDate = _targetPlayDate != null &&
-                      !_targetPlayDate!.isBefore(minDate)
-                  ? _targetPlayDate!
-                  : minDate;
+              final initialDate =
+                  _targetPlayDate != null && !_targetPlayDate!.isBefore(minDate)
+                      ? _targetPlayDate!
+                      : minDate;
               final picked = await showDatePicker(
                 context: context,
                 firstDate: minDate,
