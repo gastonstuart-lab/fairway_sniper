@@ -3614,14 +3614,16 @@ async function runBooking(config) {
         `[TEE] Available booking times detected: ${bookingSlots.map((slot) => slot.time).filter(Boolean).join(', ') || '(none)'}`,
       );
     }
+    const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
+    const desiredPartySize = desiredAdditionalCount + 1;
+    additionalPlayers = players.slice(0, desiredAdditionalCount);
     const selectPreferredTimesFromSlots = (slots, { bookableOnly = false } = {}) => {
       const slotTimeSet = new Set(
         (Array.isArray(slots) ? slots : [])
           .filter((slot) => {
             if (!slot?.time) return false;
-            const requiredPartySize =
-              typeof partySize === 'number' ? Math.max(1, partySize) : Math.max(1, players.length + 1);
-            if (Number.isFinite(Number(slot.openSlots)) && Number(slot.openSlots) < requiredPartySize) {
+            const requiredOpenSlots = desiredAdditionalCount;
+            if (Number.isFinite(Number(slot.openSlots)) && Number(slot.openSlots) < requiredOpenSlots) {
               return false;
             }
             return !bookableOnly || slot.state === 'bookable' || !!slot.href;
@@ -3631,9 +3633,6 @@ async function runBooking(config) {
       return normalizedPreferredTimes.filter((time) => slotTimeSet.has(time));
     };
 
-    const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
-    const desiredPartySize = desiredAdditionalCount + 1;
-    additionalPlayers = players.slice(0, desiredAdditionalCount);
     const releaseArmLeadMs = useReleaseObserver && Number.isFinite(CONFIG.SNIPER_RELEASE_ARM_LEAD_MS)
       ? Math.max(0, CONFIG.SNIPER_RELEASE_ARM_LEAD_MS)
       : 0;
