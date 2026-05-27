@@ -143,7 +143,6 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     _playerDirectoryService = PlayerDirectoryService(
       firebaseService: _firebaseService,
     );
-    _loadDraftLocally();
     _loadCreds();
     _loadAgentBaseUrl();
     _runAgentDiagnostics();
@@ -237,56 +236,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     }
   }
 
-  Future<void> _saveDraftLocally() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final draft = {
-        'username': _brsUsernameController.text,
-        'password': _brsPasswordController.text,
-        'targetPlayDate': _targetPlayDate?.toIso8601String() ?? '',
-        'preferredTimes': jsonEncode(_preferredTimes),
-        'additionalPlayerCount': _additionalPlayerCount,
-        'selectedPlayerIds': jsonEncode(_selectedPlayerIds),
-        'currentPage': _currentPage,
-        'timestamp': DateTime.now().toIso8601String(),
-      };
-      await prefs.setString('sniper_wizard_draft', jsonEncode(draft));
-    } catch (_) {}
-  }
-
-  Future<void> _loadDraftLocally() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final draftJson = prefs.getString('sniper_wizard_draft');
-      if (draftJson == null) return;
-      final draft = jsonDecode(draftJson) as Map<String, dynamic>;
-      final timestamp = DateTime.parse(draft['timestamp'] as String);
-      if (DateTime.now().difference(timestamp).inHours > 24) return;
-
-      setState(() {
-        _brsUsernameController.text = draft['username'] ?? '';
-        _brsPasswordController.text = draft['password'] ?? '';
-        if ((draft['targetPlayDate'] as String).isNotEmpty) {
-          _targetPlayDate = DateTime.parse(draft['targetPlayDate'] as String);
-          _computedReleaseDateTime = _computeReleaseDateTime(_targetPlayDate!);
-        }
-        _preferredTimes.clear();
-        _preferredTimes.addAll(
-          (jsonDecode(draft['preferredTimes'] ?? '[]') as List).cast<String>(),
-        );
-        _additionalPlayerCount = draft['additionalPlayerCount'] ?? 1;
-        _selectedPlayerIds.clear();
-        _selectedPlayerIds.addAll(
-          (jsonDecode(draft['selectedPlayerIds'] ?? '[]') as List)
-              .cast<String>(),
-        );
-      });
-    } catch (_) {}
-  }
-
   @override
   void dispose() {
-    _saveDraftLocally();
     _pageController.dispose();
     _brsUsernameController.dispose();
     _brsPasswordController.dispose();
@@ -1523,7 +1474,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                   ?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: AppSpacing.sm),
           Text(
-              'Choose up to $_additionalPlayerCount player${_additionalPlayerCount != 1 ? 's' : ''} from your club directory.',
+              'Malcolm is Player 1. Choose exactly $_additionalPlayerCount additional player${_additionalPlayerCount != 1 ? 's' : ''} from the club directory.',
               style: Theme.of(context).textTheme.bodyMedium),
           const SizedBox(height: AppSpacing.xl),
           if (_currentUserName != null && _currentUserName!.isNotEmpty)
@@ -1622,7 +1573,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           if (_additionalPlayerCount > 0) ...[
             const SizedBox(height: AppSpacing.xxl),
             Text(
-              'Additional Players',
+              'Additional Players (${_selectedPlayerIds.length}/$_additionalPlayerCount)',
               style: Theme.of(context)
                   .textTheme
                   .titleMedium

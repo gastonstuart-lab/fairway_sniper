@@ -63,7 +63,7 @@ class _PlayerListEditorState extends State<PlayerListEditor> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Text(
-              'Selected Players (${widget.playerNames.length}/${widget.maxPlayers})',
+              'Selected Additional Players (${widget.playerNames.length}/${widget.maxPlayers})',
               style: Theme.of(context).textTheme.titleMedium,
             ),
             if (!widget.readOnly && canAdd)
