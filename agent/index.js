@@ -1942,6 +1942,7 @@ async function navigateToTeeSheet(page, date, allowHop = true) {
 
 async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1500).catch(() => {});
   const { rows: scrapedRows = [], reason: scrapeReason = 'teeSheetContainerNotFound' } =
     await page.evaluate(
       ({ rowSelector, containerSelectors, timeRegexSource }) => {
@@ -2005,6 +2006,30 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
           });
         }
         if (!results.length) {
+          const linkRows = Array.from(document.querySelectorAll('a[href*="/bookings/book"]'))
+            .map((link) => {
+              const row = link.closest('tr') || link.closest('li') || link.parentElement;
+              const text = (row?.textContent || link.textContent || '').replace(/\s+/g, ' ').trim();
+              const href = link.href || '';
+              const hrefMatch = href.match(/\/(\d{4})(?:[?#]|$)/);
+              const textMatch = text.match(new RegExp(timeRegexSource));
+              const rawTime = textMatch?.[0] || hrefMatch?.[1] || '';
+              if (!rawTime) return null;
+              const time = rawTime.includes(':') ? rawTime : `${rawTime.slice(0, 2)}:${rawTime.slice(2)}`;
+              const hasUnavailable = /unavailable/i.test(text);
+              const linkText = (link.textContent || '').replace(/\s+/g, ' ').trim();
+              const isBookable = /book/i.test(linkText) || /add-booking/i.test(link.className || '');
+              if (!isBookable || hasUnavailable) return null;
+              return {
+                time,
+                state: 'bookable',
+                href,
+                source: 'booking-link-fallback',
+                rowText: text,
+              };
+            })
+            .filter(Boolean);
+          if (linkRows.length) return { rows: linkRows, reason: 'bookingLinkFallback' };
           return { rows: [], reason: 'teeSheetContainerNotFound' };
         }
         return { rows: results };
