@@ -57,6 +57,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   String? _agentTestStatus;
   bool _isRefreshingPlayers = false;
   bool _isNextBusy = false;
+  bool _isBookingNow = false;
   String? _sniperTestJobId;
   String? _sniperTestStatus;
   Timer? _sniperTestPoller;
@@ -316,6 +317,11 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     return !releaseTimeUtc.isBefore(DateTime.now().toUtc());
   }
 
+  bool _isReleasedDate(DateTime? date) {
+    if (date == null) return false;
+    return _computeReleaseDateTime(date).isBefore(DateTime.now().toUtc());
+  }
+
   DateTime _computeReleaseDateTime(DateTime targetPlayDate) {
     final releaseDate = DateTime.utc(
       targetPlayDate.year,
@@ -371,10 +377,6 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     if (_currentPage == 1) {
       if (_targetPlayDate == null) {
         _showSnack('Select target play date');
-        return;
-      }
-      if (!_isValidSniperDate(_targetPlayDate!)) {
-        _showSnack('Release time has already passed in the UK');
         return;
       }
       setState(() => _isNextBusy = true);
@@ -457,6 +459,10 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       _showSnack('Remove duplicate players');
       return;
     }
+    if (!_isValidSniperDate(_targetPlayDate!)) {
+      _showSnack('Release has passed. Use Book Now instead.');
+      return;
+    }
 
     setState(() => _isNextBusy = true);
 
@@ -515,6 +521,104 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         setState(() => _isNextBusy = false);
       }
     }
+  }
+
+  Future<void> _bookNow() async {
+    final uid = _firebaseService.currentUserId;
+    if (uid == null) {
+      _showSnack('Not logged in');
+      return;
+    }
+    if (_brsUsernameController.text.trim().isEmpty ||
+        _brsPasswordController.text.isEmpty) {
+      _showSnack('BRS credentials required');
+      return;
+    }
+    if (_targetPlayDate == null) {
+      _showSnack('Target play date required');
+      return;
+    }
+    if (_preferredTimes.isEmpty) {
+      _showSnack('At least one preferred time required');
+      return;
+    }
+    if (_selectedPlayerIds.length != _additionalPlayerCount) {
+      _showSnack(
+          'Select exactly $_additionalPlayerCount additional player${_additionalPlayerCount == 1 ? '' : 's'}');
+      return;
+    }
+    if (_selectedPlayerIds.toSet().length != _selectedPlayerIds.length) {
+      _showSnack('Remove duplicate players');
+      return;
+    }
+
+    setState(() => _isBookingNow = true);
+    _showBookingProgressDialog();
+
+    try {
+      await _firebaseService.saveBRSCredentials(
+          uid, _brsUsernameController.text.trim(), _brsPasswordController.text,
+          club: _club);
+
+      final baseUrl = await getAgentBaseUrl();
+      final response = await http
+          .post(
+            Uri.parse('$baseUrl/api/book-now'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'username': _brsUsernameController.text.trim(),
+              'password': _brsPasswordController.text,
+              'targetDate': _dateKey(_targetPlayDate!),
+              'preferredTimes': _preferredTimes,
+              'players': _selectedPlayerIds,
+              'partySize': _partySize,
+            }),
+          )
+          .timeout(const Duration(seconds: 180));
+
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+
+      final data = response.body.isNotEmpty
+          ? jsonDecode(response.body) as Map<String, dynamic>
+          : <String, dynamic>{};
+      final success = response.statusCode == 200 && data['success'] == true;
+      if (!mounted) return;
+
+      if (success) {
+        Navigator.of(context).pop();
+        _showSnack('Booked ${data['bookedTime'] ?? data['booked_time'] ?? ''}');
+      } else {
+        final error = data['error'] ?? data['notes'] ?? 'booking failed';
+        _showSnack('Booking failed: $error');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      _showSnack('Booking failed: $e');
+    } finally {
+      if (mounted) setState(() => _isBookingNow = false);
+    }
+  }
+
+  void _showBookingProgressDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const AlertDialog(
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('Attempting booking now...\nPlease wait'),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _fetchAvailableTimesForDate(DateTime date) async {
@@ -754,7 +858,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
   Widget _buildNavBar() {
     final isLastPage = _currentPage == 4;
     final canContinue = _currentPage < 4 && !_isNextBusy;
-    final canSave = isLastPage && !_isNextBusy;
+    final isReleased = _isReleasedDate(_targetPlayDate);
+    final canSave = isLastPage && !_isNextBusy && !_isBookingNow;
 
     return Container(
       decoration: BoxDecoration(
@@ -787,20 +892,23 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               const SizedBox(width: AppSpacing.md),
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed:
-                      canContinue ? _nextPage : (canSave ? _saveJob : null),
-                  icon: _isNextBusy
+                  onPressed: canContinue
+                      ? _nextPage
+                      : (canSave ? (isReleased ? _bookNow : _saveJob) : null),
+                  icon: _isNextBusy || _isBookingNow
                       ? const SizedBox(
                           width: 16,
                           height: 16,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
-                      : Icon(isLastPage ? Icons.check : Icons.arrow_forward),
+                      : Icon(isLastPage
+                          ? (isReleased ? Icons.flash_on : Icons.check)
+                          : Icons.arrow_forward),
                   label: Text(
-                    _isNextBusy
+                    _isNextBusy || _isBookingNow
                         ? 'Loading...'
                         : isLastPage
-                            ? 'Create Job'
+                            ? (isReleased ? 'Book Now' : 'Create Job')
                             : 'Continue',
                   ),
                 ),
