@@ -1175,6 +1175,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         ? 0
         : releaseUtc.difference(DateTime.now().toUtc()).inMinutes;
     final daysUntilRelease = minutesUntilRelease ~/ (24 * 60);
+    final isReleased = _isReleasedDate(_targetPlayDate);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(AppSpacing.xl),
@@ -1292,15 +1293,17 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                       )
                     else
                       Text(
-                        'Release time is now or in the past',
+                        'Already released. Continue to choose times and press Book Now.',
                         style: Theme.of(context)
                             .textTheme
                             .bodySmall
-                            ?.copyWith(color: Colors.red.shade700),
+                            ?.copyWith(color: Colors.green.shade700),
                       ),
                     const SizedBox(height: AppSpacing.md),
                     Text(
-                      '💡 The sniper will automatically log in and attempt to book your preferred times at exactly this moment.',
+                      isReleased
+                          ? 'This will run an immediate live booking attempt. It will try your preferred times in order.'
+                          : 'The sniper will automatically log in and attempt to book your preferred times at exactly this moment.',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           fontStyle: FontStyle.italic,
                           color: Colors.blue.shade800),
