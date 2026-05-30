@@ -52,6 +52,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
 
   // Available times - will be fetched from agent when target date selected
   List<String> _availableTimes = [];
+  String _teeMode = 'single';
+  int _teeTarget = 1;
+  bool _fallbackTee = false;
   String _agentBaseUrl = defaultAgentBaseUrl();
   bool _agentTesting = false;
   String? _agentTestStatus;
@@ -124,6 +127,40 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     return List<String>.from(
       _availableTimes.isNotEmpty ? _availableTimes : _fallbackTimes,
     );
+  }
+
+  String _selectedTeeChoice() {
+    if (_teeMode == 'both') return 'both';
+    return _teeTarget == 10 ? '10' : '1';
+  }
+
+  void _setSelectedTeeChoice(String choice) {
+    setState(() {
+      if (choice == 'both') {
+        _teeMode = 'both';
+        _teeTarget = 1;
+        _fallbackTee = true;
+      } else if (choice == '10') {
+        _teeMode = 'single';
+        _teeTarget = 10;
+        _fallbackTee = false;
+      } else {
+        _teeMode = 'single';
+        _teeTarget = 1;
+        _fallbackTee = false;
+      }
+    });
+    if (_targetPlayDate != null) {
+      _fetchAvailableTimesForDate(_targetPlayDate!);
+    }
+  }
+
+  Map<String, dynamic> _teePayload() {
+    return {
+      'teeMode': _teeMode,
+      'teeTarget': _teeTarget,
+      'fallbackTee': _fallbackTee,
+    };
   }
 
   void _maybeSkipCreds() {
@@ -215,8 +252,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       'password': diagPass,
       'club': _club,
       'reuseBrowser': true,
-      'teeMode': 'single',
-      'teeTarget': 1,
+      ..._teePayload(),
     };
     print('🚨🚨 [AGENT-DIAG] FETCH URL: $fetchUrl');
     try {
@@ -444,6 +480,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         ),
         releaseWindowStart: releaseDateTime,
         snipeStrategy: strategy,
+        teeMode: _teeMode,
+        teeTarget: _teeTarget,
+        fallbackTee: _fallbackTee,
         status: 'active', // Explicitly set to active
       );
 
@@ -523,6 +562,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               'preferredTimes': _preferredTimes,
               'players': _selectedPlayerIds,
               'partySize': _partySize,
+              ..._teePayload(),
             }),
           )
           .timeout(const Duration(seconds: 180));
@@ -598,8 +638,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               'username': _brsUsernameController.text.trim(),
               'password': _brsPasswordController.text,
               'includeUnavailable': true,
-              'teeMode': 'single',
-              'teeTarget': 1,
+              ..._teePayload(),
             }),
           )
           .timeout(const Duration(minutes: 3));
@@ -644,15 +683,23 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
 
   List<dynamic> _extractTimes(dynamic decoded) {
     if (decoded is! Map) return const [];
-    final topLevel = decoded['times'];
-    if (topLevel is List) return topLevel;
+    final merged = <dynamic>[];
 
-    final tee1 = decoded['tee1'];
-    if (tee1 is Map && tee1['times'] is List) {
-      return tee1['times'] as List;
+    void addTimes(dynamic raw) {
+      if (raw is List) {
+        merged.addAll(raw);
+      }
     }
 
-    return const [];
+    addTimes(decoded['times']);
+
+    final tee1 = decoded['tee1'];
+    if (tee1 is Map) addTimes(tee1['times']);
+
+    final tee10 = decoded['tee10'];
+    if (tee10 is Map) addTimes(tee10['times']);
+
+    return merged;
   }
 
   @override
@@ -913,6 +960,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           'players': _selectedPlayerIds,
           'partySize': _partySize,
           'minutes': 4,
+          ..._teePayload(),
         }),
       );
       if (response.statusCode != 200) {
@@ -1286,6 +1334,28 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           const SizedBox(height: AppSpacing.sm),
           Text('Pick up to 3 target times in order of preference.',
               style: Theme.of(context).textTheme.bodyMedium),
+          const SizedBox(height: AppSpacing.md),
+          Text('Tee Sheet',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleSmall
+                  ?.copyWith(fontWeight: FontWeight.w600)),
+          const SizedBox(height: AppSpacing.sm),
+          Wrap(
+            spacing: AppSpacing.sm,
+            children: [
+              ChoiceChip(
+                label: const Text('1st Tee'),
+                selected: _selectedTeeChoice() == '1',
+                onSelected: (_) => _setSelectedTeeChoice('1'),
+              ),
+              ChoiceChip(
+                label: const Text('10th Tee'),
+                selected: _selectedTeeChoice() == '10',
+                onSelected: (_) => _setSelectedTeeChoice('10'),
+              ),
+            ],
+          ),
           const SizedBox(height: AppSpacing.xl),
           // Explanation card
           Card(
@@ -1360,11 +1430,19 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     )),
             const SizedBox(height: AppSpacing.lg),
           ],
-          Text('Available Times',
+          Text('Visible Target Times',
               style: Theme.of(context)
                   .textTheme
                   .titleMedium
                   ?.copyWith(fontWeight: FontWeight.w600)),
+          const SizedBox(height: AppSpacing.xs),
+          Text(
+            'Pre-release rows are valid targets even if booking links are not live yet.',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: Colors.grey.shade600),
+          ),
           const SizedBox(height: AppSpacing.md),
           Wrap(
             spacing: AppSpacing.sm,

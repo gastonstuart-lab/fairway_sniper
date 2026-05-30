@@ -28,6 +28,9 @@ class BookingJob {
       releaseWindowStart; // when tee times are expected to unlock (UTC)
   final Map<String, dynamic>?
       snipeStrategy; // attempt intervals & window sizing
+  final String teeMode; // single|both
+  final int teeTarget; // 1|10 (primary tee)
+  final bool fallbackTee; // when true, allow alternate tee fallback
 
   BookingJob({
     this.id,
@@ -50,6 +53,9 @@ class BookingJob {
     this.targetDate,
     this.releaseWindowStart,
     this.snipeStrategy,
+    this.teeMode = 'single',
+    this.teeTarget = 1,
+    this.fallbackTee = false,
     DateTime? createdAt,
     DateTime? updatedAt,
   })  : createdAt = createdAt ?? DateTime.now(),
@@ -82,45 +88,69 @@ class BookingJob {
             ? Timestamp.fromDate(releaseWindowStart!)
             : null,
         'snipe_strategy': snipeStrategy,
+        'tee_mode': teeMode,
+        'tee_target': teeTarget,
+        'fallback_tee': fallbackTee,
       };
 
-  factory BookingJob.fromJson(Map<String, dynamic> json, String id) =>
-      BookingJob(
-        id: id,
-        ownerUid: json['ownerUid'] ?? '',
-        brsEmail: json['brs_email'] ?? '',
-        brsPassword: json['brs_password'] ?? '',
-        club: json['club'] ?? '',
-        timezone: json['tz'] ?? 'Europe/London',
-        releaseDay: json['release_day'] ?? '',
-        releaseTimeLocal: json['release_time_local'] ?? '',
-        targetDay: json['target_day'] ?? '',
-        preferredTimes: List<String>.from(json['preferred_times'] ?? []),
-        players: List<String>.from(json['players'] ?? []),
-        partySize: json['party_size'] is int ? json['party_size'] as int : null,
-        status: json['status'] ?? 'active',
-        nextFireTimeUtc: json['next_fire_time_utc'] is Timestamp
-            ? (json['next_fire_time_utc'] as Timestamp).toDate()
-            : null,
-        pushToken: json['push_token'],
-        createdAt: json['created_at'] is Timestamp
-            ? (json['created_at'] as Timestamp).toDate()
-            : DateTime.now(),
-        updatedAt: json['updated_at'] is Timestamp
-            ? (json['updated_at'] as Timestamp).toDate()
-            : DateTime.now(),
-        bookingMode: _parseMode(json['mode']),
-        targetDate: json['target_date'] as String?,
-        targetPlayDate: json['target_play_date'] is Timestamp
-            ? (json['target_play_date'] as Timestamp).toDate()
-            : null,
-        releaseWindowStart: json['release_window_start'] is Timestamp
-            ? (json['release_window_start'] as Timestamp).toDate()
-            : null,
-        snipeStrategy: json['snipe_strategy'] is Map<String, dynamic>
-            ? Map<String, dynamic>.from(json['snipe_strategy'] as Map)
-            : null,
+  factory BookingJob.fromJson(Map<String, dynamic> json, String id) {
+    final hasTeeFields =
+        json.containsKey('tee_mode') || json.containsKey('tee_target');
+    final parsedTeeMode =
+        _parseTeeMode(json['tee_mode'] ?? json['teeMode'] ?? 'single');
+    final parsedTeeTarget = _parseTeeTarget(
+      json['tee_target'] ?? json['teeTarget'] ?? json['tee'] ?? 1,
+    );
+    final parsedFallback = _parseBool(
+      json['fallback_tee'] ?? json['fallbackTee'] ?? false,
+    );
+
+    if (!hasTeeFields) {
+      print(
+        '⚠️ [BookingJob.fromJson] Missing tee fields for job $id. Defaulting to tee_mode=single, tee_target=1, fallback_tee=false',
       );
+    }
+
+    return BookingJob(
+      id: id,
+      ownerUid: json['ownerUid'] ?? '',
+      brsEmail: json['brs_email'] ?? '',
+      brsPassword: json['brs_password'] ?? '',
+      club: json['club'] ?? '',
+      timezone: json['tz'] ?? 'Europe/London',
+      releaseDay: json['release_day'] ?? '',
+      releaseTimeLocal: json['release_time_local'] ?? '',
+      targetDay: json['target_day'] ?? '',
+      preferredTimes: List<String>.from(json['preferred_times'] ?? []),
+      players: List<String>.from(json['players'] ?? []),
+      partySize: json['party_size'] is int ? json['party_size'] as int : null,
+      status: json['status'] ?? 'active',
+      nextFireTimeUtc: json['next_fire_time_utc'] is Timestamp
+          ? (json['next_fire_time_utc'] as Timestamp).toDate()
+          : null,
+      pushToken: json['push_token'],
+      createdAt: json['created_at'] is Timestamp
+          ? (json['created_at'] as Timestamp).toDate()
+          : DateTime.now(),
+      updatedAt: json['updated_at'] is Timestamp
+          ? (json['updated_at'] as Timestamp).toDate()
+          : DateTime.now(),
+      bookingMode: _parseMode(json['mode']),
+      targetDate: json['target_date'] as String?,
+      targetPlayDate: json['target_play_date'] is Timestamp
+          ? (json['target_play_date'] as Timestamp).toDate()
+          : null,
+      releaseWindowStart: json['release_window_start'] is Timestamp
+          ? (json['release_window_start'] as Timestamp).toDate()
+          : null,
+      snipeStrategy: json['snipe_strategy'] is Map<String, dynamic>
+          ? Map<String, dynamic>.from(json['snipe_strategy'] as Map)
+          : null,
+      teeMode: parsedTeeMode,
+      teeTarget: parsedTeeTarget,
+      fallbackTee: parsedFallback,
+    );
+  }
 
   static BookingMode _parseMode(dynamic raw) {
     if (raw is String) {
@@ -132,6 +162,22 @@ class BookingJob {
       }
     }
     return BookingMode.normal;
+  }
+
+  static String _parseTeeMode(dynamic raw) {
+    final value = raw?.toString().trim().toLowerCase();
+    return value == 'both' ? 'both' : 'single';
+  }
+
+  static int _parseTeeTarget(dynamic raw) {
+    final value = raw?.toString().trim();
+    return value == '10' ? 10 : 1;
+  }
+
+  static bool _parseBool(dynamic raw) {
+    if (raw == true || raw == 'true') return true;
+    if (raw == false || raw == 'false') return false;
+    return false;
   }
 
   BookingJob copyWith({
@@ -157,6 +203,9 @@ class BookingJob {
     String? targetDate,
     DateTime? releaseWindowStart,
     Map<String, dynamic>? snipeStrategy,
+    String? teeMode,
+    int? teeTarget,
+    bool? fallbackTee,
   }) =>
       BookingJob(
         id: id ?? this.id,
@@ -181,5 +230,8 @@ class BookingJob {
         targetDate: targetDate ?? this.targetDate,
         releaseWindowStart: releaseWindowStart ?? this.releaseWindowStart,
         snipeStrategy: snipeStrategy ?? this.snipeStrategy,
+        teeMode: teeMode ?? this.teeMode,
+        teeTarget: teeTarget ?? this.teeTarget,
+        fallbackTee: fallbackTee ?? this.fallbackTee,
       );
 }
