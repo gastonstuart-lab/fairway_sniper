@@ -244,8 +244,7 @@ app.get('/api/runtime-status', (_req, res) => {
 
 const parseTeeMode = (value) => {
   const raw = String(value || '').trim().toLowerCase();
-  if (raw === 'single') return 'single';
-  return 'both';
+  return raw === 'both' ? 'both' : 'single';
 };
 
 const parseTeeTarget = (value) => {
@@ -1336,12 +1335,15 @@ async function scheduleClaimedJob(job) {
       const partySize = typeof runJob.party_size === 'number' ? runJob.party_size : runJob.partySize;
       const pushToken = runJob.push_token || runJob.pushToken;
       const dryRun = runJob.dry_run === true || runJob.dryRun === true;
-      const tee = typeof runJob.tee === 'number' ? runJob.tee : 1;
+      const teeConfig = resolveTeeConfigFromJob(runJob, 'RUNNER');
 
       console.log(`[RUNNER] runBooking start ${jobId}`);
       console.log(`[RUNNER] Target play date: ${getTargetDateKeyFromJob(runJob) || targetDateKey}`);
       console.log(`[RUNNER] Preferred times: ${preferredTimes.join(', ') || '(none)'}`);
       console.log(`[RUNNER] Fire time UTC: ${scheduleAt.toISOString()}`);
+      console.log(
+        `[RUNNER] Tee execution: mode=${teeConfig.teeMode} target=${teeConfig.teeTarget} fallback=${teeConfig.fallbackTee}`,
+      );
       const result = await runBooking({
         jobId,
         ownerUid,
@@ -1359,7 +1361,10 @@ async function scheduleClaimedJob(job) {
         useReleaseObserver: true,
         pushToken,
         dryRun,
-        tee,
+        tee: teeConfig.tee,
+        teeMode: teeConfig.teeMode,
+        teeTarget: teeConfig.teeTarget,
+        fallbackTee: teeConfig.fallbackTee,
       });
 
       console.log(
@@ -1620,6 +1625,38 @@ function getTargetDateKeyFromJob(job) {
   return normalizeDateKey(job?.target_date || job?.targetDate);
 }
 
+function resolveTeeConfigFromJob(job, contextLabel = 'RUNNER') {
+  const rawTeeMode = job?.tee_mode ?? job?.teeMode;
+  const rawTeeTarget = job?.tee_target ?? job?.teeTarget ?? job?.tee;
+  const rawFallbackTee = job?.fallback_tee ?? job?.fallbackTee;
+  const requestedTeeMode = parseTeeMode(rawTeeMode);
+  const teeMode = requestedTeeMode === 'both' ? 'single' : requestedTeeMode;
+  const teeTarget = parseTeeTarget(rawTeeTarget);
+  const fallbackTee = parseBooleanFlag(
+    rawFallbackTee,
+    requestedTeeMode === 'both',
+  );
+  const hadExplicitTee =
+    rawTeeMode !== undefined || rawTeeTarget !== undefined || rawFallbackTee !== undefined;
+
+  if (!hadExplicitTee) {
+    console.log(
+      `[${contextLabel}] No tee fields on job ${job?.id || 'unknown'}; defaulting to teeMode=single teeTarget=1 fallbackTee=false`,
+    );
+  } else {
+    console.log(
+      `[${contextLabel}] Tee config job ${job?.id || 'unknown'} => requestedMode=${requestedTeeMode} effectiveMode=${teeMode} teeTarget=${teeTarget} fallbackTee=${fallbackTee}`,
+    );
+    if (requestedTeeMode === 'both') {
+      console.log(
+        `[${contextLabel}] tee_mode=both is handled as sequential fallback: primary tee ${teeTarget}, alternate only after primary fails`,
+      );
+    }
+  }
+
+  return { teeMode, teeTarget, fallbackTee, tee: teeTarget };
+}
+
 function dateFromDateKey(dateKey) {
   const normalized = normalizeDateKey(dateKey);
   if (!normalized) return null;
@@ -1665,6 +1702,7 @@ async function runScheduledJob(job) {
   const partySize = typeof job.party_size === 'number' ? job.party_size : job.partySize;
   const targetPlayDate = resolveTargetPlayDate(job);
   const pushToken = job.push_token || job.pushToken;
+  const teeConfig = resolveTeeConfigFromJob(job, 'SCHEDULER');
 
   if (!username || !password || !targetPlayDate) {
     await fsUpdateJob(jobId, { status: 'failed', last_error: 'missing-credentials-or-target-date' });
@@ -1693,6 +1731,10 @@ async function runScheduledJob(job) {
       warmPage,
       useReleaseObserver: false,
       pushToken,
+      tee: teeConfig.tee,
+      teeMode: teeConfig.teeMode,
+      teeTarget: teeConfig.teeTarget,
+      fallbackTee: teeConfig.fallbackTee,
     });
 
     await fsUpdateJob(jobId, {
@@ -2762,7 +2804,7 @@ async function executeReleaseBooking(
       booked: false, 
       confirmationText: 'TEST_MODE_VALIDATION_ONLY', 
       playersFilled: [], 
-      clickDeltaMs: fireLatencyMs 
+      clickDeltaMs: fireLatencyMs,
     };
   }
   
@@ -3508,6 +3550,10 @@ async function runBooking(config) {
   const normalizedTeeMode = teeMode === 'both' ? 'both' : 'single';
   const normalizedTeeTarget = parseTeeTarget(teeTarget ?? tee);
   let teeCtx = null;
+  const teeLabelFromContext = () => {
+    const selectedTee = teeCtx?.teeTarget ?? normalizedTeeTarget;
+    return selectedTee === 10 ? '10TH TEE' : '1ST TEE';
+  };
   if (!username || !password) {
     throw new Error('Missing BRS credentials for booking run');
   }
@@ -3583,8 +3629,8 @@ async function runBooking(config) {
 
     teeCtx = await selectTeeForJob(page, config);
     const getTeeLabel = () => {
-      if (!teeCtx) return 'unknown';
-      return teeCtx.teeTarget === 10 ? '10TH TEE' : '1ST TEE';
+      if (!teeCtx) return teeLabelFromContext();
+      return teeLabelFromContext();
     };
     const refreshBookingSlots = async () => {
       markDiagContext(page, targetDateStr, teeCtx?.teeTarget ?? normalizedTeeTarget);
@@ -3670,6 +3716,7 @@ async function runBooking(config) {
         notes: 'No candidate times available on tee sheet',
         playersRequested: additionalPlayers,
         error: message,
+        teeSelected: getTeeLabel(),
       };
     }
     const buildLocatorCache = (timesToTry) => {
@@ -4104,6 +4151,7 @@ async function runBooking(config) {
             playersRequested: additionalPlayers,
             snapshotPath: evidence.snapshotPath,
             screenshotPath: evidence.screenshotPath,
+            teeSelected: getTeeLabel(),
             ...diagnostics,
           };
         }
@@ -4164,6 +4212,7 @@ async function runBooking(config) {
             error: 'clicked but no confirmation',
             snapshotPath: evidence.snapshotPath,
             screenshotPath: evidence.screenshotPath,
+            teeSelected: getTeeLabel(),
             ...diagnostics,
           };
         }
@@ -4224,6 +4273,7 @@ async function runBooking(config) {
             notes: 'No candidate times available on fallback tee',
             playersRequested: additionalPlayers,
             error: message,
+            teeSelected: getTeeLabel(),
           };
         }
         bookingSuccess = await runPreferredTimesLoop(searchTimes);
@@ -4288,7 +4338,8 @@ async function runBooking(config) {
       snapshotPath: finalSnapshotPath,
       screenshotPath: finalScreenshotPath,
       error: success ? null : finalError,
-      ...(dryRun ? { teeSelected: getTeeLabel(), armedAfterTeeSelect: true } : {}),
+      teeSelected: getTeeLabel(),
+      ...(dryRun ? { armedAfterTeeSelect: true } : {}),
     };
   } catch (error) {
     const msg = `Booking run failed: ${error.message}`;
@@ -4310,6 +4361,7 @@ async function runBooking(config) {
       notes: msg,
       playersRequested: additionalPlayers,
       error: error.message,
+      teeSelected: teeLabelFromContext(),
     };
   }
 }
