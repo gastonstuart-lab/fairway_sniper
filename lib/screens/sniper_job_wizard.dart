@@ -563,6 +563,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
               'players': _selectedPlayerIds,
               'partySize': _partySize,
               ..._teePayload(),
+              'dryRun': !kDebugMode,
+              'adminDevTool': kDebugMode,
             }),
           )
           .timeout(const Duration(seconds: 180));
@@ -807,6 +809,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                         Text(
                           '• Play Date: ${_targetPlayDate != null ? DateFormat('EEE, MMM d').format(_targetPlayDate!) : 'Not selected'}\n'
                           '• Release: ${_computedReleaseDateTime != null ? DateFormat('h:mm a').format(_computedReleaseDateTime!) : 'Not calculated'}\n'
+                          '• Tee: ${_teeTarget == 10 ? '10th Tee' : '1st Tee'}\n'
                           '• Preferred Times: ${_preferredTimes.isNotEmpty ? _preferredTimes.join(', ') : 'Not selected'}\n'
                           '• Total Players: $_partySize',
                           style: Theme.of(context)
@@ -857,6 +860,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
     final isLastPage = _currentPage == 4;
     final canContinue = _currentPage < 4 && !_isNextBusy;
     final isReleased = _isReleasedDate(_targetPlayDate);
+    final useDebugBookNow = isReleased && kDebugMode;
     final canSave = isLastPage && !_isNextBusy && !_isBookingNow;
 
     return Container(
@@ -892,7 +896,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                 child: ElevatedButton.icon(
                   onPressed: canContinue
                       ? _nextPage
-                      : (canSave ? (isReleased ? _bookNow : _saveJob) : null),
+                      : (canSave ? (useDebugBookNow ? _bookNow : _saveJob) : null),
                   icon: _isNextBusy || _isBookingNow
                       ? const SizedBox(
                           width: 16,
@@ -900,13 +904,13 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : Icon(isLastPage
-                          ? (isReleased ? Icons.flash_on : Icons.check)
+                          ? (useDebugBookNow ? Icons.flash_on : Icons.check)
                           : Icons.arrow_forward),
                   label: Text(
                     _isNextBusy || _isBookingNow
                         ? 'Loading...'
                         : isLastPage
-                            ? (isReleased ? 'Book Now' : 'Create Job')
+                            ? (useDebugBookNow ? 'Book Now' : 'Create Job')
                             : 'Continue',
                   ),
                 ),
@@ -961,6 +965,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
           'partySize': _partySize,
           'minutes': 4,
           ..._teePayload(),
+          'dryRun': true,
         }),
       );
       if (response.statusCode != 200) {

@@ -88,6 +88,7 @@ class BookingJob {
             ? Timestamp.fromDate(releaseWindowStart!)
             : null,
         'snipe_strategy': snipeStrategy,
+        'tee': teeTarget,
         'tee_mode': teeMode,
         'tee_target': teeTarget,
         'fallback_tee': fallbackTee,
