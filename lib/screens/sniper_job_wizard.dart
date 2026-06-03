@@ -483,7 +483,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         teeMode: _teeMode,
         teeTarget: _teeTarget,
         fallbackTee: _fallbackTee,
-        status: 'active', // Explicitly set to active
+        status: 'paused',
+        state: 'paused',
       );
 
       print('🔵 [WIZARD] Job status before save: ${job.status}');
@@ -501,7 +502,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       await prefs.remove('sniper_wizard_draft');
 
       Navigator.of(context).pop();
-      _showSnack('✓ Sniper job created! ID: $id');
+      _showSnack(
+          'Job saved as draft / paused. It will not contact BRS until armed. ID: $id');
     } catch (e) {
       if (!mounted) return;
       _showSnack(
@@ -811,7 +813,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                           '• Release: ${_computedReleaseDateTime != null ? DateFormat('h:mm a').format(_computedReleaseDateTime!) : 'Not calculated'}\n'
                           '• Tee: ${_teeTarget == 10 ? '10th Tee' : '1st Tee'}\n'
                           '• Preferred Times: ${_preferredTimes.isNotEmpty ? _preferredTimes.join(', ') : 'Not selected'}\n'
-                          '• Total Players: $_partySize',
+                          '• Total Players: $_partySize\n\n'
+                          'Job saved as draft / paused. It will not contact BRS until armed.',
                           style: Theme.of(context)
                               .textTheme
                               .bodySmall
@@ -896,7 +899,9 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                 child: ElevatedButton.icon(
                   onPressed: canContinue
                       ? _nextPage
-                      : (canSave ? (useDebugBookNow ? _bookNow : _saveJob) : null),
+                      : (canSave
+                          ? (useDebugBookNow ? _bookNow : _saveJob)
+                          : null),
                   icon: _isNextBusy || _isBookingNow
                       ? const SizedBox(
                           width: 16,
@@ -910,7 +915,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     _isNextBusy || _isBookingNow
                         ? 'Loading...'
                         : isLastPage
-                            ? (useDebugBookNow ? 'Book Now' : 'Create Job')
+                            ? (useDebugBookNow ? 'Book Now' : 'Save Draft')
                             : 'Continue',
                   ),
                 ),

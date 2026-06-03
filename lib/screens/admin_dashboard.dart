@@ -445,8 +445,10 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   Future<void> _toggleJobStatus(String jobId, String currentStatus) async {
     final newStatus = currentStatus == 'active' ? 'paused' : 'active';
+    final newState = currentStatus == 'active' ? 'paused' : 'queued';
     await FirebaseFirestore.instance.collection('jobs').doc(jobId).update({
       'status': newStatus,
+      'state': newState,
       'updated_at': Timestamp.now(),
     });
     if (mounted) {

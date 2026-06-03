@@ -1162,6 +1162,7 @@ function isReadyJob(job) {
   const state = String(job.state || '').toLowerCase();
   const mode = String(job.mode || job.bookingMode || '').toLowerCase();
   if (mode && mode !== 'sniper') return false;
+  if (['paused', 'draft'].includes(state)) return false;
   if (['running', 'finished', 'error'].includes(state)) return false;
   return READY_JOB_STATUSES.includes(status);
 }

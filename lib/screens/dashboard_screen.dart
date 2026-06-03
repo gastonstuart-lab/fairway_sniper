@@ -41,7 +41,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
-    _prefetchService = BookingPrefetchService(firebaseService: _firebaseService);
+    _prefetchService =
+        BookingPrefetchService(firebaseService: _firebaseService);
     _loadWeather();
     _loadNews();
     _loadProfile();
@@ -97,7 +98,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
 
     if (result != null) {
-      await _firebaseService.saveBRSCredentials(uid, result['username']!, result['password']!);
+      await _firebaseService.saveBRSCredentials(
+          uid, result['username']!, result['password']!);
       if (!mounted) return;
       setState(() => _savedCreds = result);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -112,6 +114,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final unit = size == 1 ? 'player' : 'players';
     return '$size $unit';
   }
+
   DateTime _getNextSaturday() {
     final now = DateTime.now();
     int daysUntilSaturday = (DateTime.saturday - now.weekday) % 7;
@@ -309,7 +312,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 print('🔍 [DASHBOARD] Job ${job.id}: status="${job.status}"');
               }
             }
-            
+
             if (jobSnapshot.connectionState == ConnectionState.waiting) {
               return const Center(child: CircularProgressIndicator());
             }
@@ -382,7 +385,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           builder: (context, _) => DashboardPrefetchCard(
                             state: _prefetchService.state,
                             isRunning: _prefetchService.isRunning,
-                            onRefresh: () => _prefetchService.run(forceRefresh: true),
+                            onRefresh: () =>
+                                _prefetchService.run(forceRefresh: true),
                           ),
                         ),
                       ),
@@ -398,7 +402,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.xl),
                         child: LocalTimeCard(isDarkMode: _isDarkMode),
                       ),
                     ),
@@ -406,7 +411,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.xl),
                         child: _buildWeatherCard(jobs),
                       ),
                     ),
@@ -414,7 +420,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
-                        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.xl),
                         child: Row(
                           children: [
                             Expanded(child: _buildJokeButton()),
@@ -445,12 +452,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
           onPressed: () => Navigator.of(context).push(
             MaterialPageRoute(builder: (_) => const ModeSelectionScreen()),
           ),
-          backgroundColor: _prefetchService.state.isReady
-              ? const Color(0xFF2E7D32)
-              : null,
+          backgroundColor:
+              _prefetchService.state.isReady ? const Color(0xFF2E7D32) : null,
           icon: const Icon(Icons.add),
           label: Text(
-            _prefetchService.state.isReady ? 'Ready to Book' : 'New Booking Job',
+            _prefetchService.state.isReady
+                ? 'Ready to Book'
+                : 'New Booking Job',
           ),
         ),
       ),
@@ -1360,22 +1368,31 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           ),
                           tooltip: job.status == 'active'
                               ? 'Pause Job'
-                              : 'Activate Job',
+                              : (isSniper ? 'Arm Sniper' : 'Activate Job'),
                           onPressed: () async {
+                            final isActive = job.status == 'active';
+                            final patch = isActive
+                                ? <String, dynamic>{
+                                    'status': 'paused',
+                                    'state': 'paused',
+                                  }
+                                : <String, dynamic>{
+                                    'status': 'active',
+                                    'state': isSniper ? 'queued' : 'active',
+                                  };
                             await _firebaseService.updateJob(
                               job.id!,
-                              {
-                                'status':
-                                    job.status == 'active' ? 'paused' : 'active'
-                              },
+                              patch,
                             );
                             if (context.mounted) {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
                                   content: Text(
-                                    job.status == 'active'
+                                    isActive
                                         ? '⏸️ Job paused'
-                                        : '▶️ Job activated',
+                                        : (isSniper
+                                            ? '🎯 Sniper armed'
+                                            : '▶️ Job activated'),
                                   ),
                                   duration: const Duration(seconds: 2),
                                 ),
@@ -2618,4 +2635,3 @@ class _LocalTimeCardState extends State<LocalTimeCard> {
     );
   }
 }
-

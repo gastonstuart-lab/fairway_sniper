@@ -16,6 +16,7 @@ class BookingJob {
   final List<String> players;
   final int? partySize;
   final String status;
+  final String? state;
   final DateTime? nextFireTimeUtc;
   final String? pushToken;
   final DateTime createdAt;
@@ -46,6 +47,7 @@ class BookingJob {
     required this.players,
     this.partySize,
     this.status = 'active',
+    this.state,
     this.nextFireTimeUtc,
     this.pushToken,
     this.bookingMode = BookingMode.normal,
@@ -74,6 +76,7 @@ class BookingJob {
         'players': players,
         'party_size': partySize,
         'status': status,
+        if (state != null) 'state': state,
         'next_fire_time_utc': nextFireTimeUtc != null
             ? Timestamp.fromDate(nextFireTimeUtc!)
             : null,
@@ -126,6 +129,7 @@ class BookingJob {
       players: List<String>.from(json['players'] ?? []),
       partySize: json['party_size'] is int ? json['party_size'] as int : null,
       status: json['status'] ?? 'active',
+      state: json['state'] as String?,
       nextFireTimeUtc: json['next_fire_time_utc'] is Timestamp
           ? (json['next_fire_time_utc'] as Timestamp).toDate()
           : null,
@@ -195,6 +199,7 @@ class BookingJob {
     List<String>? players,
     int? partySize,
     String? status,
+    String? state,
     DateTime? nextFireTimeUtc,
     String? pushToken,
     DateTime? createdAt,
@@ -222,6 +227,7 @@ class BookingJob {
         players: players ?? this.players,
         partySize: partySize ?? this.partySize,
         status: status ?? this.status,
+        state: state ?? this.state,
         nextFireTimeUtc: nextFireTimeUtc ?? this.nextFireTimeUtc,
         pushToken: pushToken ?? this.pushToken,
         createdAt: createdAt ?? this.createdAt,
