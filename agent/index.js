@@ -4166,7 +4166,7 @@ async function runBooking(config) {
             page,
             searchTimes,
             watchMs,
-            CONFIG.TEST_MODE,
+            true,
             {
               targetDate: targetDateStr,
               tee: teeCtx?.teeTarget ?? normalizedTeeTarget,
@@ -4203,26 +4203,33 @@ async function runBooking(config) {
         console.log(
           `[CANDIDATE] considered source=dom-watcher jobId=${jobId || 'n/a'} date=${releaseEvaluation.selectedDate || 'n/a'} tee=${releaseEvaluation.selectedTee || 'n/a'} time=${releaseEvaluation.selectedTime || releaseClickedTime} openSlots=${releaseEvaluation.openSlots ?? 'n/a'} accepted=${releaseEvaluation.accepted} reasons=${releaseEvaluation.reasons.join(',') || 'accepted'}`,
         );
+        if (!releaseEvaluation.accepted) {
+          notes.push(
+            `Rejected DOM watcher candidate ${releaseClickedTime}: ${releaseEvaluation.reasons.join(',')}`,
+          );
+          releaseResult = null;
+        } else {
         console.log(`[FIRE] FIRE_LATENCY_MS=${fireLatencyMs}`);
         if (fireLatencyMs > 200) {
           console.warn(`[WARN] ⚠️ FIRE_LATENCY_MS >200ms: ${fireLatencyMs}ms`);
           if (jobId) logJobEvent(jobId, `⚠️ FIRE LATENCY HIGH (${fireLatencyMs}ms)`);
         }
         if (CONFIG.TEST_MODE) {
-          console.log(`[TEST_MODE] ⚠️ Booking click executed in page context (TEST_MODE active)`);
+          console.log(`[TEST_MODE] Validation reached exact DOM watcher candidate`);
         }
-        // Click already executed in page context by waitForBookingRelease
-        const releaseSlotInfo = bookingSlots.find((slot) => slot.time === releaseResult.slotTime);
-        const clickResult = await executeReleaseBooking(
+        const clickResult = await tryDirectBookingHref(
           page,
-          null,
+          {
+            time: releaseResult.slotTime,
+            href: releaseResult.href,
+            date: targetDateStr,
+            tee: teeCtx?.teeTarget ?? normalizedTeeTarget,
+          },
           additionalPlayers,
-          releaseSlotInfo && releaseSlotInfo.openSlots > 0 ? releaseSlotInfo.openSlots : 3,
+          desiredPartySize,
           targetReachedAt,
           jobId,
           dryRun,
-          true,
-          fireLatencyMs,
         );
         if (dryRun) {
           const diagnostics = {
@@ -4379,6 +4386,7 @@ async function runBooking(config) {
             teeSelected: getTeeLabel(),
             ...diagnostics,
           };
+        }
         }
       } else if (!bookingSuccess) {
         console.log('[SNIPER] Release watcher timeout — refreshing exact preferred candidates');
