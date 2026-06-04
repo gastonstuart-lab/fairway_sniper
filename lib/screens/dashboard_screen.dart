@@ -115,6 +115,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return '$size $unit';
   }
 
+  String _primaryTimeLabel(BookingJob job) {
+    return job.preferredTimes.isNotEmpty
+        ? job.preferredTimes.first
+        : 'No target time';
+  }
+
   DateTime _getNextSaturday() {
     final now = DateTime.now();
     int daysUntilSaturday = (DateTime.saturday - now.weekday) % 7;
@@ -491,7 +497,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _weatherForecast != null) {
       bookingWeather = _weatherService.getHourlyWeatherForTime(
         _weatherForecast!,
-        activeJob.preferredTimes.first,
+        _primaryTimeLabel(activeJob),
       );
     }
 
@@ -586,7 +592,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       color: Theme.of(context).colorScheme.primary, size: 20),
                   const SizedBox(width: 8),
                   Text(
-                    'Tee Time Weather (${activeJob!.preferredTimes.first})',
+                    'Tee Time Weather (${_primaryTimeLabel(activeJob!)})',
                     style: Theme.of(context).textTheme.titleSmall?.copyWith(
                           fontWeight: FontWeight.w600,
                           color: textColor,
@@ -1302,7 +1308,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            '${job.targetDay} at ${job.preferredTimes.first}',
+                            '${job.targetDay} at ${_primaryTimeLabel(job)}',
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
                               fontSize: 17,
@@ -1578,7 +1584,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             ),
                             const SizedBox(height: 2),
                             Text(
-                              '${job.targetDay} at ${job.preferredTimes.first}',
+                              '${job.targetDay} at ${_primaryTimeLabel(job)}',
                               style: TextStyle(
                                 fontSize: 11,
                                 color: subtextColor,
@@ -1719,6 +1725,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   DateTime? _getTargetDateTime(BookingJob job) {
     try {
+      if (job.preferredTimes.isEmpty) return null;
+
       // Parse target day (e.g., "Saturday")
       final now = DateTime.now();
       final targetDayName = job.targetDay;
@@ -1742,7 +1750,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final targetDate = now.add(Duration(days: daysUntilTarget));
 
       // Parse time (e.g., "08:00")
-      final timeParts = job.preferredTimes.first.split(':');
+      final timeParts = _primaryTimeLabel(job).split(':');
       final hour = int.parse(timeParts[0]);
       final minute = int.parse(timeParts[1]);
 
