@@ -13,6 +13,7 @@ import {
   buildSlotPolicy,
   evaluateSlotCandidate,
 } from './slot_policy.js';
+import { getEntryOpenSlots } from './tee_data_policy.js';
 import os from 'os';
 import crypto from 'crypto';
 
@@ -1429,9 +1430,10 @@ async function scheduleClaimedJob(job) {
         players_requested: result?.playersRequested || null,
         players_filled: result?.playersFilled || null,
         field_diagnostics: result?.fieldDiagnostics || null,
+        candidate_diagnostics: result?.candidateDiagnostics || null,
         available_times: result?.availableTimes || null,
         tee_selected: result?.teeSelected || null,
-        requested_tee: tee,
+        requested_tee: teeConfig.teeTarget,
         finished_at: admin.firestore.FieldValue.serverTimestamp(),
         error_message: isSuccess ? null : result?.error || 'clicked but no confirmation',
         click_delta_ms: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
@@ -3299,23 +3301,6 @@ function confirmationBlocked(confirmationText) {
   ].includes(confirmationText);
 }
 
-function countOpenParticipantSlots(participants) {
-  if (!Array.isArray(participants)) return null;
-  return participants.filter((participant) => {
-    const name = participant?.name;
-    return name === null || name === undefined || String(name).trim() === '';
-  }).length;
-}
-
-function getEntryOpenSlots(entry) {
-  const teeTime = entry?.tee_time || entry;
-  const participantSlots = countOpenParticipantSlots(teeTime?.participants || entry?.participants);
-  if (participantSlots !== null) return participantSlots;
-  const direct = teeTime?.open_slots ?? teeTime?.openSlots ?? entry?.open_slots ?? entry?.openSlots;
-  const parsed = Number.parseInt(direct, 10);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
 function preferredSlotRank(timeLabel, preferredLabels, nearestWindowMinutes = Number.POSITIVE_INFINITY) {
   const slotMinutes = timeToMinutes(timeLabel);
   if (slotMinutes === null || !preferredLabels.length) {
@@ -3967,6 +3952,8 @@ async function runBooking(config) {
     let finalScreenshotPath = null;
     let finalBookingLinksCountAfterClick = null;
     let finalError = null;
+    let finalAvailableTimes = null;
+    let finalCandidateDiagnostics = null;
     let directCapacityRequired = false;
     let directCapacityFailed = false;
     let directCandidatesExhausted = false;
@@ -3986,6 +3973,17 @@ async function runBooking(config) {
           targetFireTime,
           { partySize: desiredPartySize },
         );
+        finalAvailableTimes = directPollResult.availableTimes || [];
+        finalCandidateDiagnostics = {
+          source: 'direct-html-poll',
+          found: directPollResult.found === true,
+          attempt: directPollResult.attempt ?? null,
+          httpStatus: directPollResult.httpStatus ?? null,
+          candidateCount: directPollResult.candidateCount ?? null,
+          availableTimes: directPollResult.availableTimes || [],
+          skippedInsufficientSlots: directPollResult.skippedInsufficientSlots ?? 0,
+          rejectedCandidates: (directPollResult.rejectedCandidates || []).slice(0, 25),
+        };
 
         if (directPollResult.found) {
           notes.push(
@@ -4467,6 +4465,8 @@ async function runBooking(config) {
       release_detect_delta_ms: finalReleaseDetectDeltaMs,
       snapshot_path: finalSnapshotPath,
       screenshot_path: finalScreenshotPath,
+      available_times: finalAvailableTimes,
+      candidate_diagnostics: finalCandidateDiagnostics,
       source_path: sourcePath,
       requested_tee: normalizedTeeTarget,
       tee_selected: getTeeLabel(),
@@ -4499,6 +4499,8 @@ async function runBooking(config) {
       latencyMs: Date.now() - startTime,
       notes: finalNotes,
       playersRequested: additionalPlayers,
+      availableTimes: finalAvailableTimes,
+      candidateDiagnostics: finalCandidateDiagnostics,
       sourcePath,
       requestedTee: normalizedTeeTarget,
       teeSelected: getTeeLabel(),
