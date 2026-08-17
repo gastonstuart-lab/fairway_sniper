@@ -3,6 +3,8 @@ import 'package:fairway_sniper/models/booking_job.dart';
 String sniperLifecycleLabel(BookingJob job) {
   final state = (job.state ?? '').trim().toLowerCase();
   final status = job.status.trim().toLowerCase();
+  final hasProductionSchedule =
+      job.prepScheduledFor != null && job.scheduledFor != null;
 
   switch (state) {
     case 'paused':
@@ -10,7 +12,7 @@ String sniperLifecycleLabel(BookingJob job) {
     case 'queued':
       return 'Arming Sniper…';
     case 'production_confirmed':
-      return 'Sniper Scheduled';
+      return hasProductionSchedule ? 'Sniper Scheduled' : 'Arming Sniper…';
     case 'timer_registered':
     case 'waiting_for_prep':
       return 'Waiting for PREP';
@@ -25,7 +27,7 @@ String sniperLifecycleLabel(BookingJob job) {
     case 'booking':
       return 'Booking…';
     case 'running':
-      return 'Running';
+      return hasProductionSchedule ? 'Sniper Scheduled' : 'Arming Sniper…';
     case 'finished':
       return 'Booked';
     case 'error':
@@ -34,7 +36,9 @@ String sniperLifecycleLabel(BookingJob job) {
 
   if (status == 'error') return 'Failed / Needs Attention';
   if (status == 'finished') return 'Booked';
-  if (status == 'running') return 'Running';
+  if (status == 'running') {
+    return hasProductionSchedule ? 'Sniper Scheduled' : 'Arming Sniper…';
+  }
   if (status == 'active') return 'Arming Sniper…';
   return status.isEmpty ? 'Unknown' : status.toUpperCase();
 }
