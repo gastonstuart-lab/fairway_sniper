@@ -9,6 +9,10 @@ const dashboardSource = fs.readFileSync(
   path.join(repoRoot, 'lib', 'screens', 'dashboard_screen.dart'),
   'utf8',
 );
+const safeProofBuilderSource = fs.readFileSync(
+  path.join(repoRoot, 'lib', 'services', 'safe_proof_builder.dart'),
+  'utf8',
+);
 
 function functionBody(source, name) {
   const start = source.indexOf(`async function ${name}`);
@@ -112,6 +116,32 @@ test('proof dry-run surfaces pre-book boundary and one-click UI action', () => {
   assert(agentSource.includes("'PROOF_SUCCESS'"));
   assert(agentSource.includes("'PROOF_FAILED'"));
   assert(dashboardSource.includes('Run Safe Production Proof'));
-  assert(dashboardSource.includes("'proof_run': true"));
-  assert(dashboardSource.includes("'proof_fire_time_override_utc'"));
+  assert(safeProofBuilderSource.includes("'proof_run': true"));
+  assert(safeProofBuilderSource.includes("'proof_fire_time_override_utc'"));
+  assert(safeProofBuilderSource.includes("'proof_template_job_id'"));
+});
+
+test('runtime diagnostics expose effective prep lead', () => {
+  assert(agentSource.includes('sniperPrepLeadMs'));
+  assert(agentSource.includes('getPrepLeadMs()'));
+});
+
+test('fire callback captures drift before asynchronous diagnostics', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  const fireCallback = body.indexOf('const fireNow = async');
+  const driftCapture = body.indexOf('const fireCallbackAtMs = Date.now()', fireCallback);
+  const firstAwait = body.indexOf('await ', fireCallback);
+  assert(driftCapture > fireCallback, 'fire callback timestamp missing');
+  assert(driftCapture < firstAwait, 'fire callback timestamp must be captured before await');
+});
+
+test('fire hot path does not await diagnostic writes before booking starts', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  const fireCallback = body.indexOf('const fireNow = async');
+  const runBooking = body.indexOf('const result = await runBooking', fireCallback);
+  const hotPath = body.slice(fireCallback, runBooking);
+  assert(hotPath.includes("void fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED'"));
+  assert(hotPath.includes("void fsAddJobEvent(jobId, 'BOOKING_STARTED'"));
+  assert(!hotPath.includes("await fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED'"));
+  assert(!hotPath.includes("await fsAddJobEvent(jobId, 'BOOKING_STARTED'"));
 });

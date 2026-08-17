@@ -7,6 +7,7 @@ import {
   buildPrebookBoundaryEvidence,
   validatePrebookBoundary,
 } from '../prebook_boundary.js';
+import { validatePartyPlayers } from '../party_validation.js';
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..');
 const agentSource = fs.readFileSync(path.join(repoRoot, 'agent', 'index.js'), 'utf8');
@@ -15,36 +16,55 @@ function fakePage({
   formVisible = true,
   confirmVisible = true,
   confirmEnabled = true,
+  globalBookVisible = false,
   confirmText = 'Create Booking',
   url = 'https://members.brsgolf.com/galgorm/bookings/book/1112',
   onClick = () => {},
 } = {}) {
-  let locatorCall = 0;
+  const confirmControl = {
+    first() {
+      return this;
+    },
+    async isVisible() {
+      return confirmVisible;
+    },
+    async isEnabled() {
+      return confirmEnabled;
+    },
+    async textContent() {
+      return confirmText;
+    },
+    async evaluate() {
+      return confirmEnabled;
+    },
+    async click() {
+      onClick();
+    },
+  };
+  const form = {
+    first() {
+      return this;
+    },
+    async isVisible() {
+      return formVisible;
+    },
+    locator() {
+      return confirmControl;
+    },
+  };
+  const globalButton = {
+    first() {
+      return this;
+    },
+    async isVisible() {
+      return globalBookVisible;
+    },
+  };
   return {
     url: () => url,
-    locator: () => {
-      locatorCall += 1;
-      const isFormProbe = locatorCall === 1;
-      return {
-        first() {
-          return this;
-        },
-        async isVisible() {
-          return isFormProbe ? formVisible : confirmVisible;
-        },
-        async isEnabled() {
-          return confirmEnabled;
-        },
-        async textContent() {
-          return confirmText;
-        },
-        async evaluate() {
-          return confirmEnabled;
-        },
-        async click() {
-          onClick();
-        },
-      };
+    locator: (selector) => {
+      if (selector === 'form[name="member_booking_form"]') return form;
+      return globalButton;
     },
   };
 }
@@ -125,6 +145,39 @@ test('insufficient capacity fails the proof boundary', () => {
 
   assert.equal(boundary.prebookBoundaryReached, false);
   assert.equal(boundary.error, 'insufficient-capacity');
+});
+
+test('global Book button outside member booking form is rejected', async () => {
+  const boundary = await validatePrebookBoundary(
+    fakePage({ formVisible: false, globalBookVisible: true }),
+    {
+      players: [],
+      openSlots: 1,
+      confirmResult: { filled: [] },
+    },
+  );
+
+  assert.equal(boundary.prebookBoundaryReached, false);
+  assert.equal(boundary.error, 'booking-form-not-found');
+});
+
+test('four-player party requires exactly three distinct player IDs', () => {
+  assert.equal(
+    validatePartyPlayers({ partySize: 4, players: ['1', '2', '3'] }).ok,
+    true,
+  );
+  assert.equal(
+    validatePartyPlayers({ partySize: 4, players: ['1', '2'] }).error,
+    'party-player-count-mismatch',
+  );
+  assert.equal(
+    validatePartyPlayers({ partySize: 4, players: ['1', '1', '3'] }).error,
+    'duplicate-player-id',
+  );
+  assert.equal(
+    validatePartyPlayers({ partySize: 5, players: ['1', '2', '3', '4'] }).error,
+    'invalid-party-size',
+  );
 });
 
 test('live booking behavior still clicks confirm outside dry-run branch', () => {

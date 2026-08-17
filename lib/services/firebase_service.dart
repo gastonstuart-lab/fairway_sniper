@@ -131,7 +131,7 @@ class FirebaseService {
 
   Future<String> createJob(BookingJob job) async {
     print('🔵 FirebaseService.createJob called');
-    print('🔵 Job data: ${job.toJson()}');
+    print('Creating job metadata only; payload values are not logged.');
 
     try {
       final docRef = await _firestore.collection('jobs').add(job.toJson());

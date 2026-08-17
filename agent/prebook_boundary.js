@@ -1,16 +1,12 @@
 export const DRY_RUN_PREBOOK_REACHED = 'DRY_RUN_PREBOOK_REACHED';
 
-export const BOOKING_FORM_SELECTOR =
-  '#member_booking_form_confirm_booking, form[name="member_booking_form"]';
+export const BOOKING_FORM_SELECTOR = 'form[name="member_booking_form"]';
 
 export const CONFIRM_CONTROL_SELECTOR = [
   'button#member_booking_form_confirm_booking',
-  '#member_booking_form_confirm_booking',
+  'input#member_booking_form_confirm_booking',
   'form[name="member_booking_form"] button[type="submit"]',
-  'button:has-text("Create Booking")',
-  'button:has-text("Confirm")',
-  'button:has-text("Book")',
-  'button:has-text("Complete")',
+  'form[name="member_booking_form"] input[type="submit"]',
 ].join(', ');
 
 function normalizeOpenSlots(openSlots) {
@@ -32,6 +28,13 @@ function boundaryError(evidence) {
   return null;
 }
 
+function playerDiagnosticsOk(fieldDiagnostics = []) {
+  return fieldDiagnostics.every((diag) => {
+    if (!diag || diag.selectedRequestedValue === undefined) return true;
+    return diag.selectedRequestedValue === true;
+  });
+}
+
 export function buildPrebookBoundaryEvidence({
   bookingFormVisible = false,
   confirmControlVisible = false,
@@ -48,7 +51,8 @@ export function buildPrebookBoundaryEvidence({
 } = {}) {
   const expected = Array.isArray(playersExpected) ? playersExpected : [];
   const filled = Array.isArray(playersFilled) ? playersFilled : [];
-  const playersFilledOk = filled.length >= expected.length;
+  const playersFilledOk =
+    filled.length >= expected.length && playerDiagnosticsOk(fieldDiagnostics);
   const evidence = {
     prebookBoundaryReached: false,
     bookingFormVisible: Boolean(bookingFormVisible),
@@ -78,7 +82,17 @@ export function buildPrebookBoundaryEvidence({
 }
 
 export async function inspectConfirmControl(page) {
-  const control = page.locator(CONFIRM_CONTROL_SELECTOR).first();
+  const form = page.locator(BOOKING_FORM_SELECTOR).first();
+  const formVisible = await form.isVisible({ timeout: 1500 }).catch(() => false);
+  if (!formVisible) {
+    return { visible: false, enabled: false, text: null };
+  }
+
+  const control = form
+    .locator(
+      'button#member_booking_form_confirm_booking, input#member_booking_form_confirm_booking, button[type="submit"], input[type="submit"]',
+    )
+    .first();
   const visible = await control.isVisible({ timeout: 1500 }).catch(() => false);
   if (!visible) {
     return { visible: false, enabled: false, text: null };

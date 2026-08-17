@@ -16,8 +16,10 @@ import {
 import { getEntryOpenSlots } from './tee_data_policy.js';
 import {
   DRY_RUN_PREBOOK_REACHED,
+  inspectConfirmControl,
   validatePrebookBoundary,
 } from './prebook_boundary.js';
+import { validatePartyPlayers } from './party_validation.js';
 import os from 'os';
 import crypto from 'crypto';
 
@@ -276,6 +278,8 @@ app.get('/api/runtime-status', (_req, res) => {
     firestoreConnected: Boolean(db && firebaseAdminReady),
     agentRunMain: process.env.AGENT_RUN_MAIN === 'true',
     sniperRunnerStarted,
+    sniperPrepLeadMs: getPrepLeadMs(),
+    sniperPrepLeadMs: getPrepLeadMs(),
     activeSniperTimers: timerSummary,
     acceptedActiveJobs: timerSummary.jobs,
     timers: Array.from(jobTimers.values()).map((entry) => ({
@@ -339,10 +343,10 @@ const isAdminDevToolRequest = (req) =>
 
 const blockAccidentalLiveEndpoint = (req, res, endpointName) => {
   const dryRun = parseBooleanFlag(req?.body?.dryRun, false);
-  if (dryRun || isAdminDevToolRequest(req)) return false;
+  if (dryRun) return false;
   res.status(403).json({
     success: false,
-    error: `${endpointName} is an admin/dev live-booking tool. Use Firestore scheduled sniper jobs for production live bookings.`,
+    error: `${endpointName} cannot perform live bookings from client/dev requests. Use Firestore scheduled sniper jobs for production live bookings.`,
   });
   return true;
 };
@@ -1102,6 +1106,12 @@ app.post('/api/sniper-test', async (req, res) => {
     if (!username || !password || !targetDate) {
       return res.status(400).json({ error: 'Missing required fields: username, password, targetDate' });
     }
+    const dryRun = parseBooleanFlag(req.body?.dryRun, true);
+    if (!dryRun) {
+      return res.status(403).json({
+        error: '/api/sniper-test is dry-run only; use Firestore scheduled sniper jobs for production live bookings.',
+      });
+    }
     const jobId = `sniper-${Date.now()}`;
     setJob(jobId, { status: 'queued', createdAt: new Date().toISOString() });
     const normalizedTeeTarget = parseTeeTarget(teeTarget ?? req.body?.tee);
@@ -1117,7 +1127,7 @@ app.post('/api/sniper-test', async (req, res) => {
       fireTimeUtc,
       teeTarget: normalizedTeeTarget,
       fallbackTee: normalizedFallbackTee,
-      dryRun: parseBooleanFlag(req.body?.dryRun, true),
+      dryRun,
     });
     const job = getJob(jobId);
     res.json({ jobId, scheduledFor: job?.scheduledFor, status: job?.status });
@@ -1523,8 +1533,21 @@ function buildFirestoreJobStatus(docId, data) {
     claimedBy: job.claimed_by || job.claimedBy || null,
     runId: job.run_id || job.runId || null,
     preferredTimes: serializeStatusValue(job.preferred_times || job.preferredTimes || []),
+    partySize: job.party_size ?? job.partySize ?? null,
+    playersCount: Array.isArray(job.players) ? job.players.length : null,
     tee: job.tee_target || job.teeTarget || job.tee || null,
     fallbackTee: job.fallback_tee || job.fallbackTee || false,
+    dryRun: parseBooleanFlag(job.dry_run ?? job.dryRun, false),
+    proofRun: parseBooleanFlag(job.proof_run ?? job.proofRun ?? job.safe_proof ?? job.safeProof, false),
+    proofTemplateJobId: job.proof_template_job_id || job.proofTemplateJobId || null,
+    proofCandidateDate: job.proof_candidate_date || job.proofCandidateDate || null,
+    proofCandidateTime: job.proof_candidate_time || job.proofCandidateTime || null,
+    proofCandidateTee: job.proof_candidate_tee || job.proofCandidateTee || null,
+    proofPartySize: job.proof_party_size || job.proofPartySize || null,
+    prebookBoundary: serializeStatusValue(job.prebook_boundary || job.prebookBoundary || null),
+    fireTimerDriftMs: job.fire_timer_drift_ms ?? job.fireTimerDriftMs ?? null,
+    bookingHotPathDeltaMs: job.booking_hot_path_delta_ms ?? job.bookingHotPathDeltaMs ?? null,
+    firstBrsActionDeltaMs: job.first_brs_action_delta_ms ?? job.firstBrsActionDeltaMs ?? null,
     result: job.result || null,
     bookedTime: job.booked_time || job.bookedTime || null,
     errorMessage: job.error_message || job.last_error || job.error || null,
@@ -1730,6 +1753,15 @@ async function scheduleClaimedJob(job) {
   const preferredTimesForLog = Array.isArray(job.preferred_times)
     ? normalizeStringList(job.preferred_times)
     : normalizeStringList(job.preferredTimes ?? job.preferred_times);
+  const playersForValidation = Array.isArray(job.players) ? job.players : [];
+  const partyValidation = validatePartyPlayers({
+    partySize: job.party_size ?? job.partySize ?? playersForValidation.length + 1,
+    players: playersForValidation,
+  });
+  if (!partyValidation.ok) {
+    await markJobError(jobId, partyValidation.error);
+    return;
+  }
   const ukNow = DateTime.now().setZone(job.tz || job.timezone || CONFIG.TZ_LONDON).toISO();
 
   console.log(`[RUNNER] Job found ${jobId}`);
@@ -1780,6 +1812,9 @@ async function scheduleClaimedJob(job) {
     prepTimer: null,
     fireTimer: null,
     bookingAttempted: false,
+    cachedJob: job,
+    cachedCreds: null,
+    preparedRunId: null,
   };
   jobTimers.set(jobId, timerEntry);
 
@@ -1793,6 +1828,16 @@ async function scheduleClaimedJob(job) {
       const creds = await resolveJobCredentials(job);
       if (!creds?.username || !creds?.password) {
         throw new Error('missing-credentials');
+      }
+      entry.cachedCreds = creds;
+      entry.cachedJob = { ...job, players: partyValidation.players, party_size: partyValidation.partySize };
+      if (!entry.preparedRunId) {
+        entry.preparedRunId = await fsAddRun(
+          jobId,
+          job.ownerUid || job.owner_uid || 'unknown',
+          new Date(),
+          'Prepared during PREP warm-up',
+        );
       }
 
       entry.warmState = 'warming';
@@ -1841,6 +1886,8 @@ async function scheduleClaimedJob(job) {
   };
 
   const fireNow = async (source = 'fire-timer') => {
+    const fireCallbackAtMs = Date.now();
+    const fireTimerDriftMs = fireCallbackAtMs - fireMs;
     const entry = jobTimers.get(jobId);
     if (!entry || entry.bookingAttempted) return;
     entry.bookingAttempted = true;
@@ -1849,25 +1896,21 @@ async function scheduleClaimedJob(job) {
       entry.fireTimer.state = 'fired';
       entry.fireTimer.firedAt = new Date().toISOString();
     }
-    await fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED', {
+    void fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED', {
       source,
       fireTimeUtc: scheduleAt.toISOString(),
+      fireCallbackAtUtc: new Date(fireCallbackAtMs).toISOString(),
+      fireTimerDriftMs,
     });
-    await fsUpdateJob(jobId, { state: 'firing' });
+    void fsUpdateJob(jobId, {
+      state: 'firing',
+      fire_callback_at: admin.firestore.Timestamp.fromMillis(fireCallbackAtMs),
+      fire_timer_drift_ms: fireTimerDriftMs,
+    });
     try {
-      let runJob = job;
-      if (db) {
-        try {
-          const latestSnap = await db.collection(JOBS_COLLECTION).doc(jobId).get();
-          if (latestSnap.exists) runJob = { id: latestSnap.id, ...latestSnap.data() };
-        } catch (latestError) {
-          await fsAddJobEvent(jobId, 'JOB_REREAD_FAILED', {
-            error: latestError?.message || String(latestError),
-          });
-        }
-      }
+      let runJob = entry.cachedJob || job;
       const ownerUid = runJob.ownerUid || runJob.owner_uid || 'unknown';
-      const creds = await resolveJobCredentials(runJob);
+      const creds = entry.cachedCreds || await resolveJobCredentials(runJob);
       const preferredTimes = Array.isArray(runJob.preferred_times)
         ? normalizeStringList(runJob.preferred_times)
         : normalizeStringList(runJob.preferredTimes ?? runJob.preferred_times);
@@ -1882,8 +1925,9 @@ async function scheduleClaimedJob(job) {
 
       let fireWarmPage = warmPage;
       if (!fireWarmPage) {
-        await fsAddJobEvent(jobId, 'BRS_NOT_READY_AT_FIRE_TIME', {
+        void fsAddJobEvent(jobId, 'BRS_NOT_READY_AT_FIRE_TIME', {
           warmState: entry.warmState || 'pending',
+          fireTimerDriftMs,
         });
         try {
           fireWarmPage = await Promise.race([
@@ -1897,13 +1941,20 @@ async function scheduleClaimedJob(job) {
         }
       }
 
-      await fsUpdateJob(jobId, { state: 'booking' });
-      await fsAddJobEvent(jobId, 'BOOKING_STARTED', {
+      const bookingHotPathStartMs = Date.now();
+      void fsUpdateJob(jobId, {
+        state: 'booking',
+        booking_hot_path_start_at: admin.firestore.Timestamp.fromMillis(bookingHotPathStartMs),
+        booking_hot_path_delta_ms: bookingHotPathStartMs - fireCallbackAtMs,
+      });
+      void fsAddJobEvent(jobId, 'BOOKING_STARTED', {
         fireTimeUtc: scheduleAt.toISOString(),
         targetDate: getTargetDateKeyFromJob(runJob) || targetDateKey,
         preferredTimes,
         teeTarget: teeConfig.teeTarget,
         dryRun,
+        fireTimerDriftMs,
+        bookingHotPathDeltaMs: bookingHotPathStartMs - fireCallbackAtMs,
       });
 
       const result = await runBooking({
@@ -1928,6 +1979,9 @@ async function scheduleClaimedJob(job) {
         teeTarget: teeConfig.teeTarget,
         fallbackTee: teeConfig.fallbackTee,
         sourcePath: 'firestore-runner',
+        preparedRunId: entry.preparedRunId,
+        fireCallbackAtMs,
+        bookingHotPathStartMs,
       });
 
       const isSuccess = result?.success === true;
@@ -1938,12 +1992,19 @@ async function scheduleClaimedJob(job) {
           bookedTime: result?.bookedTime || null,
           teeSelected: result?.teeSelected || null,
           verificationSignal: result?.verification_signal ?? result?.verificationSignal ?? null,
+          prebookBoundary: result?.prebookBoundary || result?.prebook_boundary || null,
+          fireTimerDriftMs: result?.fire_timer_drift_ms ?? result?.fireTimerDriftMs ?? fireTimerDriftMs,
+          bookingHotPathDeltaMs:
+            result?.booking_hot_path_delta_ms ?? result?.bookingHotPathDeltaMs ?? null,
+          firstBrsActionDeltaMs:
+            result?.first_brs_action_delta_ms ?? result?.firstBrsActionDeltaMs ?? null,
         });
       }
       if (isProof) {
         await fsAddJobEvent(jobId, reachedDryRunBoundary ? 'PROOF_SUCCESS' : 'PROOF_FAILED', {
           result: result?.result || null,
           error: reachedDryRunBoundary ? null : result?.error || 'proof-boundary-not-reached',
+          prebookBoundary: result?.prebookBoundary || result?.prebook_boundary || null,
         });
       }
       if (!(isProof && reachedDryRunBoundary)) {
@@ -1965,6 +2026,7 @@ async function scheduleClaimedJob(job) {
         players_requested: result?.playersRequested || null,
         players_filled: result?.playersFilled || null,
         field_diagnostics: result?.fieldDiagnostics || null,
+        prebook_boundary: result?.prebookBoundary || result?.prebook_boundary || null,
         candidate_diagnostics: result?.candidateDiagnostics || null,
         available_times: result?.availableTimes || null,
         tee_selected: result?.teeSelected || null,
@@ -1972,6 +2034,14 @@ async function scheduleClaimedJob(job) {
         finished_at: admin.firestore.FieldValue.serverTimestamp(),
         error_message: isSuccess ? null : result?.error || 'clicked but no confirmation',
         click_delta_ms: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
+        fire_timer_drift_ms: result?.fire_timer_drift_ms ?? result?.fireTimerDriftMs ?? fireTimerDriftMs,
+        booking_hot_path_delta_ms:
+          result?.booking_hot_path_delta_ms ?? result?.bookingHotPathDeltaMs ?? null,
+        first_brs_action_delta_ms:
+          result?.first_brs_action_delta_ms ?? result?.firstBrsActionDeltaMs ?? null,
+        booking_form_reached_ms: result?.bookingFormReachedMs ?? result?.booking_form_reached_ms ?? null,
+        prebook_boundary_reached_ms:
+          result?.prebook_boundary_reached_ms ?? result?.prebookBoundaryReachedMs ?? null,
         verification_url: result?.verification_url ?? result?.verificationUrl ?? null,
         verification_signal: result?.verification_signal ?? result?.verificationSignal ?? null,
         booking_links_count_after_click:
@@ -2911,6 +2981,21 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
           try {
             await selectElem.selectOption({ value: playerName }, { timeout: 2000 });
             await page.waitForTimeout(500);
+            const selectedAfter = await selectElem
+              .evaluate((el) => ({
+                selectedValue: el.value || '',
+                selectedText:
+                  el.selectedOptions && el.selectedOptions[0]
+                    ? (el.selectedOptions[0].textContent || '').replace(/\s+/g, ' ').trim()
+                    : '',
+              }))
+              .catch(() => null);
+            const diag = result.fieldDiagnostics[result.fieldDiagnostics.length - 1];
+            if (diag && selectedAfter) {
+              diag.selectedValueAfterSelect = selectedAfter.selectedValue;
+              diag.selectedTextAfterSelect = selectedAfter.selectedText;
+              diag.selectedRequestedValue = selectedAfter.selectedValue === String(playerName);
+            }
             console.log(
               `    ✅ Player ${playerNum}: ${playerName} (select by id)`,
             );
@@ -3109,30 +3194,19 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
   console.log(`  🎯 Clicking Confirm button...`);
 
   try {
-    // Strategy 1: getByRole button with confirm text
-    let confirmBtn = page
-      .locator('#member_booking_form_confirm_booking')
+    const confirmState = await inspectConfirmControl(page);
+    const confirmBtn = page
+      .locator('form[name="member_booking_form"]')
+      .first()
+      .locator(
+        'button#member_booking_form_confirm_booking, input#member_booking_form_confirm_booking, button[type="submit"], input[type="submit"]',
+      )
       .first();
-
-    let btnVisible = await confirmBtn
-      .isVisible({ timeout: 3000 })
-      .catch(() => false);
-
-    // Strategy 2: Fallback locators
-    if (!btnVisible) {
-      confirmBtn = page
-        .locator(
-          'button#member_booking_form_confirm_booking, form[name="member_booking_form"] button[type="submit"], button:has-text("Create Booking"), button:has-text("Confirm"), button:has-text("Book"), button:has-text("Complete")',
-        )
-        .first();
-      btnVisible = await confirmBtn
-        .isVisible({ timeout: 2000 })
-        .catch(() => false);
-    }
+    const btnVisible = confirmState.visible && confirmState.enabled;
 
     if (btnVisible) {
       await confirmBtn.scrollIntoViewIfNeeded().catch(() => {});
-      await confirmBtn.click({ timeout: 5000, force: true });
+      await confirmBtn.click({ timeout: 5000 });
       console.log(`    ✅ Confirm button clicked`);
 
       // Wait for navigation/response
@@ -3193,7 +3267,9 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
       return result;
     } else {
       console.log(`    ❌ Confirm button not found (timeout)`);
-      result.confirmationText = 'confirm-button-not-found';
+      result.confirmationText = confirmState.visible
+        ? 'confirm-control-disabled'
+        : 'confirm-button-not-found';
       return result;
     }
   } catch (error) {
@@ -3699,7 +3775,7 @@ async function tryDirectBookingHref(
   const navigationMs = Date.now() - navigationStarted;
   await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
 
-  const formSelector = '#member_booking_form_confirm_booking, form[name="member_booking_form"]';
+  const formSelector = 'form[name="member_booking_form"]';
   const formVisible = await page
     .locator(formSelector)
     .first()
@@ -3726,6 +3802,7 @@ async function tryDirectBookingHref(
     };
   }
 
+  const bookingFormReachedMs = Date.now();
   const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
   const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
   if (dryRun) {
@@ -3746,6 +3823,7 @@ async function tryDirectBookingHref(
       fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs,
       navigationMs,
+      bookingFormReachedMs,
       verificationSignal: formValidated ? 'dry-run-prebook-boundary' : boundary.error,
       verificationUrl: boundary.verificationUrl || page.url(),
       ...evidence,
@@ -3777,6 +3855,7 @@ async function tryDirectBookingHref(
     bookingLinksCountAfterClick: verification.bookingLinksCountAfterClick,
     clickDeltaMs,
     navigationMs,
+    bookingFormReachedMs,
     error:
       !verification.confirmed
         ? 'direct-clicked-but-no-confirmation'
@@ -4249,6 +4328,9 @@ async function runBooking(config) {
     fallbackTee = false,
     includeUnavailable = false,
     sourcePath = 'endpoint/dev',
+    preparedRunId = null,
+    fireCallbackAtMs = null,
+    bookingHotPathStartMs = null,
   } = config;
   const normalizedTeeMode = teeMode === 'both' ? 'both' : 'single';
   const teeWasMissing = teeTarget === undefined && tee === undefined;
@@ -4271,11 +4353,20 @@ async function runBooking(config) {
   const notes = [];
   const requestedPreferredTimes = normalizeStringList(preferredTimes);
   const normalizedPreferredTimes = normalizePreferredTimeLabels(requestedPreferredTimes);
+  const effectivePartySize =
+    partySize === undefined || partySize === null ? players.length + 1 : partySize;
+  const partyValidation = validatePartyPlayers({
+    partySize: effectivePartySize,
+    players,
+  });
+  if (!partyValidation.ok) {
+    throw new Error(partyValidation.error);
+  }
   const slotPolicy = buildSlotPolicy({
     targetDate: targetDateStr,
     tee: normalizedTeeTarget,
     preferredTimes: normalizedPreferredTimes,
-    partySize,
+    partySize: partyValidation.partySize,
   });
   let bookedTime = null;
   let fallbackLevel = 0;
@@ -4303,7 +4394,7 @@ async function runBooking(config) {
       console.log(`[BOOKING] Fire time UTC: ${new Date(targetFireTime).toISOString()}`);
     }
     console.log(`[BOOKING] Current UK time: ${DateTime.now().setZone(CONFIG.TZ_LONDON).toISO()}`);
-    runId = await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
+    runId = preparedRunId || await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
     notes.push(
       `source=${sourcePath}; target=${targetDateStr}; tee=${normalizedTeeTarget}; preferred=${normalizedPreferredTimes.join(',')}; party=${slotPolicy.partySize}`,
     );
@@ -4386,7 +4477,7 @@ async function runBooking(config) {
         `[TEE] Available booking times detected: ${bookingSlots.map((slot) => slot.time).filter(Boolean).join(', ') || '(none)'}`,
       );
     }
-    const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
+    const desiredAdditionalCount = partyValidation.expectedAdditionalPlayers;
     const desiredPartySize = desiredAdditionalCount + 1;
     additionalPlayers = players.slice(0, desiredAdditionalCount);
     const selectPreferredTimesFromSlots = (slots, { bookableOnly = false } = {}) => {
@@ -4521,6 +4612,7 @@ async function runBooking(config) {
             notes.push(msg);
             continue;
           }
+          markFirstBrsAction();
           const bookingResult = await tryBookTime(
             page,
             time,
@@ -4600,6 +4692,10 @@ async function runBooking(config) {
     let finalAvailableTimes = null;
     let finalCandidateDiagnostics = null;
     let finalPrebookBoundary = null;
+    let firstBrsActionMs = null;
+    const markFirstBrsAction = () => {
+      if (!firstBrsActionMs) firstBrsActionMs = Date.now();
+    };
     let directCapacityRequired = false;
     let directCapacityFailed = false;
     let directCandidatesExhausted = false;
@@ -4612,6 +4708,7 @@ async function runBooking(config) {
         CONFIG.SNIPER_DIRECT_POLL_ENABLED &&
         (teeCtx?.teeTarget ?? normalizedTeeTarget) === 1
       ) {
+        markFirstBrsAction();
         const directPollResult = await pollPreferredBookingLinks(
           page,
           targetDateStr,
@@ -4694,6 +4791,16 @@ async function runBooking(config) {
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
                 prebook_boundary: directResult.prebookBoundary ?? null,
+                fire_timer_drift_ms:
+                  Number.isFinite(fireCallbackAtMs) ? fireCallbackAtMs - targetFireTime : null,
+                booking_hot_path_delta_ms:
+                  Number.isFinite(bookingHotPathStartMs) && Number.isFinite(fireCallbackAtMs)
+                    ? bookingHotPathStartMs - fireCallbackAtMs
+                    : null,
+                first_brs_action_delta_ms:
+                  Number.isFinite(firstBrsActionMs) && Number.isFinite(fireCallbackAtMs)
+                    ? firstBrsActionMs - fireCallbackAtMs
+                    : null,
                 release_detect_delta_ms: directPollResult.detectDeltaMs ?? null,
                 snapshot_path: directResult.snapshotPath ?? null,
                 screenshot_path: directResult.screenshotPath ?? null,
@@ -4709,6 +4816,16 @@ async function runBooking(config) {
                 playersRequested: additionalPlayers,
                 fieldDiagnostics: directResult.fieldDiagnostics ?? null,
                 prebookBoundary: directResult.prebookBoundary ?? null,
+                fire_timer_drift_ms:
+                  Number.isFinite(fireCallbackAtMs) ? fireCallbackAtMs - targetFireTime : null,
+                booking_hot_path_delta_ms:
+                  Number.isFinite(bookingHotPathStartMs) && Number.isFinite(fireCallbackAtMs)
+                    ? bookingHotPathStartMs - fireCallbackAtMs
+                    : null,
+                first_brs_action_delta_ms:
+                  Number.isFinite(firstBrsActionMs) && Number.isFinite(fireCallbackAtMs)
+                    ? firstBrsActionMs - fireCallbackAtMs
+                    : null,
                 click_delta_ms: directResult.clickDeltaMs ?? null,
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
@@ -4810,6 +4927,7 @@ async function runBooking(config) {
         );
         try {
           await page.waitForLoadState('domcontentloaded');
+          markFirstBrsAction();
           releaseResult = await waitForBookingRelease(
             page,
             searchTimes,
@@ -5143,6 +5261,21 @@ async function runBooking(config) {
         bookingSuccess = await runPreferredTimesLoop(searchTimes);
       }
     }
+    const timingDiagnostics = {
+      fire_timer_drift_ms:
+        Number.isFinite(fireCallbackAtMs) && Number.isFinite(targetFireTime)
+          ? fireCallbackAtMs - targetFireTime
+          : null,
+      booking_hot_path_delta_ms:
+        Number.isFinite(bookingHotPathStartMs) && Number.isFinite(fireCallbackAtMs)
+          ? bookingHotPathStartMs - fireCallbackAtMs
+          : null,
+      first_brs_action_delta_ms:
+        Number.isFinite(firstBrsActionMs) && Number.isFinite(fireCallbackAtMs)
+          ? firstBrsActionMs - fireCallbackAtMs
+          : null,
+    };
+
     if (dryRun && bookedTime && finalPrebookBoundary?.prebookBoundaryReached === true) {
       const finalNotes = notes.join(' | ') || 'dry-run-prebook-boundary-reached';
       await fsFinishRun(runId, {
@@ -5155,6 +5288,7 @@ async function runBooking(config) {
         verification_url: finalVerificationUrl,
         verification_signal: finalVerificationSignal || 'dry-run-prebook-boundary',
         prebook_boundary: finalPrebookBoundary,
+        ...timingDiagnostics,
         available_times: finalAvailableTimes,
         candidate_diagnostics: finalCandidateDiagnostics,
         source_path: sourcePath,
@@ -5171,6 +5305,7 @@ async function runBooking(config) {
         notes: finalNotes,
         playersRequested: additionalPlayers,
         prebookBoundary: finalPrebookBoundary,
+        ...timingDiagnostics,
         availableTimes: finalAvailableTimes,
         candidateDiagnostics: finalCandidateDiagnostics,
         sourcePath,
@@ -5203,6 +5338,7 @@ async function runBooking(config) {
       chosen_time: bookedTime,
       fallback_level: fallbackLevel,
       click_delta_ms: finalClickDeltaMs,
+      ...timingDiagnostics,
       verification_url: finalVerificationUrl,
       verification_signal: finalVerificationSignal,
       booking_links_count_after_click: finalBookingLinksCountAfterClick,
@@ -5249,6 +5385,7 @@ async function runBooking(config) {
       requestedTee: normalizedTeeTarget,
       teeSelected: getTeeLabel(),
       click_delta_ms: finalClickDeltaMs,
+      ...timingDiagnostics,
       verification_url: finalVerificationUrl,
       verification_signal: finalVerificationSignal,
       booking_links_count_after_click: finalBookingLinksCountAfterClick,
