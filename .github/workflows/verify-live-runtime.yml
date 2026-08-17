@@ -22,10 +22,11 @@ jobs:
             echo "Attempt $attempt/30"
             if json=$(curl --fail --silent --show-error --max-time 20 "$RUNTIME_URL"); then
               echo "$json" | python -m json.tool || true
-              LIVE_JSON="$json" EXPECTED_SHA="$EXPECTED_SHA" EXPECTED_FIREBASE="$EXPECTED_FIREBASE" python - <<'PY'
+              if LIVE_JSON="$json" EXPECTED_SHA="$EXPECTED_SHA" EXPECTED_FIREBASE="$EXPECTED_FIREBASE" python - <<'PY'
           import json, os, sys
           data = json.loads(os.environ['LIVE_JSON'])
-          sha = str(data.get('gitHash') or data.get('git_hash') or data.get('deploymentSha') or '')
+          deployment = data.get('deployment') if isinstance(data.get('deployment'), dict) else {}
+          sha = str(data.get('gitHash') or deployment.get('gitHash') or data.get('git_hash') or data.get('deploymentSha') or '')
           expected_sha = os.environ['EXPECTED_SHA']
           firebase = str(data.get('firebaseProjectId') or '')
           runner = data.get('sniperRunnerStarted') is True
@@ -36,12 +37,9 @@ jobs:
           print(f"CHECK sha={sha} expected={expected_sha} sha_ok={sha_ok}")
           print(f"CHECK firebase={firebase} firebase_ok={firebase_ok}")
           print(f"CHECK agentRunMain={main} sniperRunnerStarted={runner} firestoreConnected={firestore}")
-          if sha_ok and firebase_ok and runner and main and firestore:
-              sys.exit(0)
-          sys.exit(2)
+          sys.exit(0 if sha_ok and firebase_ok and runner and main and firestore else 2)
           PY
-              rc=$?
-              if [ "$rc" -eq 0 ]; then
+              then
                 echo "LIVE_RUNTIME_OK"
                 curl --fail --silent --show-error --max-time 20 "https://fairwaysniper-production.up.railway.app/api/warm-status" | python -m json.tool || true
                 exit 0
