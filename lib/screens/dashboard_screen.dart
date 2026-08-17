@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart' show Firebase;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/booking_prefetch_service.dart';
+import 'package:fairway_sniper/services/agent_base_url.dart';
 import 'package:fairway_sniper/services/weather_service.dart';
 import 'package:fairway_sniper/services/golf_news_service.dart';
 import 'package:fairway_sniper/models/booking_job.dart';
@@ -13,7 +15,9 @@ import 'package:fairway_sniper/widgets/brs_credentials_modal.dart';
 import 'package:fairway_sniper/widgets/dashboard_widgets.dart';
 import 'package:fairway_sniper/theme/app_spacing.dart';
 import 'package:intl/intl.dart';
+import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
+import 'dart:convert';
 import 'dart:async';
 import 'package:fairway_sniper/theme.dart';
 
@@ -109,6 +113,67 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  Future<String> _verifyProductionAgentCanSeeJob(String jobId) async {
+    final baseUrl = await getAgentBaseUrl();
+    final appProjectId = Firebase.app().options.projectId;
+    final uri = Uri.parse('$baseUrl/api/firestore/jobs/$jobId/status');
+
+    Map<String, dynamic> data = <String, dynamic>{};
+    int statusCode = 0;
+    for (var attempt = 0; attempt < 10; attempt += 1) {
+      final response = await http.get(uri).timeout(const Duration(seconds: 12));
+      statusCode = response.statusCode;
+      data = response.body.isNotEmpty
+          ? jsonDecode(response.body) as Map<String, dynamic>
+          : <String, dynamic>{};
+      if (statusCode == 200 &&
+          data['success'] == true &&
+          data['visibleToAgent'] == true &&
+          data['hasTimer'] == true) {
+        break;
+      }
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+
+    final agentProjectId = data['firebaseProjectId']?.toString();
+    if (statusCode == 404 || data['visibleToAgent'] != true) {
+      throw Exception(
+        'Production agent cannot see this job. App Firebase=$appProjectId, agent Firebase=${agentProjectId ?? 'unknown'}.',
+      );
+    }
+    if (statusCode != 200 || data['success'] != true) {
+      throw Exception(data['error'] ?? 'Production agent job check failed');
+    }
+    if (agentProjectId != null &&
+        agentProjectId.isNotEmpty &&
+        agentProjectId != appProjectId) {
+      throw Exception(
+        'Firebase project mismatch. App=$appProjectId, agent=$agentProjectId.',
+      );
+    }
+    if (data['agentRunMain'] != true || data['sniperRunnerStarted'] != true) {
+      throw Exception('Production sniper runner is not active.');
+    }
+    if (data['agentWillAccept'] != true) {
+      throw Exception(
+        'Production agent can see the job but will not accept it: ${data['status']}/${data['state']}.',
+      );
+    }
+    if (data['hasTimer'] != true) {
+      throw Exception(
+        'Production agent has not registered a release timer yet.',
+      );
+    }
+
+    final fireTime = data['computedFireTimeUtc'] ?? data['scheduledFor'];
+    final warmState = data['warmState'] ?? 'not warmed yet';
+    final timerId = data['timerDetails'] is Map
+        ? (data['timerDetails'] as Map)['timerId']
+        : null;
+    final shortId = jobId.length <= 6 ? jobId : jobId.substring(0, 6);
+    return 'Production confirmed job $shortId: fire=$fireTime, timer=$timerId, warm=$warmState.';
+  }
+
   String _partySizeLabel(BookingJob job) {
     final size = job.partySize ?? (job.players.length + 1);
     final unit = size == 1 ? 'player' : 'players';
@@ -119,6 +184,35 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return job.preferredTimes.isNotEmpty
         ? job.preferredTimes.first
         : 'No target time';
+  }
+
+  String _sniperStateLabel(BookingJob job) {
+    final state = (job.state ?? '').toLowerCase();
+    final status = job.status.toLowerCase();
+    switch (state) {
+      case 'paused':
+        return 'Draft / Paused';
+      case 'queued':
+        return 'Waiting for Production';
+      case 'timer_registered':
+        return 'Waiting for Release';
+      case 'warming':
+        return 'Warming BRS';
+      case 'ready':
+        return 'Ready';
+      case 'running':
+        return 'Firing';
+      case 'booking':
+        return 'Booking';
+      case 'finished':
+        return 'Booked';
+      case 'error':
+        return 'Failed';
+    }
+    if (status == 'active') return 'Waiting for Production';
+    if (status == 'error') return 'Failed';
+    if (status == 'finished') return 'Booked';
+    return status.toUpperCase();
   }
 
   DateTime _getNextSaturday() {
@@ -1173,9 +1267,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
     final now = DateTime.now().toUtc();
+    final bookingFireTime = job.nextFireTimeUtc ?? job.releaseWindowStart;
     final timeUntilBooking =
-        job.nextFireTimeUtc != null && job.nextFireTimeUtc!.isAfter(now)
-            ? job.nextFireTimeUtc!.difference(now)
+        bookingFireTime != null && bookingFireTime.isAfter(now)
+            ? bookingFireTime.difference(now)
             : null;
 
     // Calculate time until the actual tee time (target day + time)
@@ -1249,7 +1344,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       borderRadius: BorderRadius.circular(4),
                     ),
                     child: Text(
-                      'Waiting for Release',
+                      _sniperStateLabel(job),
                       style: TextStyle(
                         color: headerTextColor,
                         fontSize: 11,
@@ -1390,6 +1485,33 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               job.id!,
                               patch,
                             );
+                            if (!isActive && isSniper) {
+                              try {
+                                final message =
+                                    await _verifyProductionAgentCanSeeJob(
+                                        job.id!);
+                                if (!context.mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(message),
+                                    duration: const Duration(seconds: 6),
+                                  ),
+                                );
+                                return;
+                              } catch (e) {
+                                if (!context.mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      'Sniper armed locally, but production did not confirm it: $e',
+                                    ),
+                                    backgroundColor: Colors.red.shade700,
+                                    duration: const Duration(seconds: 12),
+                                  ),
+                                );
+                                return;
+                              }
+                            }
                             if (context.mounted) {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
@@ -1512,7 +1634,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             stream: Stream.periodic(
                                 const Duration(seconds: 1), (i) => i),
                             builder: (context, snapshot) {
-                              final updatedTime = job.nextFireTimeUtc!
+                              final updatedTime = bookingFireTime!
                                   .difference(DateTime.now().toUtc());
                               return Container(
                                 padding: const EdgeInsets.symmetric(
@@ -2435,6 +2557,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              if (job.id != null) ...[
+                _buildDetailRow('Job ID', job.id!, Icons.tag),
+                const Divider(),
+              ],
               _buildDetailRow('Club', job.club, Icons.location_on),
               const Divider(),
               _buildDetailRow(
@@ -2457,7 +2583,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const Divider(),
               _buildDetailRow(
                 'Status',
-                job.status.toUpperCase(),
+                job.state == null
+                    ? job.status.toUpperCase()
+                    : '${job.status.toUpperCase()} / ${job.state!.toUpperCase()}',
                 job.status == 'active' ? Icons.play_circle : Icons.pause_circle,
               ),
               if (job.bookingMode == BookingMode.sniper) ...[
