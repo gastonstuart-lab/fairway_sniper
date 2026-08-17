@@ -23,7 +23,7 @@ jobs:
           cache: npm
           cache-dependency-path: agent/package-lock.json
       - name: Install agent dependencies without browser postinstall
-        run: npm ci --ignore-scripts
+        run: npm install --ignore-scripts --no-audit --no-fund
       - name: Syntax check production agent
         run: node --check index.js
       - name: Syntax check warm-session module
