@@ -37,6 +37,12 @@ void main() {
     expect(isLiveSniperJob(job), isTrue);
   });
 
+  test('production confirmed without both timestamps still says arming', () {
+    final job = sniperJob(status: 'running', state: 'production_confirmed');
+    expect(sniperLifecycleLabel(job), 'Arming Sniper…');
+    expect(isProductionScheduledSniper(job), isFalse);
+  });
+
   test('production confirmed with both timestamps is scheduled', () {
     final job = sniperJob(
       status: 'running',
@@ -46,6 +52,21 @@ void main() {
     expect(sniperLifecycleLabel(job), 'Sniper Scheduled');
     expect(isProductionScheduledSniper(job), isTrue);
     expect(isLiveSniperJob(job), isTrue);
+  });
+
+  test('running claim remains arming until production timestamps exist', () {
+    expect(
+      sniperLifecycleLabel(sniperJob(status: 'running', state: 'running')),
+      'Arming Sniper…',
+    );
+    expect(
+      sniperLifecycleLabel(sniperJob(
+        status: 'running',
+        state: 'running',
+        productionTimes: true,
+      )),
+      'Sniper Scheduled',
+    );
   });
 
   test('warming and ready expose truthful lifecycle labels', () {
