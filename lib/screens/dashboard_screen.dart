@@ -1525,7 +1525,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     // Determine mode colors
     final isSniper = job.bookingMode == BookingMode.sniper;
     final isLiveJob =
-        isSniper ? isLiveSniperJob(job) : isLiveJob;
+        isSniper ? isLiveSniperJob(job) : job.status == 'active';
     final isScheduledSniper = isSniper && isProductionScheduledSniper(job);
     final headerColor = isSniper
         ? const Color(0xFFFF6B35) // Bright orange for sniper
@@ -1789,8 +1789,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             color: Colors.red,
                             size: 28,
                           ),
-                          tooltip: 'Delete Job',
-                          onPressed: () async {
+                          tooltip: isSniper && isLiveJob
+                              ? 'Scheduled sniper cannot be deleted while active'
+                              : 'Delete Job',
+                          onPressed: isSniper && isLiveJob ? null : () async {
                             // Show confirmation dialog
                             final confirm = await showDialog<bool>(
                               context: context,
@@ -2139,7 +2141,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               size: 16, color: subtextColor),
                           const SizedBox(width: 8),
                           Text(
-                            'Sniper paused — arm it to schedule',
+                            isSniper
+                                ? 'Sniper paused — arm it to schedule'
+                                : 'Job Paused',
                             style: TextStyle(
                               fontSize: 13,
                               color: subtextColor,
