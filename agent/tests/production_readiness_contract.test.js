@@ -188,11 +188,16 @@ test('firestore job diagnostic exposes project, timer and fire-time evidence', (
   }
 });
 
-test('dashboard does not confirm armed sniper without both production timers', () => {
+test('dashboard does not confirm scheduled sniper without both production timers', () => {
   assert(dashboardSource.includes("data['hasPrepTimer'] != true || data['hasFireTimer'] != true"));
   assert(dashboardSource.includes('Production agent has not registered both PREP and FIRE timers yet.'));
-  assert(dashboardSource.includes('Waiting for Production'));
-  assert(dashboardSource.includes('timer_registered'));
+  const statusHelperSource = fs.readFileSync(
+    path.join(repoRoot, 'lib/services/sniper_job_status.dart'),
+    'utf8',
+  );
+  assert(statusHelperSource.includes('Arming Sniper…'));
+  assert(statusHelperSource.includes('Sniper Scheduled'));
+  assert(statusHelperSource.includes('timer_registered'));
 });
 
 test('proof fire-time override is restricted to explicit proof dry-run jobs', () => {
