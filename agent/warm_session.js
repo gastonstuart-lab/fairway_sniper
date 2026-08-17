@@ -1,18 +1,12 @@
 import { chromium } from '@playwright/test';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 
-const __filename = fileURLToPath(import.meta.url);
-const agentDir = path.dirname(__filename);
-const profileDir = path.join(agentDir, '.session', 'profile');
-
+let warmBrowser = null;
 let warmContext = null;
 let warmPage = null;
 let inflightInit = null;
-let lastTargetDate = null;
 let keepAliveTimer = null;
 let lastKeepAliveAt = null;
+
 let status = {
   warm: false,
   authenticated: false,
@@ -26,231 +20,253 @@ let status = {
 
 const DEFAULT_LOGIN_URL =
   process.env.CLUB_LOGIN_URL || 'https://members.brsgolf.com/galgorm/login';
-const TEE_SHEET_URL = (date) => {
-  const d = date instanceof Date ? date : new Date(date);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `https://members.brsgolf.com/galgorm/tee-sheet/1/${y}/${m}/${dd}`;
-};
 
-function log(msg) {
-  // keep logs lightweight; upstream logger timestamps
-  console.log(`[WARM] ${msg}`);
+function log(message) {
+  console.log(`[WARM] ${message}`);
 }
 
-async function ensureProfileDir() {
-  await fs.promises.mkdir(profileDir, { recursive: true }).catch(() => {});
+function targetDateKey(targetDate) {
+  if (typeof targetDate === 'string') {
+    const match = targetDate.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (match) return match[1];
+  }
+  const date = targetDate instanceof Date ? targetDate : new Date(targetDate);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error('Invalid targetDate for warm session');
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+function teeSheetUrl(targetDate) {
+  const [year, month, day] = targetDateKey(targetDate).split('-');
+  return `https://members.brsgolf.com/galgorm/tee-sheet/1/${year}/${month}/${day}`;
+}
+
+function pageIsUsable(page) {
+  return Boolean(page && !page.isClosed?.());
+}
+
+function browserIsUsable(browser) {
+  return Boolean(browser && browser.isConnected?.());
+}
+
+function resetStatus(error = null) {
+  status = {
+    warm: false,
+    authenticated: false,
+    teeSheetLoaded: false,
+    targetDate: null,
+    lastError: error,
+    lastKeepAliveAt,
+    contextAlive: false,
+    pageUrl: null,
+  };
+}
+
+async function disposeBrokenSession() {
+  if (warmPage && !warmPage.isClosed?.()) {
+    await warmPage.close().catch(() => {});
+  }
+  if (warmContext) {
+    await warmContext.close().catch(() => {});
+  }
+  if (warmBrowser && warmBrowser.isConnected?.()) {
+    await warmBrowser.close().catch(() => {});
+  }
+  warmPage = null;
+  warmContext = null;
+  warmBrowser = null;
 }
 
 async function ensureContext() {
-  // DISABLED: Persistent contexts require Playwright browsers to be pre-installed.
-  // Returning null to signal fallback to regular session creation.
-  log('persistent context disabled (using regular sessions instead)');
-  return null;
-  warmContext = await chromium.launchPersistentContext(profileDir, {
+  if (browserIsUsable(warmBrowser) && warmContext && pageIsUsable(warmPage)) {
+    status.contextAlive = true;
+    return warmContext;
+  }
+
+  await disposeBrokenSession();
+  log('launching reusable Chromium session');
+  warmBrowser = await chromium.launch({
     headless: true,
     args: ['--disable-blink-features=AutomationControlled'],
   });
-  // Use first page; persistent context opens a blank page
-  [warmPage] = warmContext.pages();
-  if (!warmPage) {
-    warmPage = await warmContext.newPage();
-  }
+  warmContext = await warmBrowser.newContext();
+  warmPage = await warmContext.newPage();
+
   status.warm = true;
   status.authenticated = false;
   status.teeSheetLoaded = false;
+  status.targetDate = null;
   status.lastError = null;
+  status.contextAlive = true;
+  status.pageUrl = warmPage.url();
   return warmContext;
 }
 
 async function isAuthenticated(page) {
-  // Heuristic: presence of tee sheet nav or logout link
-  const logout = await page
-    .locator('a[href*="logout"], button:has-text("Logout")')
+  if (!pageIsUsable(page)) return false;
+
+  const logoutVisible = await page
+    .locator('a[href*="logout"], button:has-text("Logout"), a:has-text("Logout")')
     .first()
     .isVisible()
     .catch(() => false);
-  if (logout) return true;
-  const tee = await page
+  if (logoutVisible) return true;
+
+  const teeSheetSignal = await page
     .locator(
-      'a[href*="tee-sheet"], a:has-text("Tee Sheet"), button:has-text("Book")',
+      'a[href*="tee-sheet"], a:has-text("Tee Sheet"), button:has-text("Book"), a[href*="/bookings/"]',
     )
     .first()
     .isVisible()
     .catch(() => false);
-  return tee;
+  return teeSheetSignal;
 }
 
-async function robustFill(page, locator, value, label) {
-  const el = page.locator(locator).first();
-  await el.waitFor({ state: 'visible', timeout: 15000 });
-  await el.click({ timeout: 5000 }).catch(() => {});
-  await el.fill(value, { timeout: 8000 });
+async function robustFill(page, selector, value, label) {
+  const element = page.locator(selector).first();
+  await element.waitFor({ state: 'visible', timeout: 15000 });
+  await element.click({ timeout: 5000 }).catch(() => {});
+  await element.fill(value, { timeout: 8000 });
   log(`filled ${label}`);
 }
 
 async function performLogin(page, loginUrl, username, password) {
-  log('navigating to login page');
+  if (!username || !password) {
+    throw new Error('BRS credentials are required for warm session');
+  }
+
+  log('navigating to BRS login page');
   await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-  // Retry strategy over multiple selector variants
   const userSelectors = [
     'input[name="username"]',
     'input[type="text"][name*="username"]',
-    'input[placeholder*="GUI"]',
-    'input[placeholder*="username"]',
-    'input[placeholder*="Email"]',
+    'input[placeholder*="GUI" i]',
+    'input[placeholder*="username" i]',
+    'input[placeholder*="email" i]',
   ];
-  const passSelectors = [
+  const passwordSelectors = [
     'input[type="password"]',
-    'input[placeholder*="password"]',
+    'input[placeholder*="password" i]',
   ];
 
-  let userSel = userSelectors[0];
-  for (const sel of userSelectors) {
-    if ((await page.locator(sel).first().count()) > 0) {
-      userSel = sel;
-      break;
-    }
+  const userSelector = await firstExistingSelector(page, userSelectors);
+  const passwordSelector = await firstExistingSelector(page, passwordSelectors);
+  if (!userSelector || !passwordSelector) {
+    throw new Error('BRS login fields were not found');
   }
 
-  let passSel = passSelectors[0];
-  for (const sel of passSelectors) {
-    if ((await page.locator(sel).first().count()) > 0) {
-      passSel = sel;
-      break;
-    }
-  }
-
-  await robustFill(page, userSel, username, 'username');
-  await robustFill(page, passSel, password, 'password');
+  await robustFill(page, userSelector, username, 'username');
+  await robustFill(page, passwordSelector, password, 'password');
 
   const loginButton = page
-    .getByRole('button', { name: /login|log in|sign in/i })
+    .locator(
+      'button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Log in"), button:has-text("Sign in")',
+    )
     .first();
-  await loginButton.click({ timeout: 10000 }).catch(() => {});
+  await loginButton.waitFor({ state: 'visible', timeout: 10000 });
 
-  await page.waitForURL(/(?!.*\/login)/, { timeout: 20000 }).catch(() => {});
+  await Promise.all([
+    page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {}),
+    loginButton.click({ timeout: 10000 }),
+  ]);
 
-  // Final auth check
-  const authed = await isAuthenticated(page);
-  if (!authed) {
-    throw new Error('Login did not complete; auth signal not detected');
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    if (await isAuthenticated(page)) {
+      status.authenticated = true;
+      log('authenticated');
+      return;
+    }
+    await page.waitForTimeout(250);
   }
-  log('authenticated');
-  status.authenticated = true;
+
+  throw new Error('Login did not complete; auth signal not detected');
 }
 
-async function ensureLoggedIn(
-  username,
-  password,
-  loginUrl = DEFAULT_LOGIN_URL,
-) {
-  await ensureContext();
-  const page = warmPage;
+async function firstExistingSelector(page, selectors) {
+  for (const selector of selectors) {
+    if ((await page.locator(selector).first().count().catch(() => 0)) > 0) {
+      return selector;
+    }
+  }
+  return null;
+}
 
-  const authed = await isAuthenticated(page).catch(() => false);
-  if (authed) {
-    log('already authenticated');
-    status.authenticated = true;
-    return page;
+async function ensureLoggedIn(username, password, loginUrl = DEFAULT_LOGIN_URL) {
+  await ensureContext();
+  if (!pageIsUsable(warmPage)) {
+    throw new Error('Warm browser page is unavailable');
   }
 
-  await performLogin(page, loginUrl, username, password);
-  return page;
+  if (await isAuthenticated(warmPage).catch(() => false)) {
+    status.authenticated = true;
+    status.contextAlive = true;
+    status.pageUrl = warmPage.url();
+    log('reusing authenticated BRS session');
+    return warmPage;
+  }
+
+  status.authenticated = false;
+  await performLogin(warmPage, loginUrl, username, password);
+  return warmPage;
 }
 
 async function waitForTeeSheet(page, timeout = 25000) {
-  const timePattern = /\b(?:0?\d|1\d|2[0-3]):[0-5]\d\b/;
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    // Any tee sheet row
-    if (
-      (await page
-        .locator('tr')
-        .count()
-        .catch(() => 0)) > 0
-    )
-      return true;
-    // Any visible time
-    if (
-      (await page
-        .locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/')
-        .count()
-        .catch(() => 0)) > 0
-    )
-      return true;
-    // Any tee-sheet container
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const bookingLinks = await page
+      .locator('a[href*="/bookings/book"]')
+      .count()
+      .catch(() => 0);
+    if (bookingLinks > 0) return true;
+
+    const rows = await page.locator('tr').count().catch(() => 0);
+    if (rows > 0) return true;
+
+    const timeLabels = await page
+      .locator('text=/\\b(?:0?\\d|1\\d|2[0-3]):[0-5]\\d\\b/')
+      .count()
+      .catch(() => 0);
+    if (timeLabels > 0) return true;
+
     const teeSheetShell = page.locator(
       '[data-tee-sheet], .tee-sheet, #tee-sheet, [aria-label*="tee sheet" i], section:has-text("tee sheet"), div:has-text("Booking")',
     );
-    if (await teeSheetShell.isVisible().catch(() => false)) return true;
+    if (await teeSheetShell.first().isVisible().catch(() => false)) return true;
+
     await page.waitForTimeout(100);
   }
   throw new Error('Tee sheet not detected after preload wait');
 }
 
-// --- Release watcher using MutationObserver ---
-export async function waitForBookingReleaseObserver(page, timeoutMs = 2000) {
-  return await page.evaluate((timeout) => {
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (el) => {
-        if (!done) {
-          done = true;
-          observer && observer.disconnect();
-          resolve({ found: true, time: Date.now() });
-        }
-      };
-      // Check if already present
-      const existing = document.querySelector('a[href*="/bookings/book"]');
-      if (existing) return finish(existing);
-      const observer = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-          for (const node of m.addedNodes) {
-            if (
-              node.nodeType === 1 &&
-              node.matches &&
-              node.matches('a[href*="/bookings/book"]')
-            ) {
-              finish(node);
-              return;
-            }
-            if (node.nodeType === 1 && node.querySelector) {
-              const found = node.querySelector('a[href*="/bookings/book"]');
-              if (found) {
-                finish(found);
-                return;
-              }
-            }
-          }
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-      setTimeout(() => {
-        if (!done) {
-          done = true;
-          observer.disconnect();
-          resolve({ found: false });
-        }
-      }, timeout);
-    });
-  }, timeoutMs);
-}
-
 async function preloadTeeSheet(targetDate) {
   await ensureContext();
-  const page = warmPage;
-  const url = TEE_SHEET_URL(targetDate);
-  log(`loading tee sheet ${url}`);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await waitForTeeSheet(page);
+  if (!pageIsUsable(warmPage)) {
+    throw new Error('Warm browser page is unavailable');
+  }
+
+  const dateKey = targetDateKey(targetDate);
+  const url = teeSheetUrl(dateKey);
+  log(`loading tee sheet for ${dateKey}`);
+  await warmPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+  if (!(await isAuthenticated(warmPage).catch(() => false))) {
+    status.authenticated = false;
+    throw new Error('BRS session lost authentication while loading tee sheet');
+  }
+
+  await waitForTeeSheet(warmPage);
+  status.warm = true;
+  status.authenticated = true;
   status.teeSheetLoaded = true;
-  status.targetDate = new Date(targetDate).toISOString().slice(0, 10);
-  lastTargetDate = status.targetDate;
-  log('tee sheet loaded and ready');
-  return page;
+  status.targetDate = dateKey;
+  status.lastError = null;
+  status.contextAlive = true;
+  status.pageUrl = warmPage.url();
+  log(`tee sheet loaded and ready for ${dateKey}`);
+  return warmPage;
 }
 
 async function initWarmFlow(targetDate, username, password) {
@@ -258,49 +274,73 @@ async function initWarmFlow(targetDate, username, password) {
     await ensureLoggedIn(username, password);
     await preloadTeeSheet(targetDate);
     status.lastError = null;
-  } catch (err) {
-    status.lastError = err?.message || String(err);
-    log(`error: ${status.lastError}`);
-    throw err;
+    return warmPage;
+  } catch (error) {
+    status.lastError = error?.message || String(error);
+    status.authenticated = false;
+    status.teeSheetLoaded = false;
+    log(`warm flow failed: ${status.lastError}`);
+    throw error;
   }
 }
 
 export async function getWarmPage(targetDate, username, password) {
   if (!targetDate) throw new Error('targetDate is required for warm session');
+  if (!username || !password) throw new Error('BRS credentials are required for warm session');
 
-  // DISABLED: Return null to signal that regular session should be used instead
-  log('warm session disabled - caller should create regular session');
-  return null;
+  const dateKey = targetDateKey(targetDate);
+
+  if (
+    pageIsUsable(warmPage) &&
+    status.authenticated &&
+    status.teeSheetLoaded &&
+    status.targetDate === dateKey
+  ) {
+    const stillAuthenticated = await isAuthenticated(warmPage).catch(() => false);
+    if (stillAuthenticated) {
+      status.contextAlive = true;
+      status.pageUrl = warmPage.url();
+      return warmPage;
+    }
+  }
+
+  if (inflightInit) {
+    await inflightInit;
+    if (
+      pageIsUsable(warmPage) &&
+      status.authenticated &&
+      status.teeSheetLoaded &&
+      status.targetDate === dateKey
+    ) {
+      return warmPage;
+    }
+  }
+
+  inflightInit = initWarmFlow(dateKey, username, password);
+  try {
+    return await inflightInit;
+  } finally {
+    inflightInit = null;
+  }
 }
 
 export async function closeWarmSession() {
   stopKeepAlive();
-  if (warmContext && !warmContext.isClosed?.()) {
-    log('closing warm session');
-    await warmContext.close().catch(() => {});
-  }
-  warmContext = null;
-  warmPage = null;
-  status = {
-    warm: false,
-    authenticated: false,
-    teeSheetLoaded: false,
-    targetDate: null,
-    lastError: null,
-    lastKeepAliveAt: null,
-    contextAlive: false,
-    pageUrl: null,
-  };
+  inflightInit = null;
+  await disposeBrokenSession();
   lastKeepAliveAt = null;
+  resetStatus();
 }
 
 export function getWarmStatus() {
-  const contextAlive = !!warmContext && !warmContext.isClosed?.();
-  const pageUrl = warmPage?.url?.();
+  const contextAlive =
+    browserIsUsable(warmBrowser) && Boolean(warmContext) && pageIsUsable(warmPage);
+  const pageUrl = pageIsUsable(warmPage) ? warmPage.url() : null;
+
   return {
-    warm: status.warm,
-    authenticated: status.authenticated,
-    teeSheetLoaded: status.teeSheetLoaded,
+    warm: status.warm && contextAlive,
+    authenticated: status.authenticated && contextAlive,
+    teeSheetLoaded: status.teeSheetLoaded && contextAlive,
     targetDate: status.targetDate,
     lastError: status.lastError,
     lastKeepAliveAt,
@@ -310,45 +350,35 @@ export function getWarmStatus() {
 }
 
 async function keepaliveTick() {
-  const contextAlive = !!warmContext && !warmContext.isClosed?.();
-  if (!contextAlive || !warmPage) {
+  const contextAlive =
+    browserIsUsable(warmBrowser) && Boolean(warmContext) && pageIsUsable(warmPage);
+  if (!contextAlive) {
     status.warm = false;
     status.authenticated = false;
     status.teeSheetLoaded = false;
     status.contextAlive = false;
-    // Do not set lastError if missing, keep it null
+    status.pageUrl = null;
     return;
   }
 
   lastKeepAliveAt = Date.now();
+  status.lastKeepAliveAt = lastKeepAliveAt;
 
   try {
-    // cheap ping to keep session alive
-    await warmPage.evaluate(() => document.title).catch(() => {});
+    await warmPage.evaluate(() => document.title);
     status.contextAlive = true;
-    status.pageUrl = warmPage.url?.();
-
-    // cheap auth heuristic (no navigation)
-    const authed = await isAuthenticated(warmPage).catch(() => false);
-    status.authenticated = authed;
-
-    // tee sheet presence without heavy queries
-    const url = warmPage.url();
-    const onSheet =
-      typeof url === 'string' &&
-      status.targetDate &&
-      url.includes(status.targetDate) &&
-      url.includes('/tee-sheet/');
-    if (onSheet) {
-      const anyRow = await warmPage.locator('tr').first().isVisible().catch(() => false);
-      status.teeSheetLoaded = anyRow || status.teeSheetLoaded;
+    status.pageUrl = warmPage.url();
+    status.authenticated = await isAuthenticated(warmPage).catch(() => false);
+    if (!status.authenticated) {
+      status.teeSheetLoaded = false;
     }
-
     status.lastError = null;
     status.warm = true;
-  } catch (err) {
-    status.lastError = err?.message || String(err);
+  } catch (error) {
+    status.lastError = error?.message || String(error);
     status.contextAlive = false;
+    status.authenticated = false;
+    status.teeSheetLoaded = false;
   }
 }
 
@@ -358,11 +388,50 @@ export function startKeepAlive(options = {}) {
   keepAliveTimer = setInterval(() => {
     keepaliveTick().catch(() => {});
   }, intervalMs);
+  keepAliveTimer.unref?.();
 }
 
 export function stopKeepAlive() {
-  if (keepAliveTimer) {
-    clearInterval(keepAliveTimer);
-    keepAliveTimer = null;
-  }
+  if (!keepAliveTimer) return;
+  clearInterval(keepAliveTimer);
+  keepAliveTimer = null;
+}
+
+export async function waitForBookingReleaseObserver(page, timeoutMs = 2000) {
+  return page.evaluate((timeout) => {
+    return new Promise((resolve) => {
+      let done = false;
+      let observer = null;
+      const finish = (found) => {
+        if (done) return;
+        done = true;
+        observer?.disconnect();
+        resolve({ found, time: Date.now() });
+      };
+
+      if (document.querySelector('a[href*="/bookings/book"]')) {
+        finish(true);
+        return;
+      }
+
+      observer = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            if (node.matches?.('a[href*="/bookings/book"]')) {
+              finish(true);
+              return;
+            }
+            if (node.querySelector?.('a[href*="/bookings/book"]')) {
+              finish(true);
+              return;
+            }
+          }
+        }
+      });
+
+      observer.observe(document.body, { childList: true, subtree: true });
+      setTimeout(() => finish(false), timeout);
+    });
+  }, timeoutMs);
 }
