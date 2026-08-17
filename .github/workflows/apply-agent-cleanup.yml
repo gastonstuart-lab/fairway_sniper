@@ -1,0 +1,59 @@
+name: apply-agent-cleanup
+
+on:
+  push:
+    branches:
+      - copilot/production-proof-fairway-sniper
+
+permissions:
+  contents: write
+
+jobs:
+  patch-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: copilot/production-proof-fairway-sniper
+      - name: Remove duplicate legacy warm-up scheduler
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          agent = Path('agent/index.js')
+          text = agent.read_text(encoding='utf-8')
+          old = "    startSniperRunner();\n    startWarmUpScheduler();\n"
+          new = "    startSniperRunner();\n"
+          if old not in text:
+              raise SystemExit('Expected runner startup block not found')
+          text = text.replace(old, new, 1)
+          agent.write_text(text, encoding='utf-8')
+
+          test = Path('agent/tests/production_readiness_contract.test.js')
+          t = test.read_text(encoding='utf-8')
+          marker = "test('expired pre-fire jobs are explicitly failed instead of waiting forever', () => {\n"
+          guard = """test('production startup uses only the deterministic PREP/FIRE runner', () => {
+            const startup = agentSource.slice(agentSource.indexOf("if (process.env.AGENT_RUN_MAIN === 'true')"));
+            assert(startup.includes('startSniperRunner();'));
+            assert(!startup.includes('startWarmUpScheduler();'));
+          });
+
+          """
+          if "production startup uses only the deterministic PREP/FIRE runner" not in t:
+              if marker not in t:
+                  raise SystemExit('Contract-test insertion marker not found')
+              t = t.replace(marker, guard + marker, 1)
+              test.write_text(t, encoding='utf-8')
+          PY
+      - name: Remove one-off workflow
+        run: rm .github/workflows/apply-agent-cleanup.yml
+      - name: Commit cleanup back to PR branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agent/index.js agent/tests/production_readiness_contract.test.js .github/workflows/apply-agent-cleanup.yml
+          git diff --cached --check
+          git commit -m "fix: use only deterministic production warm-up path"
+          git push origin HEAD:copilot/production-proof-fairway-sniper
