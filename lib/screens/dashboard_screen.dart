@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart' show Firebase;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
@@ -41,6 +42,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String? _displayName;
   Map<String, String>? _savedCreds;
   bool _loadingCreds = false;
+  bool _proofRunning = false;
+  String? _proofJobId;
+  String? _proofStatusMessage;
 
   @override
   void initState() {
@@ -129,7 +133,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       if (statusCode == 200 &&
           data['success'] == true &&
           data['visibleToAgent'] == true &&
-          data['hasTimer'] == true) {
+          data['hasPrepTimer'] == true &&
+          data['hasFireTimer'] == true) {
         break;
       }
       await Future<void>.delayed(const Duration(seconds: 2));
@@ -159,19 +164,120 @@ class _DashboardScreenState extends State<DashboardScreen> {
         'Production agent can see the job but will not accept it: ${data['status']}/${data['state']}.',
       );
     }
-    if (data['hasTimer'] != true) {
+    if (data['hasPrepTimer'] != true || data['hasFireTimer'] != true) {
       throw Exception(
-        'Production agent has not registered a release timer yet.',
+        'Production agent has not registered both PREP and FIRE timers yet.',
       );
     }
 
     final fireTime = data['computedFireTimeUtc'] ?? data['scheduledFor'];
+    final prepTime = data['computedPrepTimeUtc'];
     final warmState = data['warmState'] ?? 'not warmed yet';
-    final timerId = data['timerDetails'] is Map
-        ? (data['timerDetails'] as Map)['timerId']
+    final prepTimerId = data['timerDetails'] is Map
+        ? ((data['timerDetails'] as Map)['prepTimer'] as Map?)?['timerId']
+        : null;
+    final fireTimerId = data['timerDetails'] is Map
+        ? ((data['timerDetails'] as Map)['fireTimer'] as Map?)?['timerId']
         : null;
     final shortId = jobId.length <= 6 ? jobId : jobId.substring(0, 6);
-    return 'Production confirmed job $shortId: fire=$fireTime, timer=$timerId, warm=$warmState.';
+    return 'Production confirmed job $shortId: prep=$prepTime (timer=$prepTimerId), fire=$fireTime (timer=$fireTimerId), warm=$warmState.';
+  }
+
+  Future<void> _runSafeProductionProof(List<BookingJob> jobs) async {
+    if (_proofRunning) return;
+    final uid = _firebaseService.currentUserId;
+    if (uid == null) {
+      _showSnack('Not logged in');
+      return;
+    }
+    final creds = _savedCreds ?? await _firebaseService.loadBRSCredentials(uid);
+    if (creds == null ||
+        (creds['username'] ?? '').trim().isEmpty ||
+        (creds['password'] ?? '').isEmpty) {
+      _showSnack('Save BRS credentials first to run production proof.');
+      return;
+    }
+
+    setState(() {
+      _proofRunning = true;
+      _proofStatusMessage = 'Creating safe proof job...';
+    });
+
+    try {
+      final nowUtc = DateTime.now().toUtc();
+      final fireOverrideUtc = nowUtc.add(const Duration(minutes: 3));
+      final template = jobs.where((j) => j.bookingMode == BookingMode.sniper).toList();
+      final base = template.isNotEmpty ? template.first : null;
+      final targetDate = base?.targetDate ??
+          DateFormat('yyyy-MM-dd').format(nowUtc.add(const Duration(days: 1)));
+      final targetDateParts = targetDate.split('-').map(int.parse).toList();
+      final targetPlayDateUtc = DateTime.utc(
+        targetDateParts[0],
+        targetDateParts[1],
+        targetDateParts[2],
+      );
+      final preferredTimes = base?.preferredTimes.isNotEmpty == true
+          ? base!.preferredTimes
+          : <String>['11:12'];
+      final proofData = <String, dynamic>{
+        'ownerUid': uid,
+        'mode': 'sniper',
+        'status': 'active',
+        'state': 'queued',
+        'club': base?.club ?? 'galgorm',
+        'tz': 'Europe/London',
+        'release_day': DateFormat('EEEE').format(targetPlayDateUtc),
+        'release_time_local': '19:20',
+        'target_day': DateFormat('EEEE').format(targetPlayDateUtc),
+        'target_date': targetDate,
+        'target_play_date': Timestamp.fromDate(targetPlayDateUtc),
+        'preferred_times': preferredTimes,
+        'players': const <String>[],
+        'party_size': 1,
+        'tee': base?.teeTarget ?? 1,
+        'tee_target': base?.teeTarget ?? 1,
+        'tee_mode': base?.teeMode ?? 'single',
+        'fallback_tee': base?.fallbackTee ?? false,
+        'brs_email': (creds['username'] ?? '').trim(),
+        'brs_password': creds['password'],
+        'dry_run': true,
+        'proof_run': true,
+        'proof_label': 'safe_production_proof',
+        'proof_fire_time_override_utc': Timestamp.fromDate(fireOverrideUtc),
+        'created_at': FieldValue.serverTimestamp(),
+        'updated_at': FieldValue.serverTimestamp(),
+      };
+
+      final created =
+          await FirebaseFirestore.instance.collection('jobs').add(proofData);
+      final message = await _verifyProductionAgentCanSeeJob(created.id);
+      if (!mounted) return;
+      setState(() {
+        _proofJobId = created.id;
+        _proofStatusMessage = message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 8)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _proofStatusMessage = 'Proof failed to start: $e';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Safe production proof failed to start: $e'),
+          backgroundColor: Colors.red.shade700,
+          duration: const Duration(seconds: 10),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _proofRunning = false;
+        });
+      }
+    }
   }
 
   String _partySizeLabel(BookingJob job) {
@@ -194,12 +300,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return 'Draft / Paused';
       case 'queued':
         return 'Waiting for Production';
+      case 'production_confirmed':
+        return 'Production Confirmed';
       case 'timer_registered':
-        return 'Waiting for Release';
+        return 'Waiting for Prep';
+      case 'waiting_for_fire':
+        return 'Waiting for Fire';
       case 'warming':
         return 'Warming BRS';
       case 'ready':
         return 'Ready';
+      case 'firing':
+        return 'Firing';
       case 'running':
         return 'Firing';
       case 'booking':
@@ -491,6 +603,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         ),
                       ),
                     ),
+                    Center(
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 800),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.xl),
+                        child: _buildProofCard(jobs),
+                      ),
+                    ),
+                    const SizedBox(height: AppSpacing.lg),
                     Center(
                       child: Container(
                         constraints: const BoxConstraints(maxWidth: 800),
@@ -1881,6 +2002,76 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } catch (e) {
       return null;
     }
+  }
+
+  Widget _buildProofCard(List<BookingJob> jobs) {
+    return Card(
+      elevation: 3,
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.lg),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.verified_user, color: Color(0xFF2E7D32)),
+                const SizedBox(width: 8),
+                Text(
+                  'Safe Production Proof',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Runs a dry-run proof through Firestore → Railway → PREP/FIRE timers → BRS flow, and stops before irreversible booking.',
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: _proofRunning ? null : () => _runSafeProductionProof(jobs),
+              icon: _proofRunning
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.play_arrow),
+              label: Text(_proofRunning
+                  ? 'Starting proof...'
+                  : 'Run Safe Production Proof'),
+            ),
+            if (_proofStatusMessage != null) ...[
+              const SizedBox(height: 8),
+              Text(_proofStatusMessage!),
+            ],
+            if (_proofJobId != null) ...[
+              const SizedBox(height: 8),
+              StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                stream: FirebaseFirestore.instance
+                    .collection('jobs')
+                    .doc(_proofJobId)
+                    .snapshots(),
+                builder: (context, snapshot) {
+                  final data = snapshot.data?.data() ?? const <String, dynamic>{};
+                  final status = (data['status'] ?? '').toString();
+                  final state = (data['state'] ?? '').toString();
+                  final result = (data['result'] ?? '').toString();
+                  final error = (data['error_message'] ?? '').toString();
+                  final shortId = _proofJobId!.length <= 6
+                      ? _proofJobId!
+                      : _proofJobId!.substring(0, 6);
+                  return Text(
+                    'Proof job $shortId: ${status.toUpperCase()}${state.isNotEmpty ? ' / ${state.toUpperCase()}' : ''}${result.isNotEmpty ? ' / $result' : ''}${error.isNotEmpty ? ' / $error' : ''}',
+                  );
+                },
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _buildRecentRuns(String userId) {
