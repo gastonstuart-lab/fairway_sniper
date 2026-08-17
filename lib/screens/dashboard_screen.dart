@@ -173,15 +173,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final fireTime = data['computedFireTimeUtc'] ?? data['scheduledFor'];
     final prepTime = data['computedPrepTimeUtc'];
     final warmState = data['warmState'] ?? 'not warmed yet';
-    final prepTimerId = data['timerDetails'] is Map
-        ? ((data['timerDetails'] as Map)['prepTimer'] as Map?)?['timerId']
-        : null;
-    final fireTimerId = data['timerDetails'] is Map
-        ? ((data['timerDetails'] as Map)['fireTimer'] as Map?)?['timerId']
-        : null;
+    final timerDetails = data['timerDetails'];
+final prepTimer = timerDetails is Map ? timerDetails['prepTimer'] : null;
+final fireTimer = timerDetails is Map ? timerDetails['fireTimer'] : null;
+final prepTimerId = prepTimer is Map ? prepTimer['timerId'] : null;
+final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
     final shortId = jobId.length <= 6 ? jobId : jobId.substring(0, 6);
     return 'Production confirmed job $shortId: prep=$prepTime (timer=$prepTimerId), fire=$fireTime (timer=$fireTimerId), warm=$warmState.';
   }
+
+  void _showSnack(String message) {
+  if (!mounted) return;
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text(message)),
+  );
+}
 
   Future<void> _runSafeProductionProof(List<BookingJob> jobs) async {
     if (_proofRunning) return;
