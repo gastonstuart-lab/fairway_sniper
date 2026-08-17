@@ -2,20 +2,19 @@
   "name": "fairway-sniper-agent",
   "version": "1.0.0",
   "description": "BRS Golf auto-booking automation agent",
-  "main": "production_server_v2.js",
+  "main": "index.js",
   "type": "module",
   "scripts": {
     "postinstall": "npx playwright install --with-deps chromium",
     "build": "npx playwright install --with-deps chromium",
-    "start": "node production_server_v2.js",
-    "start:legacy": "node index.js",
+    "start": "node index.js",
     "start:boot": "node boot.js",
     "test": "node index.js --dry-run",
     "test:fetch": "powershell -ExecutionPolicy Bypass -File ./scripts/test-fetch.ps1",
     "test:player-directory": "pwsh -NoProfile -File ./test-fetch-player-directory.ps1",
     "test:snipe-check": "pwsh -NoProfile -Command \"$body = @{ username = $env:BRS_USERNAME; password = $env:BRS_PASSWORD; targetDate = (Get-Date).ToString('yyyy-MM-dd'); preferredTimes = @(); players = @(); checkOnly = $true } | ConvertTo-Json; Invoke-RestMethod -Uri 'http://localhost:3000/api/snipe' -Method Post -ContentType 'application/json' -Body $body | ConvertTo-Json -Depth 6\"",
     "test:snipe-preview": "pwsh -NoProfile -Command \"$body = @{ username = $env:BRS_USERNAME; password = $env:BRS_PASSWORD; targetDate = (Get-Date).ToString('yyyy-MM-dd'); preferredTimes = @(); players = @(); previewBooking = $true } | ConvertTo-Json; Invoke-RestMethod -Uri 'http://localhost:3000/api/snipe' -Method Post -ContentType 'application/json' -Body $body | ConvertTo-Json -Depth 6\"",
-    "test:safety": "node --test tests/slot_policy.test.js tests/tee_data_policy.test.js tests/release_watcher_gate.test.js tests/production_readiness_contract.test.js tests/production_v2_contract.test.js",
+    "test:safety": "node --test tests/slot_policy.test.js tests/tee_data_policy.test.js tests/release_watcher_gate.test.js tests/production_readiness_contract.test.js",
     "validate:tee": "node scripts/validate-tee-scrape.mjs"
   },
   "dependencies": {
