@@ -26,14 +26,100 @@ test('scheduler registers PREP and FIRE timers before warm-up can block', () => 
   const prepTimerCreate = body.indexOf("'PREP_TIMER_CREATED'");
   const fireTimerCreate = body.indexOf("'FIRE_TIMER_CREATED'");
   const timerSet = body.indexOf('jobTimers.set(jobId');
+  const prepTimeoutSet = body.indexOf('const prepTimeoutId = setTimeout');
+  const fireTimeoutSet = body.indexOf('const fireTimeoutId = setTimeout');
   const warmStart = body.indexOf("fsAddJobEvent(jobId, 'WARMUP_STARTED'");
   assert(prepTimerCreate > -1, 'prep timer event missing');
   assert(fireTimerCreate > -1, 'fire timer event missing');
   assert(timerSet > -1, 'timer registration missing');
+  assert(prepTimeoutSet > -1, 'prep timeout installation missing');
+  assert(fireTimeoutSet > -1, 'fire timeout installation missing');
   assert(warmStart > -1, 'warm-up event missing');
-  assert(prepTimerCreate < warmStart, 'prep timer must be registered before warm-up starts');
-  assert(fireTimerCreate < warmStart, 'fire timer must be registered before warm-up starts');
   assert(timerSet < warmStart, 'timer must be registered before warm-up starts');
+  assert(prepTimeoutSet < prepTimerCreate, 'prep timeout must be installed before diagnostic writes');
+  assert(fireTimeoutSet < fireTimerCreate, 'fire timeout must be installed before diagnostic writes');
+});
+
+function finalDelay(targetMs, installedAtMs) {
+  return Math.max(0, targetMs - installedAtMs);
+}
+
+test('fire timer recomputes delay after async scheduling work', () => {
+  const initialNow = 1_000_000;
+  const targetFireMs = initialNow + 10_000;
+  const installedAtMs = initialNow + 3_000;
+
+  assert.equal(finalDelay(targetFireMs, installedAtMs), 7_000);
+  assert.notEqual(finalDelay(targetFireMs, installedAtMs), targetFireMs - initialNow);
+
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('const fireTimerInstalledAtMs = Date.now();'));
+  assert(body.includes('const fireDelayMs = Math.max(0, fireMs - fireTimerInstalledAtMs);'));
+});
+
+test('prep timer recomputes delay after async scheduling work', () => {
+  const initialNow = 1_000_000;
+  const targetPrepMs = initialNow + 10_000;
+  const installedAtMs = initialNow + 3_000;
+
+  assert.equal(finalDelay(targetPrepMs, installedAtMs), 7_000);
+
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('const prepTimerInstalledAtMs = Date.now();'));
+  assert(body.includes('const prepDelayMs = Math.max(0, prepMs - prepTimerInstalledAtMs);'));
+});
+
+test('no await occurs between final timer delay calculation and setTimeout installation', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  const prepDelayCalc = body.indexOf('const prepDelayMs = Math.max(0, prepMs - prepTimerInstalledAtMs);');
+  const prepTimeoutSet = body.indexOf('const prepTimeoutId = setTimeout', prepDelayCalc);
+  const fireDelayCalc = body.indexOf('const fireDelayMs = Math.max(0, fireMs - fireTimerInstalledAtMs);');
+  const fireTimeoutSet = body.indexOf('const fireTimeoutId = setTimeout', fireDelayCalc);
+
+  assert(prepDelayCalc > -1);
+  assert(prepTimeoutSet > prepDelayCalc);
+  assert.equal(body.slice(prepDelayCalc, prepTimeoutSet).includes('await '), false);
+  assert(fireDelayCalc > -1);
+  assert(fireTimeoutSet > fireDelayCalc);
+  assert.equal(body.slice(fireDelayCalc, fireTimeoutSet).includes('await '), false);
+});
+
+test('timer metadata matches the real installed timer target', () => {
+  const scheduledStartAtMs = 1_010_000;
+  const installedAtMs = 1_003_000;
+  const delayMs = finalDelay(scheduledStartAtMs, installedAtMs);
+
+  assert(Math.abs(installedAtMs + delayMs - scheduledStartAtMs) <= 1);
+
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('timerCreatedAt: prepTimerInstalledAtUtc'));
+  assert(body.includes('scheduledStartAt: prepAt.toISOString()'));
+  assert(body.includes('timerCreatedAt: fireTimerInstalledAtUtc'));
+  assert(body.includes('scheduledStartAt: scheduleAt.toISOString()'));
+});
+
+test('past PREP target recovers with immediate delay', () => {
+  const targetPrepMs = 1_000_000;
+  const installedAtMs = 1_003_000;
+
+  assert.equal(finalDelay(targetPrepMs, installedAtMs), 0);
+
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('if (prepMs <= prepTimerInstalledAtMs) timerEntry.prepTimer.recovered = true;'));
+});
+
+test('absolute FIRE timestamp does not shift when timer installation is delayed', () => {
+  const initialNow = 1_000_000;
+  const fireMs = initialNow + 10_000;
+  const installedAtMs = initialNow + 3_000;
+
+  assert.equal(new Date(fireMs).getTime(), fireMs);
+  assert.equal(finalDelay(fireMs, installedAtMs), 7_000);
+
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('const scheduleAt = new Date(fireMs);'));
+  assert(body.includes('scheduledStartAt: scheduleAt.toISOString()'));
+  assert(!body.includes('new Date(fireTimerInstalledAtMs + fireDelayMs)'));
 });
 
 test('scheduler records persistent lifecycle events for production reconstruction', () => {
@@ -90,6 +176,10 @@ test('firestore job diagnostic exposes project, timer and fire-time evidence', (
     'timerDetails',
     'prepTimer',
     'fireTimer',
+    'prepTimerInstalledAtUtc',
+    'fireTimerInstalledAtUtc',
+    'prepTimerInstallLagMs',
+    'fireTimerInstallLagMs',
     'brsAuthenticated',
     'lastAgentEvent',
     'lastAgentError',

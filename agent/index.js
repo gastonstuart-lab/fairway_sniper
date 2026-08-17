@@ -298,6 +298,8 @@ app.get('/api/runtime-status', (_req, res) => {
             timerId: entry.prepTimer.timerId,
             state: entry.prepTimer.state,
             timerCreatedAt: entry.prepTimer.timerCreatedAt,
+            prepTimerInstalledAtUtc: entry.prepTimer.prepTimerInstalledAtUtc || null,
+            prepTimerInstallLagMs: entry.prepTimer.prepTimerInstallLagMs ?? null,
             scheduledStartAt: entry.prepTimer.scheduledStartAt,
             delayMs: entry.prepTimer.delayMs,
             firedAt: entry.prepTimer.firedAt || null,
@@ -308,6 +310,8 @@ app.get('/api/runtime-status', (_req, res) => {
             timerId: entry.fireTimer.timerId,
             state: entry.fireTimer.state,
             timerCreatedAt: entry.fireTimer.timerCreatedAt,
+            fireTimerInstalledAtUtc: entry.fireTimer.fireTimerInstalledAtUtc || null,
+            fireTimerInstallLagMs: entry.fireTimer.fireTimerInstallLagMs ?? null,
             scheduledStartAt: entry.fireTimer.scheduledStartAt,
             delayMs: entry.fireTimer.delayMs,
             firedAt: entry.fireTimer.firedAt || null,
@@ -1550,6 +1554,8 @@ function buildFirestoreJobStatus(docId, data) {
                 timerId: timerDetails.prepTimer.timerId,
                 state: timerDetails.prepTimer.state,
                 timerCreatedAt: timerDetails.prepTimer.timerCreatedAt,
+                prepTimerInstalledAtUtc: timerDetails.prepTimer.prepTimerInstalledAtUtc || null,
+                prepTimerInstallLagMs: timerDetails.prepTimer.prepTimerInstallLagMs ?? null,
                 scheduledStartAt: timerDetails.prepTimer.scheduledStartAt,
                 delayMs: timerDetails.prepTimer.delayMs,
                 firedAt: timerDetails.prepTimer.firedAt || null,
@@ -1561,6 +1567,8 @@ function buildFirestoreJobStatus(docId, data) {
                 timerId: timerDetails.fireTimer.timerId,
                 state: timerDetails.fireTimer.state,
                 timerCreatedAt: timerDetails.fireTimer.timerCreatedAt,
+                fireTimerInstalledAtUtc: timerDetails.fireTimer.fireTimerInstalledAtUtc || null,
+                fireTimerInstallLagMs: timerDetails.fireTimer.fireTimerInstallLagMs ?? null,
                 scheduledStartAt: timerDetails.fireTimer.scheduledStartAt,
                 delayMs: timerDetails.fireTimer.delayMs,
                 firedAt: timerDetails.fireTimer.firedAt || null,
@@ -1603,6 +1611,10 @@ function buildFirestoreJobStatus(docId, data) {
     proofCandidateTee: job.proof_candidate_tee || job.proofCandidateTee || null,
     proofPartySize: job.proof_party_size || job.proofPartySize || null,
     prebookBoundary: serializeStatusValue(job.prebook_boundary || job.prebookBoundary || null),
+    prepTimerInstalledAtUtc: serializeStatusValue(job.prep_timer_installed_at || job.prepTimerInstalledAt || null),
+    fireTimerInstalledAtUtc: serializeStatusValue(job.fire_timer_installed_at || job.fireTimerInstalledAt || null),
+    prepTimerInstallLagMs: job.prep_timer_install_lag_ms ?? job.prepTimerInstallLagMs ?? null,
+    fireTimerInstallLagMs: job.fire_timer_install_lag_ms ?? job.fireTimerInstallLagMs ?? null,
     fireTimerDriftMs: job.fire_timer_drift_ms ?? job.fireTimerDriftMs ?? null,
     bookingHotPathDeltaMs: job.booking_hot_path_delta_ms ?? job.bookingHotPathDeltaMs ?? null,
     firstBrsActionDeltaMs: job.first_brs_action_delta_ms ?? job.firstBrsActionDeltaMs ?? null,
@@ -1790,8 +1802,8 @@ async function scheduleClaimedJob(job) {
     return;
   }
 
-  const now = Date.now();
-  if (fireMs < now - CONFIG.SNIPER_MISSED_FIRE_GRACE_MS) {
+  const schedulingCalculationAtMs = Date.now();
+  if (fireMs < schedulingCalculationAtMs - CONFIG.SNIPER_MISSED_FIRE_GRACE_MS) {
     await markJobError(jobId, 'MISSED_FIRE_TIME');
     return;
   }
@@ -1805,8 +1817,6 @@ async function scheduleClaimedJob(job) {
   const prepAtLocal = DateTime.fromJSDate(prepAt)
     .setZone(job.tz || job.timezone || CONFIG.TZ_LONDON)
     .toISO();
-  const prepDelayMs = Math.max(0, prepMs - now);
-  const fireDelayMs = Math.max(0, fireMs - now);
   const targetDateKey = getTargetDateKeyFromJob(job) || normalizeDateKey(targetPlayDate);
   const preferredTimesForLog = Array.isArray(job.preferred_times)
     ? normalizeStringList(job.preferred_times)
@@ -1829,29 +1839,7 @@ async function scheduleClaimedJob(job) {
   console.log(`[RUNNER] Prep time UTC: ${prepAt.toISOString()}`);
   console.log(`[RUNNER] Current UK time: ${ukNow}`);
   console.log(`[RUNNER] Fire time resolved for ${jobId}: ${scheduleAt.toISOString()}`);
-  console.log(`[RUNNER] Prep delay=${prepDelayMs}ms; fire delay=${fireDelayMs}ms`);
-
-  await fsUpdateJob(jobId, {
-    scheduled_for: admin.firestore.Timestamp.fromDate(scheduleAt),
-    scheduled_for_local: scheduleAtLocal,
-    prep_scheduled_for: admin.firestore.Timestamp.fromDate(prepAt),
-    prep_scheduled_for_local: prepAtLocal,
-    warm_state: 'pending',
-    state: 'production_confirmed',
-  });
-  await fsAddJobEvent(jobId, 'PREP_TIMER_CREATED', {
-    prepTimeUtc: prepAt.toISOString(),
-    prepTimeLocal: prepAtLocal,
-    scheduledStartAt: new Date(Math.max(now, prepMs)).toISOString(),
-    delayMs: prepDelayMs,
-  });
-  await fsAddJobEvent(jobId, 'FIRE_TIMER_CREATED', {
-    fireTimeUtc: scheduleAt.toISOString(),
-    fireTimeLocal: scheduleAtLocal,
-    prepTimeUtc: prepAt.toISOString(),
-    scheduledStartAt: scheduleAt.toISOString(),
-    delayMs: fireDelayMs,
-  });
+  console.log('[RUNNER] Timer delays will be calculated immediately before installation');
 
   let warmPage = null;
   let warmupPromise = null;
@@ -2141,6 +2129,8 @@ async function scheduleClaimedJob(job) {
 
   const prepTimerId = nextTimerId('prep');
   const fireTimerId = nextTimerId('fire');
+  const prepTimerInstalledAtMs = Date.now();
+  const prepDelayMs = Math.max(0, prepMs - prepTimerInstalledAtMs);
   const prepTimeoutId = setTimeout(async () => {
     const entry = jobTimers.get(jobId);
     if (!entry || !entry.prepTimer) return;
@@ -2159,29 +2149,74 @@ async function scheduleClaimedJob(job) {
     }
   }, prepDelayMs);
 
+  const fireTimerInstalledAtMs = Date.now();
+  const fireDelayMs = Math.max(0, fireMs - fireTimerInstalledAtMs);
   const fireTimeoutId = setTimeout(async () => {
     await fireNow('fire-timer');
   }, fireDelayMs);
+
+  const prepTimerInstalledAtUtc = new Date(prepTimerInstalledAtMs).toISOString();
+  const fireTimerInstalledAtUtc = new Date(fireTimerInstalledAtMs).toISOString();
+  const prepTimerInstallLagMs = prepTimerInstalledAtMs - schedulingCalculationAtMs;
+  const fireTimerInstallLagMs = fireTimerInstalledAtMs - schedulingCalculationAtMs;
 
   timerEntry.prepTimer = {
     timerId: prepTimerId,
     timeoutId: prepTimeoutId,
     state: 'registered',
-    timerCreatedAt: new Date().toISOString(),
-    scheduledStartAt: new Date(Math.max(now, prepMs)).toISOString(),
+    timerCreatedAt: prepTimerInstalledAtUtc,
+    prepTimerInstalledAtUtc,
+    scheduledStartAt: prepAt.toISOString(),
     delayMs: prepDelayMs,
+    prepTimerInstallLagMs,
   };
   timerEntry.fireTimer = {
     timerId: fireTimerId,
     timeoutId: fireTimeoutId,
     state: 'registered',
-    timerCreatedAt: new Date().toISOString(),
+    timerCreatedAt: fireTimerInstalledAtUtc,
+    fireTimerInstalledAtUtc,
     scheduledStartAt: scheduleAt.toISOString(),
     delayMs: fireDelayMs,
+    fireTimerInstallLagMs,
   };
 
-  if (prepMs <= now) timerEntry.prepTimer.recovered = true;
-  if (fireMs <= now) timerEntry.fireTimer.recovered = true;
+  if (prepMs <= prepTimerInstalledAtMs) timerEntry.prepTimer.recovered = true;
+  if (fireMs <= fireTimerInstalledAtMs) timerEntry.fireTimer.recovered = true;
+
+  console.log(`[RUNNER] Prep delay=${prepDelayMs}ms; fire delay=${fireDelayMs}ms`);
+
+  void fsUpdateJob(jobId, {
+    scheduled_for: admin.firestore.Timestamp.fromDate(scheduleAt),
+    scheduled_for_local: scheduleAtLocal,
+    prep_scheduled_for: admin.firestore.Timestamp.fromDate(prepAt),
+    prep_scheduled_for_local: prepAtLocal,
+    prep_timer_installed_at: admin.firestore.Timestamp.fromMillis(prepTimerInstalledAtMs),
+    fire_timer_installed_at: admin.firestore.Timestamp.fromMillis(fireTimerInstalledAtMs),
+    prep_timer_install_lag_ms: prepTimerInstallLagMs,
+    fire_timer_install_lag_ms: fireTimerInstallLagMs,
+    warm_state: 'pending',
+    state: 'production_confirmed',
+  });
+  void fsAddJobEvent(jobId, 'PREP_TIMER_CREATED', {
+    prepTimeUtc: prepAt.toISOString(),
+    prepTimeLocal: prepAtLocal,
+    timerCreatedAt: prepTimerInstalledAtUtc,
+    prepTimerInstalledAtUtc,
+    prepTimerInstallLagMs,
+    scheduledStartAt: prepAt.toISOString(),
+    delayMs: prepDelayMs,
+  });
+  void fsAddJobEvent(jobId, 'FIRE_TIMER_CREATED', {
+    fireTimeUtc: scheduleAt.toISOString(),
+    fireTimeLocal: scheduleAtLocal,
+    prepTimeUtc: prepAt.toISOString(),
+    timerCreatedAt: fireTimerInstalledAtUtc,
+    fireTimerInstalledAtUtc,
+    fireTimerInstallLagMs,
+    scheduledStartAt: scheduleAt.toISOString(),
+    delayMs: fireDelayMs,
+  });
 }
 
 async function handleReadyJob(job) {
