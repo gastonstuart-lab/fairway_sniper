@@ -20,6 +20,11 @@ import {
   validatePrebookBoundary,
 } from './prebook_boundary.js';
 import { validatePartyPlayers } from './party_validation.js';
+import {
+  filterSafeProofCandidates,
+  normalizeSafeAvailabilityFromTeeData,
+} from './safe_availability.js';
+import { resolveRunLogId } from './run_log_timing.js';
 import os from 'os';
 import crypto from 'crypto';
 
@@ -279,7 +284,6 @@ app.get('/api/runtime-status', (_req, res) => {
     agentRunMain: process.env.AGENT_RUN_MAIN === 'true',
     sniperRunnerStarted,
     sniperPrepLeadMs: getPrepLeadMs(),
-    sniperPrepLeadMs: getPrepLeadMs(),
     activeSniperTimers: timerSummary,
     acceptedActiveJobs: timerSummary.jobs,
     timers: Array.from(jobTimers.values()).map((entry) => ({
@@ -357,6 +361,11 @@ const markDiagContext = (page, dateStr, tee) => {
   page.context()._teeForDiagnostics = tee;
 };
 
+const normalizeCapacityValue = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  return Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : null;
+};
+
 const TEE_ROW_SELECTOR =
   'tr, li, .tee-row, .slot-row, .timeslot, .slot, .availability, [data-testid*="tee"], [class*="tee"], [class*="time"], [class*="slot"]';
 const TEE_CONTAINER_SELECTORS = [
@@ -373,7 +382,7 @@ const TEE_CONTAINER_SELECTORS = [
 ];
 const TEE_TIME_REGEX_SOURCE = '\\b(?:[01]\\d|2[0-3]):[0-5]\\d\\b';
 
-async function collectTeeResult(page, tee, dateStr, includeUnavailable = false) {
+async function collectTeeResult(page, tee, dateStr, includeUnavailable = false, partySize = null) {
   try {
     await ensureTeeSelected(page, tee);
   } catch (error) {
@@ -385,14 +394,57 @@ async function collectTeeResult(page, tee, dateStr, includeUnavailable = false) 
   } catch (err) {
     console.warn('[TEE] Waiting for tee rows:', err?.message || err);
   }
+  const teeDataSlots = await fetchTeeDataAvailabilitySlots(page, dateStr, tee, includeUnavailable);
+  if (teeDataSlots.length) {
+    const result = {
+      tee,
+      count: teeDataSlots.length,
+      times: teeDataSlots.map((slot) => slot.time),
+      slots: teeDataSlots,
+      source: 'brs-tee-data',
+    };
+    if (partySize !== null && partySize !== undefined) {
+      result.safeProofCandidates = filterSafeProofCandidates(teeDataSlots, { partySize });
+    }
+    return result;
+  }
   const { times, slots, debug } = await scrapeAvailableTimes(page, { includeUnavailable });
-  return {
+  const result = {
     tee,
     count: Array.isArray(times) ? times.length : 0,
     times,
     slots,
     debug,
   };
+  if (partySize !== null && partySize !== undefined) {
+    result.safeProofCandidates = filterSafeProofCandidates(slots, { partySize });
+  }
+  return result;
+}
+
+async function fetchTeeDataAvailabilitySlots(page, dateStr, tee, includeUnavailable = false) {
+  if (!page?.context) return [];
+  try {
+    const response = await page.context().request.get(teeSheetDataUrlForDate(dateStr, tee), {
+      headers: {
+        'x-requested-with': 'XMLHttpRequest',
+        accept: 'application/json, text/javascript, */*; q=0.01',
+        'cache-control': 'no-cache, no-store, max-age=0',
+        pragma: 'no-cache',
+      },
+      timeout: 3500,
+    });
+    if (!response.ok()) return [];
+    const payload = await response.json();
+    return normalizeSafeAvailabilityFromTeeData(payload, {
+      date: dateStr,
+      tee,
+      includeUnavailable,
+    });
+  } catch (error) {
+    console.warn('[TEE] BRS tee-data availability unavailable:', error?.message || error);
+    return [];
+  }
 }
 
 // Fetch available tee times for a single date
@@ -408,6 +460,9 @@ app.post('/api/fetch-tee-times', async (req, res) => {
       req.body?.includeUnavailable ?? req.query?.includeUnavailable,
       false,
     );
+    const partySizeForProof = Number.isFinite(Number(req.body?.partySize ?? req.query?.partySize))
+      ? Math.max(1, Math.min(4, Number.parseInt(req.body?.partySize ?? req.query?.partySize, 10)))
+      : null;
 
     if (!date || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing date/username/password' });
@@ -451,12 +506,12 @@ app.post('/api/fetch-tee-times', async (req, res) => {
     };
 
     if (teeMode === 'both') {
-      const tee1 = await collectTeeResult(page, 1, date, includeUnavailable);
-      const tee10 = await collectTeeResult(page, 10, date, includeUnavailable);
+      const tee1 = await collectTeeResult(page, 1, date, includeUnavailable, partySizeForProof);
+      const tee10 = await collectTeeResult(page, 10, date, includeUnavailable, partySizeForProof);
       response.tee1 = tee1;
       response.tee10 = tee10;
     } else {
-      const single = await collectTeeResult(page, teeTarget, date, includeUnavailable);
+      const single = await collectTeeResult(page, teeTarget, date, includeUnavailable, partySizeForProof);
       response.count = single.count;
       response.times = single.times;
       response.slots = single.slots;
@@ -484,6 +539,9 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
       req.body?.includeUnavailable ?? req.query?.includeUnavailable,
       false,
     );
+    const partySizeForProof = Number.isFinite(Number(req.body?.partySize ?? req.query?.partySize))
+      ? Math.max(1, Math.min(4, Number.parseInt(req.body?.partySize ?? req.query?.partySize, 10)))
+      : null;
     if (!startDate || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing startDate/username/password' });
     }
@@ -529,8 +587,8 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
       }
 
       if (teeMode === 'both') {
-        const tee1 = await collectTeeResult(page, 1, targetDate, includeUnavailable);
-        const tee10 = await collectTeeResult(page, 10, targetDate, includeUnavailable);
+        const tee1 = await collectTeeResult(page, 1, targetDate, includeUnavailable, partySizeForProof);
+        const tee10 = await collectTeeResult(page, 10, targetDate, includeUnavailable, partySizeForProof);
         results.push({
           date: targetDate,
           teeMode,
@@ -539,7 +597,7 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
           tee10,
         });
       } else {
-        const single = await collectTeeResult(page, teeTarget, targetDate, includeUnavailable);
+        const single = await collectTeeResult(page, teeTarget, targetDate, includeUnavailable, partySizeForProof);
         const entry = {
           date: targetDate,
           teeMode,
@@ -1815,6 +1873,7 @@ async function scheduleClaimedJob(job) {
     cachedJob: job,
     cachedCreds: null,
     preparedRunId: null,
+    preparedRunPromise: null,
   };
   jobTimers.set(jobId, timerEntry);
 
@@ -1831,13 +1890,21 @@ async function scheduleClaimedJob(job) {
       }
       entry.cachedCreds = creds;
       entry.cachedJob = { ...job, players: partyValidation.players, party_size: partyValidation.partySize };
-      if (!entry.preparedRunId) {
-        entry.preparedRunId = await fsAddRun(
+      if (!entry.preparedRunId && !entry.preparedRunPromise) {
+        entry.preparedRunPromise = fsAddRun(
           jobId,
           job.ownerUid || job.owner_uid || 'unknown',
           new Date(),
           'Prepared during PREP warm-up',
-        );
+        )
+          .then((runId) => {
+            entry.preparedRunId = runId || null;
+            return entry.preparedRunId;
+          })
+          .catch((error) => {
+            console.warn('[RUN] PREP run-log creation failed:', error?.message || error);
+            return null;
+          });
       }
 
       entry.warmState = 'warming';
@@ -1984,9 +2051,14 @@ async function scheduleClaimedJob(job) {
         bookingHotPathStartMs,
       });
 
-      const isSuccess = result?.success === true;
+      const rawSuccess = result?.success === true;
       const isProof = isProofDryRunJob(runJob);
-      const reachedDryRunBoundary = result?.result === 'DRY_RUN_PREBOOK_REACHED';
+      const boundaryConsistency = isProof
+        ? validateProofBoundaryConsistency(runJob, result)
+        : { ok: true, error: null };
+      const reachedDryRunBoundary =
+        result?.result === 'DRY_RUN_PREBOOK_REACHED' && boundaryConsistency.ok;
+      const isSuccess = rawSuccess && (!isProof || reachedDryRunBoundary);
       if (reachedDryRunBoundary) {
         await fsAddJobEvent(jobId, 'DRY_RUN_PREBOOK_REACHED', {
           bookedTime: result?.bookedTime || null,
@@ -2003,7 +2075,9 @@ async function scheduleClaimedJob(job) {
       if (isProof) {
         await fsAddJobEvent(jobId, reachedDryRunBoundary ? 'PROOF_SUCCESS' : 'PROOF_FAILED', {
           result: result?.result || null,
-          error: reachedDryRunBoundary ? null : result?.error || 'proof-boundary-not-reached',
+          error: reachedDryRunBoundary
+            ? null
+            : boundaryConsistency.error || result?.error || 'proof-boundary-not-reached',
           prebookBoundary: result?.prebookBoundary || result?.prebook_boundary || null,
         });
       }
@@ -2032,7 +2106,8 @@ async function scheduleClaimedJob(job) {
         tee_selected: result?.teeSelected || null,
         requested_tee: teeConfig.teeTarget,
         finished_at: admin.firestore.FieldValue.serverTimestamp(),
-        error_message: isSuccess ? null : result?.error || 'clicked but no confirmation',
+        error_message:
+          isSuccess ? null : boundaryConsistency.error || result?.error || 'clicked but no confirmation',
         click_delta_ms: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
         fire_timer_drift_ms: result?.fire_timer_drift_ms ?? result?.fireTimerDriftMs ?? fireTimerDriftMs,
         booking_hot_path_delta_ms:
@@ -2665,9 +2740,10 @@ function teeSheetUrlForDate(date) {
   return `https://members.brsgolf.com/galgorm/tee-sheet/1/${year}/${month}/${day}`;
 }
 
-function teeSheetDataUrlForDate(date) {
+function teeSheetDataUrlForDate(date, tee = 1) {
   const { year, month, day } = datePartsForTeeSheet(date);
-  return `https://members.brsgolf.com/galgorm/tee-sheet/data/1/${year}/${month}/${day}?_=${Date.now()}`;
+  const teeSegment = parseTeeTarget(tee);
+  return `https://members.brsgolf.com/galgorm/tee-sheet/data/${teeSegment}/${year}/${month}/${day}?_=${Date.now()}`;
 }
 
 function pageMatchesDate(page, date) {
@@ -2820,6 +2896,9 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   }
 
   let slots = Array.from(timeMap.values());
+  if (!includeUnavailable) {
+    slots = slots.filter((slot) => slot.state === 'bookable' && (slot.href || slot.source === 'booking-link-fallback'));
+  }
   slots.sort((a, b) => a.time.localeCompare(b.time));
 
   let times = slots.map((slot) => slot.time);
@@ -2887,13 +2966,16 @@ function escapeRegex(str) {
  * @param {number} openSlots - Number of available slots (1-4)
  * @returns {Promise<{filled: string[], skippedReason?: string, confirmationText?: string}>}
  */
-async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun = false) {
+async function fillPlayersAndConfirm(page, players = [], openSlots = null, dryRun = false, options = {}) {
   const result = {
     filled: [],
     skippedReason: null,
     confirmationText: null,
     fieldDiagnostics: [],
   };
+  const partySize = options.partySize !== null && options.partySize !== undefined && options.partySize !== '' && Number.isFinite(Number(options.partySize))
+    ? Math.max(1, Math.min(4, Number.parseInt(options.partySize, 10)))
+    : Math.max(1, Math.min(4, (Array.isArray(players) ? players.length : 0) + 1));
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page
@@ -2902,10 +2984,14 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     })
     .catch(() => {});
 
-  const normalizedOpenSlots = Number.isFinite(Number(openSlots))
-    ? Math.max(0, Number(openSlots))
-    : 3;
-  if (players.length > normalizedOpenSlots) {
+  const normalizedOpenSlots = normalizeCapacityValue(openSlots);
+  if (partySize > 1 && normalizedOpenSlots === null) {
+    console.log('  Capacity is not proven for multi-player party.');
+    result.skippedReason = 'capacity-unproven';
+    result.confirmationText = 'capacity-unproven';
+    return result;
+  }
+  if (normalizedOpenSlots !== null && normalizedOpenSlots < partySize) {
     console.log(
       `  ⚠️ Full party does not fit: ${players.length} additional player(s), ${normalizedOpenSlots} open slot(s).`,
     );
@@ -2914,15 +3000,14 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     return result;
   }
 
-  // Only try to fill as many players as slots permit (max 3 additional players = slots 2, 3, 4)
-  const playersToFill = players.slice(0, Math.min(normalizedOpenSlots, 3));
+  const playersToFill = Array.isArray(players) ? [...players] : [];
 
   console.log(
     `  👥 Attempting to fill ${playersToFill.length} player(s) (${normalizedOpenSlots} slot(s) available)...`,
   );
 
   // If no additional players needed, skip directly to confirmation
-  if (playersToFill.length === 0 && openSlots > 0) {
+  if (playersToFill.length === 0 && (normalizedOpenSlots === null || normalizedOpenSlots > 0)) {
     console.log(
       `  ℹ️ Only logged-in user (Player 1) needed. Skipping player selection.`,
     );
@@ -3180,8 +3265,12 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     const boundary = await validatePrebookBoundary(page, {
       players,
       openSlots: normalizedOpenSlots,
+      partySize,
       confirmResult: result,
-      capacityValidated: players.length <= normalizedOpenSlots,
+      candidateTime: options.candidateTime ?? null,
+      teeSelected: options.teeSelected ?? null,
+      capacityValidated:
+        normalizedOpenSlots === null ? partySize <= 1 : normalizedOpenSlots >= partySize,
     });
     result.prebookBoundary = boundary;
     result.confirmationText = boundary.prebookBoundaryReached
@@ -3283,11 +3372,12 @@ async function tryBookTime(
   page,
   time,
   players = [],
-  openSlots = 3,
+  openSlots = null,
   cachedLocator = null,
   targetFireTime = Date.now(),
   jobId = null,
   dryRun = false,
+  options = {},
 ) {
   // Wait for tee sheet rows to exist
   console.log(`  ⏳ Waiting for tee sheet to load...`);
@@ -3343,9 +3433,16 @@ async function tryBookTime(
     console.log(`[FIRE] Delta ms: ${clickTime - targetFireTime}ms`);
     await page.waitForTimeout(2000);
 
-    const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
-    const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
-    const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
+    const capacityForPlayers = normalizeCapacityValue(openSlots);
+    const partySizeForBoundary = options.partySize !== null && options.partySize !== undefined && options.partySize !== '' && Number.isFinite(Number(options.partySize))
+      ? Number(options.partySize)
+      : players.length + 1;
+    const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun, {
+      partySize: partySizeForBoundary,
+      candidateTime: options.candidateTime ?? timeLabel,
+      teeSelected: options.teeSelected ?? null,
+    });
+    const expectedPlayersCount = players.length;
     const boundary = confirmResult.prebookBoundary || {};
     const formValidated = boundary.prebookBoundaryReached === true;
     if (dryRun) {
@@ -3357,7 +3454,7 @@ async function tryBookTime(
         prebookBoundary: boundary,
         result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
         playersFilled: confirmResult.filled,
-        playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+        playersRequested: players,
         confirmationText: confirmResult.confirmationText,
         skippedReason: confirmResult.skippedReason,
         fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -3370,7 +3467,7 @@ async function tryBookTime(
     return {
       booked: rowBooked,
       playersFilled: confirmResult.filled,
-      playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+      playersRequested: players,
       confirmationText: confirmResult.confirmationText,
       skippedReason: confirmResult.skippedReason,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -3400,9 +3497,16 @@ async function tryBookTime(
   page.on('dialog', (dialog) => dialog.accept());
 
   // Call the unified player selection and confirmation helper
-  const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
-  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
-  const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
+  const capacityForPlayers = normalizeCapacityValue(openSlots);
+  const partySizeForBoundary = options.partySize !== null && options.partySize !== undefined && options.partySize !== '' && Number.isFinite(Number(options.partySize))
+    ? Number(options.partySize)
+    : players.length + 1;
+  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun, {
+    partySize: partySizeForBoundary,
+    candidateTime: options.candidateTime ?? time,
+    teeSelected: options.teeSelected ?? null,
+  });
+  const expectedPlayersCount = players.length;
   const boundary = confirmResult.prebookBoundary || {};
   const formValidated = boundary.prebookBoundaryReached === true;
   if (dryRun) {
@@ -3414,7 +3518,7 @@ async function tryBookTime(
       prebookBoundary: boundary,
       result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
       playersFilled: confirmResult.filled,
-      playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+      playersRequested: players,
       confirmationText: confirmResult.confirmationText,
       skippedReason: confirmResult.skippedReason,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -3442,7 +3546,7 @@ async function tryBookTime(
       verification.confirmed &&
       !confirmationBlocked(confirmResult.confirmationText),
     playersFilled: confirmResult.filled,
-    playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+    playersRequested: players,
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
     fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -3540,6 +3644,7 @@ async function executeReleaseBooking(
   dryRun = false,
   skipClick = false,
   clickDeltaOverride = null,
+  options = {},
 ) {
   // Click already executed in page context (skipClick=true for release mode)
   // clickDeltaOverride contains the fireLatencyMs from MutationObserver
@@ -3557,7 +3662,11 @@ async function executeReleaseBooking(
   }
   
   // Always run the normal booking flow to fill players (if any) and confirm
-  const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun);
+  const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun, {
+    partySize: options.partySize ?? additionalPlayers.length + 1,
+    candidateTime: options.candidateTime ?? null,
+    teeSelected: options.teeSelected ?? null,
+  });
   const playersFilled = confirmResult.filled || [];
   if (dryRun) {
     const boundary = confirmResult.prebookBoundary || {};
@@ -3571,7 +3680,7 @@ async function executeReleaseBooking(
       result: reached ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
       confirmationText: confirmResult.confirmationText,
       playersFilled,
-      playersRequested: additionalPlayers.slice(0, Math.min(Number(openSlots) || 0, 3)),
+      playersRequested: additionalPlayers,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs: fireLatencyMs,
       verificationSignal: reached ? 'dry-run-prebook-boundary' : boundary.error,
@@ -3750,7 +3859,7 @@ async function tryDirectBookingHref(
   page,
   candidate,
   players = [],
-  openSlots = 3,
+  openSlots = null,
   targetFireTime = Date.now(),
   jobId = null,
   dryRun = false,
@@ -3803,8 +3912,15 @@ async function tryDirectBookingHref(
   }
 
   const bookingFormReachedMs = Date.now();
-  const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
-  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
+  const capacityForPlayers = normalizeCapacityValue(openSlots);
+  const partySizeForBoundary = candidate?.partySize !== null && candidate?.partySize !== undefined && candidate?.partySize !== '' && Number.isFinite(Number(candidate?.partySize))
+    ? Number(candidate.partySize)
+    : players.length + 1;
+  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun, {
+    partySize: partySizeForBoundary,
+    candidateTime: candidate?.time ?? null,
+    teeSelected: candidate?.tee ?? null,
+  });
   if (dryRun) {
     const boundary = confirmResult.prebookBoundary || {};
     const formValidated = boundary.prebookBoundaryReached === true;
@@ -3819,7 +3935,7 @@ async function tryDirectBookingHref(
       error: formValidated ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
       confirmationText: confirmResult.confirmationText,
       playersFilled: confirmResult.filled,
-      playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+      playersRequested: players,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs,
       navigationMs,
@@ -3830,7 +3946,7 @@ async function tryDirectBookingHref(
     };
   }
 
-  const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
+  const expectedPlayersCount = players.length;
   const verification = await verifyBookingConfirmation(page, time, 8000);
   if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
     verification.confirmed = false;
@@ -3846,7 +3962,7 @@ async function tryDirectBookingHref(
       verification.confirmed &&
       !confirmationBlocked(confirmResult.confirmationText),
     playersFilled: confirmResult.filled,
-    playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+    playersRequested: players,
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
     fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -4019,6 +4135,38 @@ function confirmationBlocked(confirmationText) {
     'players-missing-before-confirm',
     'insufficient-open-slots',
   ].includes(confirmationText);
+}
+
+function normalizeTeeEvidence(value) {
+  if (value === null || value === undefined || value === '') return null;
+  return String(value).includes('10') ? 10 : 1;
+}
+
+function validateProofBoundaryConsistency(job, result) {
+  const boundary = result?.prebookBoundary || result?.prebook_boundary || null;
+  const candidateTime = normalizeTimeLabel(boundary?.candidateTime);
+  const bookedTime = normalizeTimeLabel(result?.bookedTime);
+  const expectedTime = normalizeTimeLabel(job?.proof_candidate_time);
+  const boundaryTee = normalizeTeeEvidence(boundary?.teeSelected);
+  const resultTee = normalizeTeeEvidence(result?.teeSelected);
+  const expectedTee = normalizeTeeEvidence(job?.proof_candidate_tee);
+
+  if (!candidateTime || !boundaryTee) {
+    return { ok: false, error: 'proof-boundary-missing-candidate-evidence' };
+  }
+  if (bookedTime && candidateTime !== bookedTime) {
+    return { ok: false, error: 'proof-boundary-candidate-time-mismatch' };
+  }
+  if (expectedTime && candidateTime !== expectedTime) {
+    return { ok: false, error: 'proof-boundary-proof-candidate-time-mismatch' };
+  }
+  if (resultTee && boundaryTee !== resultTee) {
+    return { ok: false, error: 'proof-boundary-tee-mismatch' };
+  }
+  if (expectedTee && boundaryTee !== expectedTee) {
+    return { ok: false, error: 'proof-boundary-proof-candidate-tee-mismatch' };
+  }
+  return { ok: true, error: null };
 }
 
 function preferredSlotRank(timeLabel, preferredLabels, nearestWindowMinutes = Number.POSITIVE_INFINITY) {
@@ -4394,7 +4542,11 @@ async function runBooking(config) {
       console.log(`[BOOKING] Fire time UTC: ${new Date(targetFireTime).toISOString()}`);
     }
     console.log(`[BOOKING] Current UK time: ${DateTime.now().setZone(CONFIG.TZ_LONDON).toISO()}`);
-    runId = preparedRunId || await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
+    runId = await resolveRunLogId({
+      preparedRunId,
+      sourcePath,
+      createRun: () => fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started'),
+    });
     notes.push(
       `source=${sourcePath}; target=${targetDateStr}; tee=${normalizedTeeTarget}; preferred=${normalizedPreferredTimes.join(',')}; party=${slotPolicy.partySize}`,
     );
@@ -4463,9 +4615,7 @@ async function runBooking(config) {
         time: slot.time,
         state: slot.state,
         href: slot.href,
-        openSlots: Number.isFinite(Number(slot.openSlots))
-          ? Number(slot.openSlots)
-          : null,
+        openSlots: normalizeCapacityValue(slot.openSlots),
       }));
     };
     let bookingSlots = Array.isArray(slotsData) ? [...slotsData] : [];
@@ -4485,10 +4635,11 @@ async function runBooking(config) {
         (Array.isArray(slots) ? slots : [])
           .filter((slot) => {
             if (!slot?.time) return false;
-            if (desiredPartySize > 1 && !Number.isFinite(Number(slot.openSlots))) {
+            const slotOpenSlots = normalizeCapacityValue(slot.openSlots);
+            if (desiredPartySize > 1 && slotOpenSlots === null) {
               return false;
             }
-            if (Number.isFinite(Number(slot.openSlots)) && Number(slot.openSlots) < desiredPartySize) {
+            if (slotOpenSlots !== null && slotOpenSlots < desiredPartySize) {
               return false;
             }
             return !bookableOnly || slot.state === 'bookable' || !!slot.href;
@@ -4622,6 +4773,11 @@ async function runBooking(config) {
             targetFireTime,
             jobId,
             dryRun,
+            {
+              partySize: desiredPartySize,
+              candidateTime: time,
+              teeSelected: teeCtx?.teeTarget ?? normalizedTeeTarget,
+            },
           );
           if (bookingResult && bookingResult.booked) {
             bookedTime = time;
@@ -4743,6 +4899,7 @@ async function runBooking(config) {
               ...candidate,
               date: targetDateStr,
               tee: teeCtx?.teeTarget ?? normalizedTeeTarget,
+              partySize: desiredPartySize,
             };
             const evaluation = evaluateSlotCandidate(slotPolicy, candidateWithContext);
             console.log(
@@ -4755,13 +4912,15 @@ async function runBooking(config) {
               continue;
             }
             const slotInfo = bookingSlots.find((slot) => slot.time === candidate.time);
+            const candidateOpenSlots = normalizeCapacityValue(candidate.openSlots);
+            const slotInfoOpenSlots = normalizeCapacityValue(slotInfo?.openSlots);
             const openSlots =
-              Number.isFinite(Number(candidate.openSlots)) && Number(candidate.openSlots) > 0
-                ? Number(candidate.openSlots)
-                : slotInfo && slotInfo.openSlots > 0
-                  ? slotInfo.openSlots
+              candidateOpenSlots !== null && candidateOpenSlots > 0
+                ? candidateOpenSlots
+                : slotInfoOpenSlots !== null && slotInfoOpenSlots > 0
+                  ? slotInfoOpenSlots
                   : null;
-            if (desiredPartySize > 1 && !Number.isFinite(Number(openSlots))) {
+            if (desiredPartySize > 1 && openSlots === null) {
               notes.push(`Rejected direct candidate ${candidate.time}: capacity-unproven`);
               continue;
             }
@@ -4990,6 +5149,7 @@ async function runBooking(config) {
             href: releaseResult.href,
             date: targetDateStr,
             tee: teeCtx?.teeTarget ?? normalizedTeeTarget,
+            partySize: desiredPartySize,
           },
           additionalPlayers,
           desiredPartySize,

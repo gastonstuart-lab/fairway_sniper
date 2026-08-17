@@ -124,6 +124,7 @@ test('proof dry-run surfaces pre-book boundary and one-click UI action', () => {
 test('runtime diagnostics expose effective prep lead', () => {
   assert(agentSource.includes('sniperPrepLeadMs'));
   assert(agentSource.includes('getPrepLeadMs()'));
+  assert.equal(agentSource.match(/sniperPrepLeadMs:/g)?.length, 1);
 });
 
 test('fire callback captures drift before asynchronous diagnostics', () => {
@@ -144,4 +145,24 @@ test('fire hot path does not await diagnostic writes before booking starts', () 
   assert(hotPath.includes("void fsAddJobEvent(jobId, 'BOOKING_STARTED'"));
   assert(!hotPath.includes("await fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED'"));
   assert(!hotPath.includes("await fsAddJobEvent(jobId, 'BOOKING_STARTED'"));
+});
+
+test('scheduled fire path uses nonblocking run-log resolver', () => {
+  assert(agentSource.includes("sourcePath !== 'firestore-runner'") === false);
+  assert(agentSource.includes('resolveRunLogId'));
+  assert(agentSource.includes("sourcePath: 'firestore-runner'"));
+});
+
+test('safe availability endpoint returns server-normalized proof candidates with capacity', () => {
+  assert(agentSource.includes('partySizeForProof'));
+  assert(agentSource.includes('safeProofCandidates'));
+  assert(agentSource.includes('filterSafeProofCandidates'));
+  assert(agentSource.includes('normalizeSafeAvailabilityFromTeeData'));
+});
+
+test('proof success requires reached candidate to match expected proof candidate', () => {
+  assert(agentSource.includes('validateProofBoundaryConsistency'));
+  assert(agentSource.includes('proof-boundary-proof-candidate-time-mismatch'));
+  assert(agentSource.includes('proof-boundary-proof-candidate-tee-mismatch'));
+  assert.match(agentSource, /reachedDryRunBoundary =[\s\S]*boundaryConsistency\.ok/);
 });

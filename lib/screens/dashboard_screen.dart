@@ -240,6 +240,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             'teeMode': template.teeMode,
             'teeTarget': template.teeTarget,
             'includeUnavailable': false,
+            'partySize': template.partySize ?? template.players.length + 1,
           }),
         )
         .timeout(const Duration(minutes: 3));
@@ -255,21 +256,37 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final partySize = template.partySize ?? template.players.length + 1;
     final preferred = template.preferredTimes.toSet();
     SafeProofCandidate? fallback;
+    final preferredTee = template.teeTarget == 10 ? 10 : 1;
+    final teeKey = preferredTee == 10 ? 'tee10' : 'tee1';
+    bool isBookableSlot(Map<String, dynamic> slot) {
+      final state = slot['state']?.toString().toLowerCase();
+      final bookable = slot['bookable'];
+      final href = slot['href']?.toString();
+      return state == 'bookable' &&
+          bookable == true &&
+          href != null &&
+          href.isNotEmpty;
+    }
+
     for (final rawDay in days.whereType<Map>()) {
       final day = rawDay.cast<String, dynamic>();
       final date = day['date']?.toString();
       if (date == null || date.isEmpty) continue;
-      final teeKey = template.teeTarget == 10 ? 'tee10' : 'tee1';
       final teeData = day[teeKey];
-      final slots = (day['slots'] is List)
-          ? day['slots'] as List
-          : (teeData is Map && teeData['slots'] is List)
-              ? teeData['slots'] as List
-              : const [];
+      final slots = (teeData is Map && teeData['safeProofCandidates'] is List)
+          ? teeData['safeProofCandidates'] as List
+          : (day['safeProofCandidates'] is List)
+              ? day['safeProofCandidates'] as List
+              : (day['slots'] is List)
+                  ? day['slots'] as List
+                  : (teeData is Map && teeData['slots'] is List)
+                      ? teeData['slots'] as List
+                      : const [];
       for (final rawSlot in slots.whereType<Map>()) {
         final slot = rawSlot.cast<String, dynamic>();
         final time = slot['time']?.toString();
         if (time == null || time.isEmpty) continue;
+        if (!isBookableSlot(slot)) continue;
         final openSlots = _slotOpenSlots(slot);
         if (partySize > 1 && (openSlots == null || openSlots < partySize)) {
           continue;
@@ -277,7 +294,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         final candidate = SafeProofCandidate(
           date: date,
           time: time,
-          tee: template.teeTarget,
+          tee: preferredTee,
         );
         if (date == template.targetDate && preferred.contains(time)) {
           return candidate;

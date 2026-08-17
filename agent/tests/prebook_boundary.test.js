@@ -147,6 +147,65 @@ test('insufficient capacity fails the proof boundary', () => {
   assert.equal(boundary.error, 'insufficient-capacity');
 });
 
+test('four-player prebook boundary passes with three additional players and four open slots', async () => {
+  const boundary = await validatePrebookBoundary(fakePage(), {
+    players: ['101', '202', '303'],
+    partySize: 4,
+    openSlots: 4,
+    confirmResult: { filled: ['101', '202', '303'] },
+    candidateTime: '11:12',
+    teeSelected: 1,
+  });
+
+  assert.equal(boundary.prebookBoundaryReached, true);
+  assert.equal(boundary.result, DRY_RUN_PREBOOK_REACHED);
+  assert.equal(boundary.openSlots, 4);
+  assert.equal(boundary.partySize, 4);
+  assert.deepEqual(boundary.playersExpected, ['101', '202', '303']);
+});
+
+test('four-player prebook boundary rejects three open slots', async () => {
+  const boundary = await validatePrebookBoundary(fakePage(), {
+    players: ['101', '202', '303'],
+    partySize: 4,
+    openSlots: 3,
+    confirmResult: { filled: ['101', '202', '303'] },
+    candidateTime: '11:12',
+    teeSelected: 1,
+  });
+
+  assert.equal(boundary.prebookBoundaryReached, false);
+  assert.equal(boundary.error, 'insufficient-capacity');
+});
+
+test('four-player prebook boundary rejects unknown capacity', async () => {
+  const boundary = await validatePrebookBoundary(fakePage(), {
+    players: ['101', '202', '303'],
+    partySize: 4,
+    openSlots: null,
+    confirmResult: { filled: ['101', '202', '303'] },
+    candidateTime: '11:12',
+    teeSelected: 1,
+  });
+
+  assert.equal(boundary.prebookBoundaryReached, false);
+  assert.equal(boundary.error, 'capacity-unproven');
+});
+
+test('four-player prebook boundary rejects missing additional player', async () => {
+  const boundary = await validatePrebookBoundary(fakePage(), {
+    players: ['101', '202'],
+    partySize: 4,
+    openSlots: 4,
+    confirmResult: { filled: ['101', '202'] },
+    candidateTime: '11:12',
+    teeSelected: 1,
+  });
+
+  assert.equal(boundary.prebookBoundaryReached, false);
+  assert.equal(boundary.error, 'players-missing-before-confirm');
+});
+
 test('global Book button outside member booking form is rejected', async () => {
   const boundary = await validatePrebookBoundary(
     fakePage({ formVisible: false, globalBookVisible: true }),
@@ -193,7 +252,7 @@ test('all dry-run booking routes use shared pre-book boundary semantics', () => 
 });
 
 test('failed proof cannot emit BOOKING_SUCCESS', () => {
-  assert.match(agentSource, /const reachedDryRunBoundary = result\?\.result === 'DRY_RUN_PREBOOK_REACHED'/);
+  assert.match(agentSource, /const reachedDryRunBoundary =[\s\S]*result\?\.result === 'DRY_RUN_PREBOOK_REACHED'[\s\S]*boundaryConsistency\.ok/);
   assert.match(agentSource, /fsAddJobEvent\(jobId, reachedDryRunBoundary \? 'PROOF_SUCCESS' : 'PROOF_FAILED'/);
   assert.match(agentSource, /isSuccess \? 'BOOKING_SUCCESS' : 'BOOKING_FAILED'/);
 });
@@ -202,4 +261,11 @@ test('successful proof emits dry-run boundary and proof success events', () => {
   assert(agentSource.includes("'DRY_RUN_PREBOOK_REACHED'"));
   assert(agentSource.includes("'PROOF_SUCCESS'"));
   assert(agentSource.includes('result: DRY_RUN_PREBOOK_REACHED'));
+});
+
+test('production dry-run passes candidate time and tee into prebook boundary', () => {
+  assert.match(agentSource, /candidateTime: options\.candidateTime \?\? time/);
+  assert.match(agentSource, /teeSelected: options\.teeSelected \?\? null/);
+  assert.match(agentSource, /candidateTime: candidate\?\.time \?\? null/);
+  assert.match(agentSource, /teeSelected: candidate\?\.tee \?\? null/);
 });

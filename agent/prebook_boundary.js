@@ -10,16 +10,24 @@ export const CONFIRM_CONTROL_SELECTOR = [
 ].join(', ');
 
 function normalizeOpenSlots(openSlots) {
-  return Number.isFinite(Number(openSlots)) ? Math.max(0, Number(openSlots)) : 3;
+  if (openSlots === null || openSlots === undefined || openSlots === '') return null;
+  return Number.isFinite(Number(openSlots)) ? Math.max(0, Number(openSlots)) : null;
 }
 
-function requestedPlayersForCapacity(players = [], openSlots = 3) {
-  return Array.isArray(players)
-    ? players.slice(0, Math.min(normalizeOpenSlots(openSlots), 3))
-    : [];
+function normalizePartySize(partySize, players = []) {
+  if (partySize !== null && partySize !== undefined && partySize !== '' && Number.isFinite(Number(partySize))) {
+    return Math.max(1, Math.min(4, Number.parseInt(partySize, 10)));
+  }
+  return Math.max(1, Math.min(4, (Array.isArray(players) ? players.length : 0) + 1));
+}
+
+function requestedPlayersForCapacity(players = []) {
+  return Array.isArray(players) ? [...players] : [];
 }
 
 function boundaryError(evidence) {
+  if (!evidence.partyPlayersValid) return 'players-missing-before-confirm';
+  if (evidence.capacityError) return evidence.capacityError;
   if (!evidence.capacityValidated) return 'insufficient-capacity';
   if (!evidence.bookingFormVisible) return 'booking-form-not-found';
   if (!evidence.playersFilledOk) return 'players-missing-before-confirm';
@@ -42,6 +50,10 @@ export function buildPrebookBoundaryEvidence({
   playersExpected = [],
   playersFilled = [],
   capacityValidated = false,
+  capacityError = null,
+  openSlots = null,
+  partySize = 1,
+  partyPlayersValid = true,
   verificationUrl = null,
   candidateTime = null,
   teeSelected = null,
@@ -63,6 +75,10 @@ export function buildPrebookBoundaryEvidence({
     playersFilled: filled,
     playersFilledOk,
     capacityValidated: Boolean(capacityValidated),
+    capacityError,
+    openSlots,
+    partySize,
+    partyPlayersValid: Boolean(partyPlayersValid),
     verificationUrl,
     candidateTime,
     teeSelected,
@@ -114,7 +130,8 @@ export async function validatePrebookBoundary(
   page,
   {
     players = [],
-    openSlots = 3,
+    openSlots = null,
+    partySize = null,
     confirmResult = {},
     candidateTime = null,
     teeSelected = null,
@@ -122,10 +139,18 @@ export async function validatePrebookBoundary(
   } = {},
 ) {
   const normalizedOpenSlots = normalizeOpenSlots(openSlots);
-  const playersExpected = requestedPlayersForCapacity(players, normalizedOpenSlots);
+  const normalizedPartySize = normalizePartySize(partySize, players);
+  const playersExpected = requestedPlayersForCapacity(players);
+  const partyPlayersValid = playersExpected.length === normalizedPartySize - 1;
+  const computedCapacityError =
+    normalizedOpenSlots === null && normalizedPartySize > 1
+      ? 'capacity-unproven'
+      : normalizedOpenSlots !== null && normalizedOpenSlots < normalizedPartySize
+        ? 'insufficient-capacity'
+        : null;
   const computedCapacityValidated =
     capacityValidated === null || capacityValidated === undefined
-      ? (Array.isArray(players) ? players.length : 0) <= normalizedOpenSlots
+      ? computedCapacityError === null
       : Boolean(capacityValidated);
 
   const bookingFormVisible = await page
@@ -143,6 +168,10 @@ export async function validatePrebookBoundary(
     playersExpected,
     playersFilled: confirmResult.filled || [],
     capacityValidated: computedCapacityValidated,
+    capacityError: computedCapacityError,
+    openSlots: normalizedOpenSlots,
+    partySize: normalizedPartySize,
+    partyPlayersValid,
     verificationUrl: page.url(),
     candidateTime,
     teeSelected,
