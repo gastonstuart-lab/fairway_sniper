@@ -1,0 +1,185 @@
+name: apply-sniper-dashboard-ux
+
+on:
+  push:
+    branches:
+      - ui/schedule-sniper-dashboard
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ui/schedule-sniper-dashboard
+          fetch-depth: 0
+      - name: Apply focused Flutter UX changes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise SystemExit(f'missing expected source for {label}')
+              return text.replace(old, new, 1)
+
+          # 1) Sniper wizard: completing the wizard schedules the real job immediately.
+          wizard_path = Path('lib/screens/sniper_job_wizard.dart')
+          wizard = wizard_path.read_text()
+          wizard = replace_once(
+              wizard,
+              "        status: 'paused',\n        state: 'paused',",
+              "        status: 'active',\n        state: 'queued',",
+              'wizard active/queued job state',
+          )
+          wizard = replace_once(
+              wizard,
+              "? (useDebugBookNow ? 'Book Now' : 'Save Draft')",
+              "? (useDebugBookNow ? 'Book Now' : 'Schedule Sniper')",
+              'wizard final button label',
+          )
+          wizard = replace_once(
+              wizard,
+              "      Navigator.of(context).pop();\n      _showSnack(\n          'Job saved as draft / paused. It will not contact BRS until armed. ID: $id');",
+              "      _showSnack('🎯 Sniper job created. Production is arming it now… ID: $id');\n      Navigator.of(context).popUntil((route) => route.isFirst);",
+              'wizard completion navigation/message',
+          )
+          wizard = replace_once(
+              wizard,
+              "print('🔵 [WIZARD] Job status before save: ${job.status}');",
+              "print('🔵 [WIZARD] Scheduling sniper job with status: ${job.status}/${job.state}');",
+              'wizard debug status',
+          )
+          wizard_path.write_text(wizard)
+
+          # 2) BookingJob: read the authoritative PREP/FIRE timestamps written by production.
+          model_path = Path('lib/models/booking_job.dart')
+          model = model_path.read_text()
+          model = replace_once(
+              model,
+              "  final DateTime?\n      releaseWindowStart; // when tee times are expected to unlock (UTC)\n",
+              "  final DateTime?\n      releaseWindowStart; // when tee times are expected to unlock (UTC)\n  final DateTime? scheduledFor; // authoritative production FIRE timestamp\n  final DateTime? prepScheduledFor; // authoritative production PREP timestamp\n",
+              'model production timer fields',
+          )
+          model = replace_once(
+              model,
+              "    this.releaseWindowStart,\n    this.snipeStrategy,",
+              "    this.releaseWindowStart,\n    this.scheduledFor,\n    this.prepScheduledFor,\n    this.snipeStrategy,",
+              'model constructor timer fields',
+          )
+          model = replace_once(
+              model,
+              "      releaseWindowStart: json['release_window_start'] is Timestamp\n          ? (json['release_window_start'] as Timestamp).toDate()\n          : null,\n      snipeStrategy:",
+              "      releaseWindowStart: json['release_window_start'] is Timestamp\n          ? (json['release_window_start'] as Timestamp).toDate()\n          : null,\n      scheduledFor: json['scheduled_for'] is Timestamp\n          ? (json['scheduled_for'] as Timestamp).toDate()\n          : null,\n      prepScheduledFor: json['prep_scheduled_for'] is Timestamp\n          ? (json['prep_scheduled_for'] as Timestamp).toDate()\n          : null,\n      snipeStrategy:",
+              'model fromJson timer fields',
+          )
+          model = replace_once(
+              model,
+              "    DateTime? releaseWindowStart,\n    Map<String, dynamic>? snipeStrategy,",
+              "    DateTime? releaseWindowStart,\n    DateTime? scheduledFor,\n    DateTime? prepScheduledFor,\n    Map<String, dynamic>? snipeStrategy,",
+              'model copyWith timer params',
+          )
+          model = replace_once(
+              model,
+              "        releaseWindowStart: releaseWindowStart ?? this.releaseWindowStart,\n        snipeStrategy:",
+              "        releaseWindowStart: releaseWindowStart ?? this.releaseWindowStart,\n        scheduledFor: scheduledFor ?? this.scheduledFor,\n        prepScheduledFor: prepScheduledFor ?? this.prepScheduledFor,\n        snipeStrategy:",
+              'model copyWith timer values',
+          )
+          model_path.write_text(model)
+
+          # 3) Dashboard: truthful lifecycle, automatic live-job presentation, production times.
+          dash_path = Path('lib/screens/dashboard_screen.dart')
+          dash = dash_path.read_text()
+          dash = replace_once(
+              dash,
+              "import 'package:fairway_sniper/services/safe_proof_status.dart';\n",
+              "import 'package:fairway_sniper/services/safe_proof_status.dart';\nimport 'package:fairway_sniper/services/sniper_job_status.dart';\n",
+              'dashboard status helper import',
+          )
+
+          label_pattern = re.compile(r"  String _sniperStateLabel\(BookingJob job\) \{.*?\n  \}\n\n  DateTime _getNextSaturday", re.S)
+          match = label_pattern.search(dash)
+          if not match:
+              raise SystemExit('missing dashboard sniper label function')
+          dash = dash[:match.start()] + "  String _sniperStateLabel(BookingJob job) => sniperLifecycleLabel(job);\n\n  DateTime _getNextSaturday" + dash[match.end():]
+
+          dash = replace_once(
+              dash,
+              "  Widget _buildJobsList(List<BookingJob> jobs) {\n    return Column(",
+              "  Widget _buildJobsList(List<BookingJob> jobs) {\n    final displayJobs = jobs.where((job) => !job.proofRun).toList();\n    final liveCount = displayJobs.where((job) {\n      if (job.bookingMode == BookingMode.sniper) return isLiveSniperJob(job);\n      return job.status == 'active';\n    }).length;\n    return Column(",
+              'dashboard jobs filter/count',
+          )
+          dash = replace_once(
+              dash,
+              "              '${jobs.where((j) => j.status == 'active').length}',",
+              "              '$liveCount',",
+              'dashboard live count',
+          )
+          dash = replace_once(dash, "        if (jobs.isEmpty)\n", "        if (displayJobs.isEmpty)\n", 'dashboard empty jobs')
+          dash = replace_once(dash, "          ...jobs.map((job) => _buildJobCard(job)),", "          ...displayJobs.map((job) => _buildJobCard(job)),", 'dashboard displayed jobs')
+          dash = replace_once(
+              dash,
+              "    final bookingFireTime = job.nextFireTimeUtc ?? job.releaseWindowStart;",
+              "    final bookingFireTime =\n        job.scheduledFor ?? job.nextFireTimeUtc ?? job.releaseWindowStart;",
+              'dashboard authoritative fire time',
+          )
+          dash = replace_once(
+              dash,
+              "    final isSniper = job.bookingMode == BookingMode.sniper;\n    final headerColor = isSniper",
+              "    final isSniper = job.bookingMode == BookingMode.sniper;\n    final isLiveJob =\n        isSniper ? isLiveSniperJob(job) : job.status == 'active';\n    final isScheduledSniper = isSniper && isProductionScheduledSniper(job);\n    final headerColor = isSniper",
+              'dashboard live/scheduled flags',
+          )
+
+          card_start = dash.index('  Widget _buildJobCard(BookingJob job) {')
+          card_end = dash.index('  DateTime? _getTargetDateTime(BookingJob job) {', card_start)
+          card = dash[card_start:card_end]
+          card = card.replace("job.status == 'active'", 'isLiveJob')
+          card = card.replace("job.status != 'active'", '!isLiveJob')
+
+          toggle_pattern = re.compile(r"                        // Toggle Active/Pause button\n.*?                        // Delete button", re.S)
+          toggle_match = toggle_pattern.search(card)
+          if not toggle_match:
+              raise SystemExit('missing dashboard toggle block')
+          replacement = """                        // New sniper jobs schedule automatically. Only legacy paused\n                        // sniper jobs retain a manual recovery arm action.\n                        if (isSniper &&\n                            (job.state ?? '').toLowerCase() == 'paused')\n                          IconButton(\n                            icon: const Icon(Icons.play_circle,\n                                color: Colors.green, size: 28),\n                            tooltip: 'Arm Sniper',\n                            onPressed: () async {\n                              await _firebaseService.updateJob(\n                                job.id!,\n                                const <String, dynamic>{\n                                  'status': 'active',\n                                  'state': 'queued',\n                                },\n                              );\n                              try {\n                                final message =\n                                    await _verifyProductionAgentCanSeeJob(job.id!);\n                                if (!context.mounted) return;\n                                ScaffoldMessenger.of(context).showSnackBar(\n                                  SnackBar(\n                                    content: Text(message),\n                                    duration: const Duration(seconds: 6),\n                                  ),\n                                );\n                              } catch (e) {\n                                if (!context.mounted) return;\n                                ScaffoldMessenger.of(context).showSnackBar(\n                                  SnackBar(\n                                    content: Text(\n                                      'Sniper needs attention: production did not confirm it: $e',\n                                    ),\n                                    backgroundColor: Colors.red.shade700,\n                                    duration: const Duration(seconds: 12),\n                                  ),\n                                );\n                              }\n                            },\n                          )\n                        else if (isSniper)\n                          IconButton(\n                            icon: Icon(\n                              isScheduledSniper\n                                  ? Icons.verified\n                                  : Icons.schedule,\n                              color: isScheduledSniper\n                                  ? Colors.green\n                                  : Colors.orange,\n                              size: 28,\n                            ),\n                            tooltip: isScheduledSniper\n                                ? 'Sniper scheduled in production'\n                                : 'Sniper is arming in production',\n                            onPressed: null,\n                          )\n                        else\n                          IconButton(\n                            icon: Icon(\n                              isLiveJob\n                                  ? Icons.pause_circle\n                                  : Icons.play_circle,\n                              color: isLiveJob\n                                  ? Colors.orange\n                                  : Colors.green,\n                              size: 28,\n                            ),\n                            tooltip: isLiveJob ? 'Pause Job' : 'Activate Job',\n                            onPressed: () async {\n                              final patch = isLiveJob\n                                  ? const <String, dynamic>{\n                                      'status': 'paused',\n                                      'state': 'paused',\n                                    }\n                                  : const <String, dynamic>{\n                                      'status': 'active',\n                                      'state': 'active',\n                                    };\n                              await _firebaseService.updateJob(job.id!, patch);\n                            },\n                          ),\n                        // Delete button"""
+          card = card[:toggle_match.start()] + replacement + card[toggle_match.end():]
+
+          callout_marker = """                  const SizedBox(height: 16),\n                  // Only show countdown for Sniper mode (Normal mode books immediately)"""
+          callout = """                  const SizedBox(height: 16),\n                  if (isSniper) ...[\n                    Container(\n                      width: double.infinity,\n                      padding: const EdgeInsets.all(14),\n                      decoration: BoxDecoration(\n                        color: (isScheduledSniper ? Colors.green : Colors.orange)\n                            .withValues(alpha: 0.10),\n                        borderRadius: BorderRadius.circular(10),\n                        border: Border.all(\n                          color: (isScheduledSniper ? Colors.green : Colors.orange)\n                              .withValues(alpha: 0.35),\n                        ),\n                      ),\n                      child: Column(\n                        crossAxisAlignment: CrossAxisAlignment.start,\n                        children: [\n                          Text(\n                            isScheduledSniper\n                                ? '🎯 SNIPER SCHEDULED'\n                                : 'Arming sniper…',\n                            style: TextStyle(\n                              fontWeight: FontWeight.bold,\n                              color: isScheduledSniper\n                                  ? Colors.green.shade700\n                                  : Colors.orange.shade800,\n                            ),\n                          ),\n                          const SizedBox(height: 4),\n                          Text(\n                            isScheduledSniper\n                                ? 'Production has registered the PREP and FIRE schedule.'\n                                : 'Waiting for production to confirm the PREP and FIRE timers.',\n                            style: TextStyle(fontSize: 12, color: subtextColor),\n                          ),\n                          if (job.prepScheduledFor != null) ...[\n                            const SizedBox(height: 8),\n                            Text(\n                              'PREP: ${DateFormat('EEE d MMM, h:mm:ss a').format(job.prepScheduledFor!.toLocal())} (your time)',\n                              style: TextStyle(\n                                  fontSize: 12,\n                                  fontWeight: FontWeight.w600,\n                                  color: textColor),\n                            ),\n                          ],\n                          if (bookingFireTime != null) ...[\n                            const SizedBox(height: 3),\n                            Text(\n                              'FIRE: ${DateFormat('EEE d MMM, h:mm:ss a').format(bookingFireTime.toLocal())} (your time)',\n                              style: TextStyle(\n                                  fontSize: 12,\n                                  fontWeight: FontWeight.w600,\n                                  color: textColor),\n                            ),\n                          ],\n                        ],\n                      ),\n                    ),\n                    const SizedBox(height: 14),\n                  ],\n                  // Only show countdown for Sniper mode (Normal mode books immediately)"""
+          if callout_marker not in card:
+              raise SystemExit('missing dashboard sniper callout marker')
+          card = card.replace(callout_marker, callout, 1)
+          card = card.replace("'Countdown to Booking Time'", "'Fires in'", 1)
+          card = card.replace("'${job.releaseDay} at ${job.releaseTimeLocal}'", "'FIRE / release: ${job.releaseDay} at ${job.releaseTimeLocal} UK'", 1)
+          card = card.replace("if (!isLiveJob)\n                  Padding(", "if ((job.state ?? '').toLowerCase() == 'paused')\n                  Padding(", 1)
+          card = card.replace("'Job Paused'", "'Sniper paused — arm it to schedule'", 1)
+
+          dash = dash[:card_start] + card + dash[card_end:]
+          dash_path.write_text(dash)
+
+          # 4) Tests for the new lifecycle semantics and wizard contract.
+          test_status = Path('test/services/sniper_job_status_test.dart')
+          test_status.parent.mkdir(parents=True, exist_ok=True)
+          test_status.write_text("""import 'package:flutter_test/flutter_test.dart';\nimport 'package:fairway_sniper/models/booking_job.dart';\nimport 'package:fairway_sniper/services/sniper_job_status.dart';\n\nBookingJob sniperJob({\n  String status = 'active',\n  String? state = 'queued',\n  bool productionTimes = false,\n}) {\n  final fire = DateTime.utc(2026, 8, 18, 18, 20);\n  return BookingJob(\n    ownerUid: 'owner',\n    brsEmail: '',\n    brsPassword: '',\n    club: 'galgorm',\n    timezone: 'Europe/London',\n    releaseDay: 'Tuesday',\n    releaseTimeLocal: '19:20',\n    targetDay: 'Saturday',\n    preferredTimes: const ['11:12'],\n    players: const ['16524', '14481', '730'],\n    partySize: 4,\n    bookingMode: BookingMode.sniper,\n    status: status,\n    state: state,\n    scheduledFor: productionTimes ? fire : null,\n    prepScheduledFor:\n        productionTimes ? fire.subtract(const Duration(minutes: 4)) : null,\n  );\n}\n\nvoid main() {\n  test('queued sniper is arming, not falsely scheduled', () {\n    final job = sniperJob();\n    expect(sniperLifecycleLabel(job), 'Arming Sniper…');\n    expect(isProductionScheduledSniper(job), isFalse);\n    expect(isLiveSniperJob(job), isTrue);\n  });\n\n  test('production confirmed with both timestamps is scheduled', () {\n    final job = sniperJob(\n      status: 'running',\n      state: 'production_confirmed',\n      productionTimes: true,\n    );\n    expect(sniperLifecycleLabel(job), 'Sniper Scheduled');\n    expect(isProductionScheduledSniper(job), isTrue);\n    expect(isLiveSniperJob(job), isTrue);\n  });\n\n  test('warming and ready expose truthful lifecycle labels', () {\n    expect(\n      sniperLifecycleLabel(sniperJob(status: 'running', state: 'warming')),\n      'Warming BRS',\n    );\n    expect(\n      sniperLifecycleLabel(sniperJob(status: 'running', state: 'ready')),\n      'Ready — Waiting for FIRE',\n    );\n  });\n\n  test('finished and failed jobs are not live', () {\n    final finished = sniperJob(status: 'finished', state: 'finished');\n    final failed = sniperJob(status: 'error', state: 'error');\n    expect(sniperLifecycleLabel(finished), 'Booked');\n    expect(sniperLifecycleLabel(failed), 'Failed / Needs Attention');\n    expect(isLiveSniperJob(finished), isFalse);\n    expect(isLiveSniperJob(failed), isFalse);\n  });\n\n  test('paused legacy sniper remains recoverable but not live', () {\n    final job = sniperJob(status: 'paused', state: 'paused');\n    expect(sniperLifecycleLabel(job), 'Paused');\n    expect(isLiveSniperJob(job), isFalse);\n  });\n}\n""")
+
+          test_wizard = Path('test/screens/sniper_wizard_schedule_contract_test.dart')
+          test_wizard.parent.mkdir(parents=True, exist_ok=True)
+          test_wizard.write_text("""import 'dart:io';\n\nimport 'package:flutter_test/flutter_test.dart';\n\nvoid main() {\n  test('sniper wizard schedules real jobs instead of saving paused drafts', () {\n    final source =\n        File('lib/screens/sniper_job_wizard.dart').readAsStringSync();\n    expect(source, contains(\"status: 'active'\"));\n    expect(source, contains(\"state: 'queued'\"));\n    expect(source, contains(\"'Schedule Sniper'\"));\n    expect(source, contains('popUntil((route) => route.isFirst)'));\n    expect(source, isNot(contains('Job saved as draft / paused')));\n  });\n}\n""")
+          PY
+      - name: Commit generated focused changes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add lib test
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Schedule sniper jobs automatically and surface production state"
+          git push origin HEAD:ui/schedule-sniper-dashboard
