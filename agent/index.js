@@ -14,6 +14,10 @@ import {
   evaluateSlotCandidate,
 } from './slot_policy.js';
 import { getEntryOpenSlots } from './tee_data_policy.js';
+import {
+  DRY_RUN_PREBOOK_REACHED,
+  validatePrebookBoundary,
+} from './prebook_boundary.js';
 import os from 'os';
 import crypto from 'crypto';
 
@@ -3088,7 +3092,16 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
 
   if (dryRun) {
     console.log('  💤 Dry-run enabled: skipping Create Booking click');
-    result.confirmationText = 'dry-run-no-confirm';
+    const boundary = await validatePrebookBoundary(page, {
+      players,
+      openSlots: normalizedOpenSlots,
+      confirmResult: result,
+      capacityValidated: players.length <= normalizedOpenSlots,
+    });
+    result.prebookBoundary = boundary;
+    result.confirmationText = boundary.prebookBoundaryReached
+      ? DRY_RUN_PREBOOK_REACHED
+      : boundary.error;
     return result;
   }
 
@@ -3257,18 +3270,22 @@ async function tryBookTime(
     const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
     const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
     const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
-    const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+    const boundary = confirmResult.prebookBoundary || {};
+    const formValidated = boundary.prebookBoundaryReached === true;
     if (dryRun) {
       return {
         booked: false,
         dryRun: true,
         formValidated,
+        prebookBoundaryReached: formValidated,
+        prebookBoundary: boundary,
+        result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
         playersFilled: confirmResult.filled,
         playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
         confirmationText: confirmResult.confirmationText,
         skippedReason: confirmResult.skippedReason,
         fieldDiagnostics: confirmResult.fieldDiagnostics,
-        error: formValidated ? null : 'dry-run-players-missing',
+        error: formValidated ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
       };
     }
     const rowBooked =
@@ -3310,19 +3327,23 @@ async function tryBookTime(
   const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
   const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
   const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
-  const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+  const boundary = confirmResult.prebookBoundary || {};
+  const formValidated = boundary.prebookBoundaryReached === true;
   if (dryRun) {
     return {
       booked: false,
       dryRun: true,
       formValidated,
+      prebookBoundaryReached: formValidated,
+      prebookBoundary: boundary,
+      result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
       playersFilled: confirmResult.filled,
       playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
       confirmationText: confirmResult.confirmationText,
       skippedReason: confirmResult.skippedReason,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs,
-      error: formValidated ? null : 'dry-run-players-missing',
+      error: formValidated ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
     };
   }
 
@@ -3462,6 +3483,26 @@ async function executeReleaseBooking(
   // Always run the normal booking flow to fill players (if any) and confirm
   const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun);
   const playersFilled = confirmResult.filled || [];
+  if (dryRun) {
+    const boundary = confirmResult.prebookBoundary || {};
+    const reached = boundary.prebookBoundaryReached === true;
+    return {
+      booked: false,
+      dryRun: true,
+      formValidated: reached,
+      prebookBoundaryReached: reached,
+      prebookBoundary: boundary,
+      result: reached ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
+      confirmationText: confirmResult.confirmationText,
+      playersFilled,
+      playersRequested: additionalPlayers.slice(0, Math.min(Number(openSlots) || 0, 3)),
+      fieldDiagnostics: confirmResult.fieldDiagnostics,
+      clickDeltaMs: fireLatencyMs,
+      verificationSignal: reached ? 'dry-run-prebook-boundary' : boundary.error,
+      verificationUrl: boundary.verificationUrl || page.url(),
+      error: reached ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
+    };
+  }
   // Wait for confirmation
   let confirmationText = confirmResult.confirmationText || '';
   let booked = false;
@@ -3687,27 +3728,31 @@ async function tryDirectBookingHref(
 
   const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
   const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
-  const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
   if (dryRun) {
-    const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+    const boundary = confirmResult.prebookBoundary || {};
+    const formValidated = boundary.prebookBoundaryReached === true;
     const evidence = await savePageEvidence(page, `${jobId || 'direct'}-${time}-dry-run`);
     return {
       booked: false,
       dryRun: true,
       formValidated,
-      error: formValidated ? null : 'dry-run-players-missing',
+      prebookBoundaryReached: formValidated,
+      prebookBoundary: boundary,
+      result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
+      error: formValidated ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
       confirmationText: confirmResult.confirmationText,
       playersFilled: confirmResult.filled,
       playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
       fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs,
       navigationMs,
-      verificationSignal: 'dry-run',
-      verificationUrl: page.url(),
+      verificationSignal: formValidated ? 'dry-run-prebook-boundary' : boundary.error,
+      verificationUrl: boundary.verificationUrl || page.url(),
       ...evidence,
     };
   }
 
+  const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
   const verification = await verifyBookingConfirmation(page, time, 8000);
   if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
     verification.confirmed = false;
@@ -3894,7 +3939,6 @@ function confirmationBlocked(confirmationText) {
     'confirm-clicked-no-confirmation-text',
     'players-missing-before-confirm',
     'insufficient-open-slots',
-    'dry-run-no-confirm',
   ].includes(confirmationText);
 }
 
@@ -4495,10 +4539,14 @@ async function runBooking(config) {
               `Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`,
             );
             break;
-          } else if (bookingResult?.dryRun && bookingResult?.formValidated) {
+          } else if (bookingResult?.dryRun && bookingResult?.prebookBoundaryReached) {
             bookedTime = time;
             const preferenceIndex = normalizedPreferredTimes.indexOf(time);
             fallbackLevel = preferenceIndex >= 0 ? preferenceIndex : index;
+            finalPrebookBoundary = bookingResult.prebookBoundary ?? null;
+            finalClickDeltaMs = bookingResult.clickDeltaMs ?? finalClickDeltaMs;
+            finalVerificationUrl = bookingResult.verificationUrl ?? finalVerificationUrl;
+            finalVerificationSignal = bookingResult.verificationSignal ?? 'dry-run-prebook-boundary';
             notes.push(
               `Dry-run validated ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}`,
             );
@@ -4551,6 +4599,7 @@ async function runBooking(config) {
     let finalError = null;
     let finalAvailableTimes = null;
     let finalCandidateDiagnostics = null;
+    let finalPrebookBoundary = null;
     let directCapacityRequired = false;
     let directCapacityFailed = false;
     let directCandidatesExhausted = false;
@@ -4629,7 +4678,7 @@ async function runBooking(config) {
               dryRun,
             );
 
-            if (directResult?.dryRun && directResult?.formValidated) {
+            if (directResult?.dryRun && directResult?.prebookBoundaryReached) {
               bookedTime = candidate.time;
               fallbackLevel = candidate.preferredIndex ?? normalizedPreferredTimes.indexOf(candidate.time);
               notes.push(
@@ -4644,6 +4693,7 @@ async function runBooking(config) {
                 click_delta_ms: directResult.clickDeltaMs ?? null,
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
+                prebook_boundary: directResult.prebookBoundary ?? null,
                 release_detect_delta_ms: directPollResult.detectDeltaMs ?? null,
                 snapshot_path: directResult.snapshotPath ?? null,
                 screenshot_path: directResult.screenshotPath ?? null,
@@ -4658,6 +4708,7 @@ async function runBooking(config) {
                 notes: notes.join(' | '),
                 playersRequested: additionalPlayers,
                 fieldDiagnostics: directResult.fieldDiagnostics ?? null,
+                prebookBoundary: directResult.prebookBoundary ?? null,
                 click_delta_ms: directResult.clickDeltaMs ?? null,
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
@@ -4828,11 +4879,12 @@ async function runBooking(config) {
           jobId,
           dryRun,
         );
-        if (dryRun) {
+        if (dryRun && clickResult?.prebookBoundaryReached) {
           const diagnostics = {
             fire_latency_ms: fireLatencyMs,
-            verification_url: page.url(),
-            verification_signal: 'dry-run',
+            verification_url: clickResult.verificationUrl || page.url(),
+            verification_signal: clickResult.verificationSignal || 'dry-run-prebook-boundary',
+            prebook_boundary: clickResult.prebookBoundary ?? null,
           };
           bookedTime = releaseClickedTime;
           fallbackLevel = 0;
@@ -4854,8 +4906,51 @@ async function runBooking(config) {
             latencyMs: Date.now() - startTime,
             notes: notes.join(' | '),
             playersRequested: additionalPlayers,
+            fieldDiagnostics: clickResult.fieldDiagnostics ?? null,
+            prebookBoundary: clickResult.prebookBoundary ?? null,
             ...diagnostics,
             ...(dryRun ? { teeSelected: getTeeLabel(), armedAfterTeeSelect: true } : {}),
+          };
+        }
+        if (dryRun && !clickResult?.prebookBoundaryReached) {
+          const evidence = await savePageEvidence(page, runId || jobId || 'release-dry-run-boundary-failed');
+          const boundaryError =
+            clickResult?.prebookBoundary?.error ||
+            clickResult?.error ||
+            clickResult?.confirmationText ||
+            'dry-run-prebook-boundary-not-reached';
+          notes.push(
+            `Dry-run boundary failed for ${releaseClickedTime}: ${boundaryError}; snapshot=${evidence.snapshotPath || 'n/a'} screenshot=${evidence.screenshotPath || 'n/a'}`,
+          );
+          await fsFinishRun(runId, {
+            result: 'DRY_RUN_PREBOOK_FAILED',
+            notes: notes.join(' | '),
+            latency_ms: Date.now() - startTime,
+            chosen_time: null,
+            fallback_level: fallbackLevel,
+            fire_latency_ms: fireLatencyMs,
+            verification_url: clickResult?.verificationUrl || page.url(),
+            verification_signal: boundaryError,
+            prebook_boundary: clickResult?.prebookBoundary ?? null,
+            snapshot_path: evidence.snapshotPath,
+            screenshot_path: evidence.screenshotPath,
+          });
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: false,
+            result: 'DRY_RUN_PREBOOK_FAILED',
+            bookedTime: null,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: notes.join(' | '),
+            playersRequested: additionalPlayers,
+            error: boundaryError,
+            snapshotPath: evidence.snapshotPath,
+            screenshotPath: evidence.screenshotPath,
+            teeSelected: getTeeLabel(),
+            prebookBoundary: clickResult?.prebookBoundary ?? null,
+            verification_url: clickResult?.verificationUrl || page.url(),
+            verification_signal: boundaryError,
           };
         }
         console.log('[SNIPER] Verification started...');
@@ -5048,6 +5143,50 @@ async function runBooking(config) {
         bookingSuccess = await runPreferredTimesLoop(searchTimes);
       }
     }
+    if (dryRun && bookedTime && finalPrebookBoundary?.prebookBoundaryReached === true) {
+      const finalNotes = notes.join(' | ') || 'dry-run-prebook-boundary-reached';
+      await fsFinishRun(runId, {
+        result: DRY_RUN_PREBOOK_REACHED,
+        notes: finalNotes,
+        latency_ms: Date.now() - startTime,
+        chosen_time: bookedTime,
+        fallback_level: fallbackLevel,
+        click_delta_ms: finalClickDeltaMs,
+        verification_url: finalVerificationUrl,
+        verification_signal: finalVerificationSignal || 'dry-run-prebook-boundary',
+        prebook_boundary: finalPrebookBoundary,
+        available_times: finalAvailableTimes,
+        candidate_diagnostics: finalCandidateDiagnostics,
+        source_path: sourcePath,
+        requested_tee: normalizedTeeTarget,
+        tee_selected: getTeeLabel(),
+      });
+      if (browser && !isWarm) await browser.close();
+      return {
+        success: true,
+        result: DRY_RUN_PREBOOK_REACHED,
+        bookedTime,
+        fallbackLevel,
+        latencyMs: Date.now() - startTime,
+        notes: finalNotes,
+        playersRequested: additionalPlayers,
+        prebookBoundary: finalPrebookBoundary,
+        availableTimes: finalAvailableTimes,
+        candidateDiagnostics: finalCandidateDiagnostics,
+        sourcePath,
+        requestedTee: normalizedTeeTarget,
+        teeSelected: getTeeLabel(),
+        click_delta_ms: finalClickDeltaMs,
+        verification_url: finalVerificationUrl,
+        verification_signal: finalVerificationSignal || 'dry-run-prebook-boundary',
+      };
+    }
+
+    if (dryRun && bookedTime) {
+      finalError = finalError || 'dry-run-prebook-boundary-not-reached';
+      bookedTime = null;
+    }
+
     const success = !!bookedTime;
     const resultType = success
       ? fallbackLevel === 0
