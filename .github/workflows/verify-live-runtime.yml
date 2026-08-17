@@ -1,0 +1,53 @@
+name: verify-live-runtime
+
+on:
+  push:
+    branches:
+      - copilot/production-proof-fairway-sniper
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Railway and verify live runtime
+        shell: bash
+        env:
+          EXPECTED_SHA: 70c5b93aca0711cebb8b2dd962224ee21e2021de
+          EXPECTED_FIREBASE: na4qizroum13ep8ua6w67dmwt5cl8a
+          RUNTIME_URL: https://fairwaysniper-production.up.railway.app/api/runtime-status
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            echo "Attempt $attempt/30"
+            if json=$(curl --fail --silent --show-error --max-time 20 "$RUNTIME_URL"); then
+              echo "$json" | python -m json.tool || true
+              LIVE_JSON="$json" EXPECTED_SHA="$EXPECTED_SHA" EXPECTED_FIREBASE="$EXPECTED_FIREBASE" python - <<'PY'
+          import json, os, sys
+          data = json.loads(os.environ['LIVE_JSON'])
+          sha = str(data.get('gitHash') or data.get('git_hash') or data.get('deploymentSha') or '')
+          expected_sha = os.environ['EXPECTED_SHA']
+          firebase = str(data.get('firebaseProjectId') or '')
+          runner = data.get('sniperRunnerStarted') is True
+          main = data.get('agentRunMain') is True
+          firestore = data.get('firestoreConnected') is True
+          firebase_ok = firebase == os.environ['EXPECTED_FIREBASE']
+          sha_ok = sha == expected_sha or (sha and expected_sha.startswith(sha)) or (sha and sha.startswith(expected_sha))
+          print(f"CHECK sha={sha} expected={expected_sha} sha_ok={sha_ok}")
+          print(f"CHECK firebase={firebase} firebase_ok={firebase_ok}")
+          print(f"CHECK agentRunMain={main} sniperRunnerStarted={runner} firestoreConnected={firestore}")
+          if sha_ok and firebase_ok and runner and main and firestore:
+              sys.exit(0)
+          sys.exit(2)
+          PY
+              rc=$?
+              if [ "$rc" -eq 0 ]; then
+                echo "LIVE_RUNTIME_OK"
+                curl --fail --silent --show-error --max-time 20 "https://fairwaysniper-production.up.railway.app/api/warm-status" | python -m json.tool || true
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "Production did not reach expected healthy SHA in time" >&2
+          exit 1
