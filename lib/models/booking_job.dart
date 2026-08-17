@@ -27,6 +27,8 @@ class BookingJob {
   final String? targetDate; // date-only key, yyyy-MM-dd, avoids timezone drift
   final DateTime?
       releaseWindowStart; // when tee times are expected to unlock (UTC)
+  final DateTime? scheduledFor; // authoritative production FIRE timestamp
+  final DateTime? prepScheduledFor; // authoritative production PREP timestamp
   final Map<String, dynamic>?
       snipeStrategy; // attempt intervals & window sizing
   final String teeMode; // single|both
@@ -56,6 +58,8 @@ class BookingJob {
     this.targetPlayDate,
     this.targetDate,
     this.releaseWindowStart,
+    this.scheduledFor,
+    this.prepScheduledFor,
     this.snipeStrategy,
     this.teeMode = 'single',
     this.teeTarget = 1,
@@ -154,6 +158,12 @@ class BookingJob {
       releaseWindowStart: json['release_window_start'] is Timestamp
           ? (json['release_window_start'] as Timestamp).toDate()
           : null,
+      scheduledFor: json['scheduled_for'] is Timestamp
+          ? (json['scheduled_for'] as Timestamp).toDate()
+          : null,
+      prepScheduledFor: json['prep_scheduled_for'] is Timestamp
+          ? (json['prep_scheduled_for'] as Timestamp).toDate()
+          : null,
       snipeStrategy: json['snipe_strategy'] is Map<String, dynamic>
           ? Map<String, dynamic>.from(json['snipe_strategy'] as Map)
           : null,
@@ -216,6 +226,8 @@ class BookingJob {
     DateTime? targetPlayDate,
     String? targetDate,
     DateTime? releaseWindowStart,
+    DateTime? scheduledFor,
+    DateTime? prepScheduledFor,
     Map<String, dynamic>? snipeStrategy,
     String? teeMode,
     int? teeTarget,
@@ -246,6 +258,8 @@ class BookingJob {
         targetPlayDate: targetPlayDate ?? this.targetPlayDate,
         targetDate: targetDate ?? this.targetDate,
         releaseWindowStart: releaseWindowStart ?? this.releaseWindowStart,
+        scheduledFor: scheduledFor ?? this.scheduledFor,
+        prepScheduledFor: prepScheduledFor ?? this.prepScheduledFor,
         snipeStrategy: snipeStrategy ?? this.snipeStrategy,
         teeMode: teeMode ?? this.teeMode,
         teeTarget: teeTarget ?? this.teeTarget,

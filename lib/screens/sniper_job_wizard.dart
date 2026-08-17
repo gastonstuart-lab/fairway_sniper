@@ -483,11 +483,11 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         teeMode: _teeMode,
         teeTarget: _teeTarget,
         fallbackTee: _fallbackTee,
-        status: 'paused',
-        state: 'paused',
+        status: 'active',
+        state: 'queued',
       );
 
-      print('🔵 [WIZARD] Job status before save: ${job.status}');
+      print('🔵 [WIZARD] Scheduling sniper job with status: ${job.status}/${job.state}');
 
       await _firebaseService.saveBRSCredentials(
           uid, _brsUsernameController.text.trim(), _brsPasswordController.text,
@@ -501,9 +501,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('sniper_wizard_draft');
 
-      Navigator.of(context).pop();
-      _showSnack(
-          'Job saved as draft / paused. It will not contact BRS until armed. ID: $id');
+      _showSnack('🎯 Sniper job created. Production is arming it now… ID: $id');
+      Navigator.of(context).popUntil((route) => route.isFirst);
     } catch (e) {
       if (!mounted) return;
       _showSnack(
@@ -915,7 +914,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     _isNextBusy || _isBookingNow
                         ? 'Loading...'
                         : isLastPage
-                            ? (useDebugBookNow ? 'Book Now' : 'Save Draft')
+                            ? (useDebugBookNow ? 'Book Now' : 'Schedule Sniper')
                             : 'Continue',
                   ),
                 ),

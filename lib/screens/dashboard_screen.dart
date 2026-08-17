@@ -6,6 +6,7 @@ import 'package:fairway_sniper/services/booking_prefetch_service.dart';
 import 'package:fairway_sniper/services/agent_base_url.dart';
 import 'package:fairway_sniper/services/safe_proof_builder.dart';
 import 'package:fairway_sniper/services/safe_proof_status.dart';
+import 'package:fairway_sniper/services/sniper_job_status.dart';
 import 'package:fairway_sniper/services/weather_service.dart';
 import 'package:fairway_sniper/services/golf_news_service.dart';
 import 'package:fairway_sniper/models/booking_job.dart';
@@ -439,40 +440,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         : 'No target time';
   }
 
-  String _sniperStateLabel(BookingJob job) {
-    final state = (job.state ?? '').toLowerCase();
-    final status = job.status.toLowerCase();
-    switch (state) {
-      case 'paused':
-        return 'Draft / Paused';
-      case 'queued':
-        return 'Waiting for Production';
-      case 'production_confirmed':
-        return 'Production Confirmed';
-      case 'timer_registered':
-        return 'Waiting for Prep';
-      case 'waiting_for_fire':
-        return 'Waiting for Fire';
-      case 'warming':
-        return 'Warming BRS';
-      case 'ready':
-        return 'Ready';
-      case 'firing':
-        return 'Firing';
-      case 'running':
-        return 'Running';
-      case 'booking':
-        return 'Booking';
-      case 'finished':
-        return 'Booked';
-      case 'error':
-        return 'Failed';
-    }
-    if (status == 'active') return 'Waiting for Production';
-    if (status == 'error') return 'Failed';
-    if (status == 'finished') return 'Booked';
-    return status.toUpperCase();
-  }
+  String _sniperStateLabel(BookingJob job) => sniperLifecycleLabel(job);
 
   DateTime _getNextSaturday() {
     final now = DateTime.now();
@@ -1461,6 +1429,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _buildJobsList(List<BookingJob> jobs) {
+    final displayJobs = jobs.where((job) => !job.proofRun).toList();
+    final liveCount = displayJobs.where((job) {
+      if (job.bookingMode == BookingMode.sniper) return isLiveSniperJob(job);
+      return job.status == 'active';
+    }).length;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1475,7 +1448,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
             ),
             Text(
-              '${jobs.where((j) => j.status == 'active').length}',
+              '$liveCount',
               style: Theme.of(context).textTheme.titleLarge?.copyWith(
                     color: Theme.of(context).colorScheme.primary,
                     fontWeight: FontWeight.bold,
@@ -1484,7 +1457,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ],
         ),
         const SizedBox(height: 16),
-        if (jobs.isEmpty)
+        if (displayJobs.isEmpty)
           Card(
             color: _isDarkMode
                 ? Colors.grey.shade900.withValues(alpha: 0.85)
@@ -1522,7 +1495,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
           )
         else
-          ...jobs.map((job) => _buildJobCard(job)),
+          ...displayJobs.map((job) => _buildJobCard(job)),
       ],
     );
   }
@@ -1535,7 +1508,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final subtextColor =
         _isDarkMode ? Colors.grey.shade400 : Colors.grey.shade600;
     final now = DateTime.now().toUtc();
-    final bookingFireTime = job.nextFireTimeUtc ?? job.releaseWindowStart;
+    final bookingFireTime =
+        job.scheduledFor ?? job.nextFireTimeUtc ?? job.releaseWindowStart;
     final timeUntilBooking =
         bookingFireTime != null && bookingFireTime.isAfter(now)
             ? bookingFireTime.difference(now)
@@ -1550,6 +1524,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     // Determine mode colors
     final isSniper = job.bookingMode == BookingMode.sniper;
+    final isLiveJob =
+        isSniper ? isLiveSniperJob(job) : isLiveJob;
+    final isScheduledSniper = isSniper && isProductionScheduledSniper(job);
     final headerColor = isSniper
         ? const Color(0xFFFF6B35) // Bright orange for sniper
         : const Color(0xFF4A90E2); // Blue for normal
@@ -1558,13 +1535,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return Card(
       elevation: 4,
       color: cardBg,
-      shadowColor: job.status == 'active'
+      shadowColor: isLiveJob
           ? (isSniper ? Colors.orange : Colors.blue).withValues(alpha: 0.3)
           : Colors.black12,
       margin: const EdgeInsets.only(bottom: 16),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(16),
-        side: job.status == 'active'
+        side: isLiveJob
             ? BorderSide(
                 color: (isSniper ? Colors.orange : Colors.blue)
                     .withValues(alpha: 0.3),
@@ -1634,18 +1611,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Container(
                       padding: const EdgeInsets.all(14),
                       decoration: BoxDecoration(
-                        gradient: job.status == 'active'
+                        gradient: isLiveJob
                             ? LinearGradient(
                                 colors: isSniper
                                     ? [Color(0xFFFF6B35), Color(0xFFFF8A50)]
                                     : [Color(0xFF4A90E2), Color(0xFF357ABD)],
                               )
                             : null,
-                        color: job.status != 'active'
+                        color: !isLiveJob
                             ? Colors.grey.shade300
                             : null,
                         borderRadius: BorderRadius.circular(14),
-                        boxShadow: job.status == 'active'
+                        boxShadow: isLiveJob
                             ? [
                                 BoxShadow(
                                   color: (isSniper
@@ -1661,7 +1638,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       child: Icon(
                         Icons.golf_course,
                         color:
-                            job.status == 'active' ? Colors.white : Colors.grey,
+                            isLiveJob ? Colors.white : Colors.grey,
                         size: 30,
                       ),
                     ),
@@ -1675,7 +1652,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
                               fontSize: 17,
-                              color: job.status == 'active'
+                              color: isLiveJob
                                   ? textColor
                                   : (_isDarkMode
                                       ? Colors.grey.shade500
@@ -1724,40 +1701,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           tooltip: 'View Details',
                           onPressed: () => _showJobDetailsDialog(job),
                         ),
-                        // Toggle Active/Pause button
-                        IconButton(
-                          icon: Icon(
-                            job.status == 'active'
-                                ? Icons.pause_circle
-                                : Icons.play_circle,
-                            color: job.status == 'active'
-                                ? Colors.orange
-                                : Colors.green,
-                            size: 28,
-                          ),
-                          tooltip: job.status == 'active'
-                              ? 'Pause Job'
-                              : (isSniper ? 'Arm Sniper' : 'Activate Job'),
-                          onPressed: () async {
-                            final isActive = job.status == 'active';
-                            final patch = isActive
-                                ? <String, dynamic>{
-                                    'status': 'paused',
-                                    'state': 'paused',
-                                  }
-                                : <String, dynamic>{
-                                    'status': 'active',
-                                    'state': isSniper ? 'queued' : 'active',
-                                  };
-                            await _firebaseService.updateJob(
-                              job.id!,
-                              patch,
-                            );
-                            if (!isActive && isSniper) {
+                        // New sniper jobs schedule automatically. Only legacy paused
+                        // sniper jobs retain a manual recovery arm action.
+                        if (isSniper &&
+                            (job.state ?? '').toLowerCase() == 'paused')
+                          IconButton(
+                            icon: const Icon(Icons.play_circle,
+                                color: Colors.green, size: 28),
+                            tooltip: 'Arm Sniper',
+                            onPressed: () async {
+                              await _firebaseService.updateJob(
+                                job.id!,
+                                const <String, dynamic>{
+                                  'status': 'active',
+                                  'state': 'queued',
+                                },
+                              );
                               try {
                                 final message =
-                                    await _verifyProductionAgentCanSeeJob(
-                                        job.id!);
+                                    await _verifyProductionAgentCanSeeJob(job.id!);
                                 if (!context.mounted) return;
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
@@ -1765,37 +1727,61 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                     duration: const Duration(seconds: 6),
                                   ),
                                 );
-                                return;
                               } catch (e) {
                                 if (!context.mounted) return;
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
                                     content: Text(
-                                      'Sniper armed locally, but production did not confirm it: $e',
+                                      'Sniper needs attention: production did not confirm it: $e',
                                     ),
                                     backgroundColor: Colors.red.shade700,
                                     duration: const Duration(seconds: 12),
                                   ),
                                 );
-                                return;
                               }
-                            }
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(
-                                    isActive
-                                        ? '⏸️ Job paused'
-                                        : (isSniper
-                                            ? '🎯 Sniper armed'
-                                            : '▶️ Job activated'),
-                                  ),
-                                  duration: const Duration(seconds: 2),
-                                ),
-                              );
-                            }
-                          },
-                        ),
+                            },
+                          )
+                        else if (isSniper)
+                          IconButton(
+                            icon: Icon(
+                              isScheduledSniper
+                                  ? Icons.verified
+                                  : Icons.schedule,
+                              color: isScheduledSniper
+                                  ? Colors.green
+                                  : Colors.orange,
+                              size: 28,
+                            ),
+                            tooltip: isScheduledSniper
+                                ? 'Sniper scheduled in production'
+                                : 'Sniper is arming in production',
+                            onPressed: null,
+                          )
+                        else
+                          IconButton(
+                            icon: Icon(
+                              isLiveJob
+                                  ? Icons.pause_circle
+                                  : Icons.play_circle,
+                              color: isLiveJob
+                                  ? Colors.orange
+                                  : Colors.green,
+                              size: 28,
+                            ),
+                            tooltip: isLiveJob ? 'Pause Job' : 'Activate Job',
+                            onPressed: () async {
+                              final patch = isLiveJob
+                                  ? const <String, dynamic>{
+                                      'status': 'paused',
+                                      'state': 'paused',
+                                    }
+                                  : const <String, dynamic>{
+                                      'status': 'active',
+                                      'state': 'active',
+                                    };
+                              await _firebaseService.updateJob(job.id!, patch);
+                            },
+                          ),
                         // Delete button
                         IconButton(
                           icon: const Icon(
@@ -1851,10 +1837,69 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                   ],
                 ),
-                if (job.status == 'active') ...[
+                if (isLiveJob) ...[
                   const SizedBox(height: 16),
                   const Divider(height: 1),
                   const SizedBox(height: 16),
+                  if (isSniper) ...[
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: (isScheduledSniper ? Colors.green : Colors.orange)
+                            .withValues(alpha: 0.10),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: (isScheduledSniper ? Colors.green : Colors.orange)
+                              .withValues(alpha: 0.35),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            isScheduledSniper
+                                ? '🎯 SNIPER SCHEDULED'
+                                : 'Arming sniper…',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: isScheduledSniper
+                                  ? Colors.green.shade700
+                                  : Colors.orange.shade800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            isScheduledSniper
+                                ? 'Production has registered the PREP and FIRE schedule.'
+                                : 'Waiting for production to confirm the PREP and FIRE timers.',
+                            style: TextStyle(fontSize: 12, color: subtextColor),
+                          ),
+                          if (job.prepScheduledFor != null) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              'PREP: ${DateFormat('EEE d MMM, h:mm:ss a').format(job.prepScheduledFor!.toLocal())} (your time)',
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: textColor),
+                            ),
+                          ],
+                          if (bookingFireTime != null) ...[
+                            const SizedBox(height: 3),
+                            Text(
+                              'FIRE: ${DateFormat('EEE d MMM, h:mm:ss a').format(bookingFireTime.toLocal())} (your time)',
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: textColor),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                  ],
                   // Only show countdown for Sniper mode (Normal mode books immediately)
                   if (job.bookingMode == BookingMode.sniper) ...[
                     // Countdown to Booking Time
@@ -1879,7 +1924,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
-                                'Countdown to Booking Time',
+                                'Fires in',
                                 style: TextStyle(
                                   fontSize: 12,
                                   fontWeight: FontWeight.w600,
@@ -1888,7 +1933,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               ),
                               const SizedBox(height: 2),
                               Text(
-                                '${job.releaseDay} at ${job.releaseTimeLocal}',
+                                'FIRE / release: ${job.releaseDay} at ${job.releaseTimeLocal} UK',
                                 style: TextStyle(
                                   fontSize: 11,
                                   color: subtextColor,
@@ -2077,7 +2122,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                   ],
                 ],
-                if (job.status != 'active')
+                if ((job.state ?? '').toLowerCase() == 'paused')
                   Padding(
                     padding: const EdgeInsets.only(top: 12),
                     child: Container(
@@ -2094,7 +2139,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               size: 16, color: subtextColor),
                           const SizedBox(width: 8),
                           Text(
-                            'Job Paused',
+                            'Sniper paused — arm it to schedule',
                             style: TextStyle(
                               fontSize: 13,
                               color: subtextColor,
