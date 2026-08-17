@@ -17,12 +17,18 @@ function functionBody(source, name) {
   return source.slice(start, next === -1 ? source.length : next);
 }
 
-test('scheduler registers release timer before BRS warm-up can block', () => {
+test('scheduler registers PREP and FIRE timers before warm-up can block', () => {
   const body = functionBody(agentSource, 'scheduleClaimedJob');
+  const prepTimerCreate = body.indexOf("'PREP_TIMER_CREATED'");
+  const fireTimerCreate = body.indexOf("'FIRE_TIMER_CREATED'");
   const timerSet = body.indexOf('jobTimers.set(jobId');
   const warmStart = body.indexOf("fsAddJobEvent(jobId, 'WARMUP_STARTED'");
+  assert(prepTimerCreate > -1, 'prep timer event missing');
+  assert(fireTimerCreate > -1, 'fire timer event missing');
   assert(timerSet > -1, 'timer registration missing');
   assert(warmStart > -1, 'warm-up event missing');
+  assert(prepTimerCreate < warmStart, 'prep timer must be registered before warm-up starts');
+  assert(fireTimerCreate < warmStart, 'fire timer must be registered before warm-up starts');
   assert(timerSet < warmStart, 'timer must be registered before warm-up starts');
 });
 
@@ -31,18 +37,30 @@ test('scheduler records persistent lifecycle events for production reconstructio
     'JOB_SEEN',
     'JOB_CLAIMED',
     'JOB_ACCEPTED',
-    'TIMER_CREATED',
+    'PREP_TIMER_CREATED',
+    'FIRE_TIMER_CREATED',
+    'PREP_TIMER_FIRED',
     'WARMUP_STARTED',
     'BRS_AUTHENTICATED',
     'READY',
-    'TIMER_FIRED',
+    'FIRE_TIMER_FIRED',
+    'BRS_NOT_READY_AT_FIRE_TIME',
     'BOOKING_STARTED',
+    'DRY_RUN_PREBOOK_REACHED',
+    'PROOF_SUCCESS',
+    'PROOF_FAILED',
     'BOOKING_SUCCESS',
     'BOOKING_FAILED',
     'MISSED_FIRE_TIME',
   ]) {
     assert(agentSource.includes(`'${event}'`), `${event} event missing`);
   }
+});
+
+test('production startup uses only the deterministic PREP/FIRE runner', () => {
+  const startup = agentSource.slice(agentSource.indexOf("if (process.env.AGENT_RUN_MAIN === 'true')"));
+  assert(startup.includes('startSniperRunner();'));
+  assert(!startup.includes('startWarmUpScheduler();'));
 });
 
 test('expired pre-fire jobs are explicitly failed instead of waiting forever', () => {
@@ -59,9 +77,15 @@ test('firestore job diagnostic exposes project, timer and fire-time evidence', (
     'runnerInstanceId',
     'computedFireTimeUtc',
     'computedFireTimeLocal',
+    'computedPrepTimeUtc',
+    'computedPrepTimeLocal',
+    'secondsUntilPrep',
     'secondsUntilFire',
-    'hasTimer',
+    'hasPrepTimer',
+    'hasFireTimer',
     'timerDetails',
+    'prepTimer',
+    'fireTimer',
     'brsAuthenticated',
     'lastAgentEvent',
     'lastAgentError',
@@ -70,9 +94,24 @@ test('firestore job diagnostic exposes project, timer and fire-time evidence', (
   }
 });
 
-test('dashboard does not confirm armed sniper without production timer', () => {
-  assert(dashboardSource.includes("data['hasTimer'] != true"));
-  assert(dashboardSource.includes('Production agent has not registered a release timer yet.'));
+test('dashboard does not confirm armed sniper without both production timers', () => {
+  assert(dashboardSource.includes("data['hasPrepTimer'] != true || data['hasFireTimer'] != true"));
+  assert(dashboardSource.includes('Production agent has not registered both PREP and FIRE timers yet.'));
   assert(dashboardSource.includes('Waiting for Production'));
   assert(dashboardSource.includes('timer_registered'));
+});
+
+test('proof fire-time override is restricted to explicit proof dry-run jobs', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('fire-time-override-requires-proof-dry-run'));
+  assert(body.includes('isProofDryRunJob'));
+});
+
+test('proof dry-run surfaces pre-book boundary and one-click UI action', () => {
+  assert(agentSource.includes("'DRY_RUN_PREBOOK_REACHED'"));
+  assert(agentSource.includes("'PROOF_SUCCESS'"));
+  assert(agentSource.includes("'PROOF_FAILED'"));
+  assert(dashboardSource.includes('Run Safe Production Proof'));
+  assert(dashboardSource.includes("'proof_run': true"));
+  assert(dashboardSource.includes("'proof_fire_time_override_utc'"));
 });

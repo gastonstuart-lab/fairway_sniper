@@ -257,6 +257,7 @@ app.get('/api/safe-mode', (_req, res) => {
 
 app.get('/api/runtime-status', (_req, res) => {
   const warmStatus = warmSession.getWarmStatus();
+  const timerSummary = summarizeTimerHandles();
   res.json({
     success: true,
     safeMode: SAFE_MODE_ENABLED,
@@ -271,17 +272,37 @@ app.get('/api/runtime-status', (_req, res) => {
     firestoreConnected: Boolean(db && firebaseAdminReady),
     agentRunMain: process.env.AGENT_RUN_MAIN === 'true',
     sniperRunnerStarted,
-    activeSniperTimers: jobTimers.size,
-    acceptedActiveJobs: jobTimers.size,
+    activeSniperTimers: timerSummary,
+    acceptedActiveJobs: timerSummary.jobs,
     timers: Array.from(jobTimers.values()).map((entry) => ({
-      timerId: entry.timerId,
       jobId: entry.jobId,
       state: entry.state,
       fireTimeUtc: entry.fireTimeUtc,
       fireTimeLocal: entry.fireTimeLocal,
-      timerCreatedAt: entry.timerCreatedAt,
-      scheduledStartAt: entry.scheduledStartAt,
-      delayMs: entry.delayMs,
+      prepTimeUtc: entry.prepTimeUtc,
+      prepTimeLocal: entry.prepTimeLocal,
+      prepTimer: entry.prepTimer
+        ? {
+            timerId: entry.prepTimer.timerId,
+            state: entry.prepTimer.state,
+            timerCreatedAt: entry.prepTimer.timerCreatedAt,
+            scheduledStartAt: entry.prepTimer.scheduledStartAt,
+            delayMs: entry.prepTimer.delayMs,
+            firedAt: entry.prepTimer.firedAt || null,
+          }
+        : null,
+      fireTimer: entry.fireTimer
+        ? {
+            timerId: entry.fireTimer.timerId,
+            state: entry.fireTimer.state,
+            timerCreatedAt: entry.fireTimer.timerCreatedAt,
+            scheduledStartAt: entry.fireTimer.scheduledStartAt,
+            delayMs: entry.fireTimer.delayMs,
+            firedAt: entry.fireTimer.firedAt || null,
+          }
+        : null,
+      warmState: entry.warmState || 'pending',
+      brsAuthenticated: entry.brsAuthenticated === true,
       runnerInstanceId: entry.runnerInstanceId,
     })),
     brsBrowserStatus: warmStatus,
@@ -843,6 +864,10 @@ const CONFIG = {
     process.env.SNIPER_MISSED_FIRE_GRACE_MS || '600000',
     10,
   ),
+  SNIPER_FIRE_WARMUP_WAIT_MS: Number.parseInt(
+    process.env.SNIPER_FIRE_WARMUP_WAIT_MS || '15000',
+    10,
+  ),
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
   SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '10', 10),
   SNIPER_NEAREST_SLOT_WINDOW_MINUTES: Number.parseInt(
@@ -1206,6 +1231,28 @@ async function fsAddJobEvent(jobId, type, metadata = {}) {
   }
 }
 
+async function fsLoadUserBRSProfile(ownerUid) {
+  if (!db || !ownerUid || ownerUid === 'unknown') return null;
+  try {
+    const snap = await db.collection('users').doc(ownerUid).get();
+    if (!snap.exists) return null;
+    const data = snap.data() || {};
+    const username = (data.brs_username || '').toString().trim();
+    const password = (data.brs_password || '').toString();
+    if (!username || !password) return null;
+    return { username, password };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function resolveJobCredentials(job) {
+  const username = (job?.brs_email || job?.brsEmail || job?.username || '').toString().trim();
+  const password = (job?.brs_password || job?.brsPassword || job?.password || '').toString();
+  if (username && password) return { username, password };
+  return await fsLoadUserBRSProfile(job?.ownerUid || job?.owner_uid || null);
+}
+
 async function fsGetActiveSniperJobs(limit = 5) {
   if (!db) return [];
   try {
@@ -1232,6 +1279,60 @@ const jobTimers = new Map();
 let timerSequence = 0;
 let lastRunnerError = null;
 let lastRunnerEvent = null;
+
+function nextTimerId(prefix) {
+  timerSequence += 1;
+  return `${AGENT_ID}:${prefix}:${timerSequence}`;
+}
+
+function getPrepLeadMs() {
+  if (!Number.isFinite(CONFIG.SNIPER_PREP_LEAD_MS)) return 240000;
+  return Math.max(0, CONFIG.SNIPER_PREP_LEAD_MS);
+}
+
+function computePrepTimeMs(fireMs) {
+  return fireMs - getPrepLeadMs();
+}
+
+function isProofDryRunJob(job) {
+  if (!job) return false;
+  const dryRun = parseBooleanFlag(job.dry_run ?? job.dryRun, false);
+  const proofFlag = parseBooleanFlag(
+    job.proof_run ?? job.proofRun ?? job.safe_proof ?? job.safeProof,
+    false,
+  );
+  return dryRun && proofFlag;
+}
+
+function getProofFireTimeOverride(job) {
+  if (!isProofDryRunJob(job)) return null;
+  return (
+    toDateMaybe(job.proof_fire_time_override_utc) ||
+    toDateMaybe(job.proofFireTimeOverrideUtc) ||
+    toDateMaybe(job.fire_time_override_utc) ||
+    toDateMaybe(job.fireTimeOverrideUtc)
+  );
+}
+
+function summarizeTimerHandles() {
+  const summary = {
+    jobs: jobTimers.size,
+    totalTimerHandles: 0,
+    prepTimers: 0,
+    fireTimers: 0,
+  };
+  for (const entry of jobTimers.values()) {
+    if (entry?.prepTimer) {
+      summary.prepTimers += 1;
+      summary.totalTimerHandles += 1;
+    }
+    if (entry?.fireTimer) {
+      summary.fireTimers += 1;
+      summary.totalTimerHandles += 1;
+    }
+  }
+  return summary;
+}
 
 function makeRunId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -1264,6 +1365,9 @@ function isRunningSniperJob(job) {
 }
 
 function getFireTimeFromJob(job) {
+  const proofOverride = getProofFireTimeOverride(job);
+  if (proofOverride) return proofOverride;
+
   const targetDateKey = getTargetDateKeyFromJob(job);
   if (targetDateKey) {
     return computeReleaseFireUTCForTargetDate(
@@ -1330,12 +1434,21 @@ function serializeStatusValue(value) {
 function buildFirestoreJobStatus(docId, data) {
   const job = { id: docId, ...(data || {}) };
   const fireTime = getFireTimeFromJob(job);
+  const prepTime = fireTime ? new Date(computePrepTimeMs(fireTime.getTime())) : null;
   const targetPlayDate = resolveTargetPlayDate(job);
   const timerDetails = jobTimers.get(docId) || null;
   const serverNow = new Date();
   const tz = job.tz || job.timezone || CONFIG.TZ_LONDON;
+  const prepApplicable = prepTime ? prepTime.getTime() > serverNow.getTime() : false;
+  const fireApplicable = fireTime ? fireTime.getTime() > serverNow.getTime() : false;
+  const hasPrepTimer = Boolean(timerDetails?.prepTimer);
+  const hasFireTimer = Boolean(timerDetails?.fireTimer);
+  const timerSummary = summarizeTimerHandles();
   const computedFireTimeLocal = fireTime
     ? DateTime.fromJSDate(fireTime).setZone(tz).toISO()
+    : null;
+  const computedPrepTimeLocal = prepTime
+    ? DateTime.fromJSDate(prepTime).setZone(tz).toISO()
     : null;
   return {
     success: true,
@@ -1344,20 +1457,46 @@ function buildFirestoreJobStatus(docId, data) {
     runnerInstanceId: AGENT_ID,
     agentRunMain: process.env.AGENT_RUN_MAIN === 'true',
     sniperRunnerStarted,
-    activeSniperTimers: jobTimers.size,
+    activeSniperTimers: timerSummary,
     serverCurrentTimeUtc: serverNow.toISOString(),
     serverCurrentTimeLocal: DateTime.fromJSDate(serverNow).setZone(tz).toISO(),
     agentWillAccept: isReadyJob(job) || isRunningSniperJob(job) || Boolean(timerDetails),
     hasTimer: Boolean(timerDetails),
+    hasPrepTimer,
+    hasFireTimer,
+    prepApplicable,
+    fireApplicable,
     timerDetails: timerDetails
       ? {
-          timerId: timerDetails.timerId,
           state: timerDetails.state,
           fireTimeUtc: timerDetails.fireTimeUtc,
           fireTimeLocal: timerDetails.fireTimeLocal,
-          timerCreatedAt: timerDetails.timerCreatedAt,
-          scheduledStartAt: timerDetails.scheduledStartAt,
-          delayMs: timerDetails.delayMs,
+          prepTimeUtc: timerDetails.prepTimeUtc,
+          prepTimeLocal: timerDetails.prepTimeLocal,
+          prepTimer: timerDetails.prepTimer
+            ? {
+                timerId: timerDetails.prepTimer.timerId,
+                state: timerDetails.prepTimer.state,
+                timerCreatedAt: timerDetails.prepTimer.timerCreatedAt,
+                scheduledStartAt: timerDetails.prepTimer.scheduledStartAt,
+                delayMs: timerDetails.prepTimer.delayMs,
+                firedAt: timerDetails.prepTimer.firedAt || null,
+                recovered: timerDetails.prepTimer.recovered === true,
+              }
+            : null,
+          fireTimer: timerDetails.fireTimer
+            ? {
+                timerId: timerDetails.fireTimer.timerId,
+                state: timerDetails.fireTimer.state,
+                timerCreatedAt: timerDetails.fireTimer.timerCreatedAt,
+                scheduledStartAt: timerDetails.fireTimer.scheduledStartAt,
+                delayMs: timerDetails.fireTimer.delayMs,
+                firedAt: timerDetails.fireTimer.firedAt || null,
+                recovered: timerDetails.fireTimer.recovered === true,
+              }
+            : null,
+          warmState: timerDetails.warmState || null,
+          brsAuthenticated: timerDetails.brsAuthenticated === true,
           runnerInstanceId: timerDetails.runnerInstanceId,
         }
       : null,
@@ -1370,6 +1509,9 @@ function buildFirestoreJobStatus(docId, data) {
     releaseTimeLocal: job.release_time_local || job.releaseTimeLocal || null,
     computedFireTimeUtc: fireTime ? fireTime.toISOString() : null,
     computedFireTimeLocal,
+    computedPrepTimeUtc: prepTime ? prepTime.toISOString() : null,
+    computedPrepTimeLocal,
+    secondsUntilPrep: prepTime ? Math.round((prepTime.getTime() - serverNow.getTime()) / 1000) : null,
     secondsUntilFire: fireTime ? Math.round((fireTime.getTime() - serverNow.getTime()) / 1000) : null,
     scheduledFor: serializeStatusValue(job.scheduled_for || job.scheduledFor || null),
     warmState: job.warm_state || job.warmState || null,
@@ -1541,6 +1683,16 @@ async function scheduleClaimedJob(job) {
     return;
   }
 
+  const proofOverrideForLiveJob =
+    toDateMaybe(job.proof_fire_time_override_utc) ||
+    toDateMaybe(job.proofFireTimeOverrideUtc) ||
+    toDateMaybe(job.fire_time_override_utc) ||
+    toDateMaybe(job.fireTimeOverrideUtc);
+  if (proofOverrideForLiveJob && !isProofDryRunJob(job)) {
+    await markJobError(jobId, 'fire-time-override-requires-proof-dry-run');
+    return;
+  }
+
   const fireTime = getFireTimeFromJob(job) || computeNextFireUTC(
     job.release_day || job.releaseDay,
     job.release_time_local || job.releaseTimeLocal,
@@ -1549,7 +1701,7 @@ async function scheduleClaimedJob(job) {
 
   const fireMs = fireTime?.getTime?.() ? fireTime.getTime() : null;
   if (!fireMs || Number.isNaN(fireMs)) {
-          await markJobError(jobId, 'missing-target-play-date');
+    await markJobError(jobId, 'missing-target-play-date');
     return;
   }
 
@@ -1559,15 +1711,17 @@ async function scheduleClaimedJob(job) {
     return;
   }
 
-  const prepLeadMs = Number.isFinite(CONFIG.SNIPER_PREP_LEAD_MS)
-    ? Math.max(0, CONFIG.SNIPER_PREP_LEAD_MS)
-    : 240000;
-  const startMs = Math.max(now, fireMs - prepLeadMs);
-  const delayMs = Math.max(0, startMs - now);
   const scheduleAt = new Date(fireMs);
   const scheduleAtLocal = DateTime.fromJSDate(scheduleAt)
     .setZone(job.tz || job.timezone || CONFIG.TZ_LONDON)
     .toISO();
+  const prepMs = computePrepTimeMs(fireMs);
+  const prepAt = new Date(prepMs);
+  const prepAtLocal = DateTime.fromJSDate(prepAt)
+    .setZone(job.tz || job.timezone || CONFIG.TZ_LONDON)
+    .toISO();
+  const prepDelayMs = Math.max(0, prepMs - now);
+  const fireDelayMs = Math.max(0, fireMs - now);
   const targetDateKey = getTargetDateKeyFromJob(job) || normalizeDateKey(targetPlayDate);
   const preferredTimesForLog = Array.isArray(job.preferred_times)
     ? normalizeStringList(job.preferred_times)
@@ -1578,55 +1732,138 @@ async function scheduleClaimedJob(job) {
   console.log(`[RUNNER] Target play date: ${targetDateKey}`);
   console.log(`[RUNNER] Preferred times: ${preferredTimesForLog.join(', ') || '(none)'}`);
   console.log(`[RUNNER] Fire time UTC: ${scheduleAt.toISOString()}`);
+  console.log(`[RUNNER] Prep time UTC: ${prepAt.toISOString()}`);
   console.log(`[RUNNER] Current UK time: ${ukNow}`);
   console.log(`[RUNNER] Fire time resolved for ${jobId}: ${scheduleAt.toISOString()}`);
-  console.log(`[RUNNER] Booking prep starts at ${new Date(startMs).toISOString()} (in ${delayMs}ms; lead ${prepLeadMs}ms)`);
+  console.log(`[RUNNER] Prep delay=${prepDelayMs}ms; fire delay=${fireDelayMs}ms`);
 
   await fsUpdateJob(jobId, {
     scheduled_for: admin.firestore.Timestamp.fromDate(scheduleAt),
     scheduled_for_local: scheduleAtLocal,
+    prep_scheduled_for: admin.firestore.Timestamp.fromDate(prepAt),
+    prep_scheduled_for_local: prepAtLocal,
     warm_state: 'pending',
-    state: 'timer_registered',
+    state: 'production_confirmed',
   });
-  await fsAddJobEvent(jobId, 'TIMER_CREATED', {
+  await fsAddJobEvent(jobId, 'PREP_TIMER_CREATED', {
+    prepTimeUtc: prepAt.toISOString(),
+    prepTimeLocal: prepAtLocal,
+    scheduledStartAt: new Date(Math.max(now, prepMs)).toISOString(),
+    delayMs: prepDelayMs,
+  });
+  await fsAddJobEvent(jobId, 'FIRE_TIMER_CREATED', {
     fireTimeUtc: scheduleAt.toISOString(),
     fireTimeLocal: scheduleAtLocal,
-    scheduledStartAt: new Date(startMs).toISOString(),
-    delayMs,
+    prepTimeUtc: prepAt.toISOString(),
+    scheduledStartAt: scheduleAt.toISOString(),
+    delayMs: fireDelayMs,
   });
 
   let warmPage = null;
-  const timerId = `${AGENT_ID}:${++timerSequence}`;
-  const timeoutId = setTimeout(async () => {
-    const timerDetails = jobTimers.get(jobId);
-    if (timerDetails) {
-      timerDetails.state = 'fired';
-      timerDetails.firedAt = new Date().toISOString();
+  let warmupPromise = null;
+  const timerEntry = {
+    jobId,
+    runId: job.run_id || job.runId || null,
+    claimedBy: AGENT_ID,
+    state: 'timers_registered',
+    warmState: 'pending',
+    brsAuthenticated: false,
+    fireTimeUtc: scheduleAt.toISOString(),
+    fireTimeLocal: scheduleAtLocal,
+    prepTimeUtc: prepAt.toISOString(),
+    prepTimeLocal: prepAtLocal,
+    runnerInstanceId: AGENT_ID,
+    prepTimer: null,
+    fireTimer: null,
+    bookingAttempted: false,
+  };
+  jobTimers.set(jobId, timerEntry);
+
+  const runPrepWarmup = async (reason = 'prep-timer') => {
+    const entry = jobTimers.get(jobId);
+    if (!entry) return null;
+    if (entry.warmState === 'ready' && warmPage) return warmPage;
+    if (warmupPromise) return warmupPromise;
+
+    warmupPromise = (async () => {
+      const creds = await resolveJobCredentials(job);
+      if (!creds?.username || !creds?.password) {
+        throw new Error('missing-credentials');
+      }
+
+      entry.warmState = 'warming';
+      await fsAddJobEvent(jobId, 'WARMUP_STARTED', {
+        targetDate: targetDateKey,
+        reason,
+      });
+      await fsUpdateJob(jobId, { warm_state: 'warming', state: 'warming' });
+
+      warmPage = await warmSession.getWarmPage(
+        resolveTargetPlayDate(job) || targetPlayDate,
+        creds.username,
+        creds.password,
+      );
+      entry.warmState = 'ready';
+      entry.brsAuthenticated = true;
+      await fsUpdateJob(jobId, { warm_state: 'warmed', state: 'ready' });
+      await fsAddJobEvent(jobId, 'BRS_AUTHENTICATED', {
+        targetDate: targetDateKey,
+        reason,
+      });
+      await fsAddJobEvent(jobId, 'READY', {
+        fireTimeUtc: scheduleAt.toISOString(),
+      });
+      return warmPage;
+    })()
+      .catch(async (error) => {
+        const latest = jobTimers.get(jobId);
+        if (latest) latest.warmState = 'warm_error';
+        await fsUpdateJob(jobId, {
+          warm_state: 'warm_error',
+          warm_error: error?.message || String(error),
+          state: 'waiting_for_fire',
+        });
+        await fsAddJobEvent(jobId, 'WARMUP_FAILED', {
+          error: error?.message || String(error),
+          reason,
+        });
+        throw error;
+      })
+      .finally(() => {
+        warmupPromise = null;
+      });
+
+    return warmupPromise;
+  };
+
+  const fireNow = async (source = 'fire-timer') => {
+    const entry = jobTimers.get(jobId);
+    if (!entry || entry.bookingAttempted) return;
+    entry.bookingAttempted = true;
+    entry.state = 'firing';
+    if (entry.fireTimer) {
+      entry.fireTimer.state = 'fired';
+      entry.fireTimer.firedAt = new Date().toISOString();
     }
-    jobTimers.delete(jobId);
-    await fsAddJobEvent(jobId, 'TIMER_FIRED', {
-      timerId,
+    await fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED', {
+      source,
       fireTimeUtc: scheduleAt.toISOString(),
     });
+    await fsUpdateJob(jobId, { state: 'firing' });
     try {
       let runJob = job;
       if (db) {
         try {
           const latestSnap = await db.collection(JOBS_COLLECTION).doc(jobId).get();
-          if (latestSnap.exists) {
-            runJob = { id: latestSnap.id, ...latestSnap.data() };
-            console.log(`[RUNNER] Re-read latest job fields before run ${jobId}`);
-          }
+          if (latestSnap.exists) runJob = { id: latestSnap.id, ...latestSnap.data() };
         } catch (latestError) {
-          console.warn(`[RUNNER] Could not re-read latest job ${jobId}: ${latestError?.message || latestError}`);
           await fsAddJobEvent(jobId, 'JOB_REREAD_FAILED', {
             error: latestError?.message || String(latestError),
           });
         }
       }
       const ownerUid = runJob.ownerUid || runJob.owner_uid || 'unknown';
-      const username = runJob.brs_email || runJob.brsEmail || runJob.username;
-      const password = runJob.brs_password || runJob.brsPassword || runJob.password;
+      const creds = await resolveJobCredentials(runJob);
       const preferredTimes = Array.isArray(runJob.preferred_times)
         ? normalizeStringList(runJob.preferred_times)
         : normalizeStringList(runJob.preferredTimes ?? runJob.preferred_times);
@@ -1635,39 +1872,42 @@ async function scheduleClaimedJob(job) {
       const pushToken = runJob.push_token || runJob.pushToken;
       const dryRun = runJob.dry_run === true || runJob.dryRun === true;
       const teeConfig = resolveTeeConfigFromJob(runJob, 'RUNNER');
-
-      if (!warmPage) {
-        await fsAddJobEvent(jobId, 'WARMUP_ON_FIRE_STARTED', {
-          targetDate: targetDateKey,
-        });
-        warmPage = await warmSession.getWarmPage(resolveTargetPlayDate(runJob) || targetPlayDate, username, password);
-        await fsAddJobEvent(jobId, 'BRS_AUTHENTICATED', {
-          targetDate: targetDateKey,
-          onFire: true,
-        });
+      if (!creds?.username || !creds?.password) {
+        throw new Error('missing-credentials');
       }
 
-      console.log(`[RUNNER] runBooking start ${jobId}`);
+      let fireWarmPage = warmPage;
+      if (!fireWarmPage) {
+        await fsAddJobEvent(jobId, 'BRS_NOT_READY_AT_FIRE_TIME', {
+          warmState: entry.warmState || 'pending',
+        });
+        try {
+          fireWarmPage = await Promise.race([
+            runPrepWarmup('fire-recovery'),
+            new Promise((resolve) =>
+              setTimeout(() => resolve(null), Math.max(1000, CONFIG.SNIPER_FIRE_WARMUP_WAIT_MS)),
+            ),
+          ]);
+        } catch (_error) {
+          fireWarmPage = null;
+        }
+      }
+
       await fsUpdateJob(jobId, { state: 'booking' });
       await fsAddJobEvent(jobId, 'BOOKING_STARTED', {
         fireTimeUtc: scheduleAt.toISOString(),
         targetDate: getTargetDateKeyFromJob(runJob) || targetDateKey,
         preferredTimes,
         teeTarget: teeConfig.teeTarget,
+        dryRun,
       });
-      console.log(`[RUNNER] Target play date: ${getTargetDateKeyFromJob(runJob) || targetDateKey}`);
-      console.log(`[RUNNER] Requested tee: ${teeConfig.teeTarget}`);
-      console.log(`[RUNNER] Preferred times: ${preferredTimes.join(', ') || '(none)'}`);
-      console.log(`[RUNNER] Fire time UTC: ${scheduleAt.toISOString()}`);
-      console.log(
-        `[RUNNER] Tee execution: mode=${teeConfig.teeMode} target=${teeConfig.teeTarget} fallback=${teeConfig.fallbackTee}`,
-      );
+
       const result = await runBooking({
         jobId,
         ownerUid,
         loginUrl: CONFIG.CLUB_LOGIN_URL,
-        username,
-        password,
+        username: creds?.username,
+        password: creds?.password,
         preferredTimes,
         targetFireTime: fireMs,
         targetPlayDate: resolveTargetPlayDate(runJob) || targetPlayDate,
@@ -1675,7 +1915,7 @@ async function scheduleClaimedJob(job) {
         players,
         partySize,
         slotsData: [],
-        warmPage,
+        warmPage: fireWarmPage,
         useReleaseObserver: true,
         pushToken,
         dryRun,
@@ -1686,18 +1926,32 @@ async function scheduleClaimedJob(job) {
         sourcePath: 'firestore-runner',
       });
 
-      console.log(
-        `[RUNNER] Final result ${jobId}: success=${result?.success === true} result=${result?.result || 'n/a'} booked=${result?.bookedTime || 'n/a'} notes=${result?.notes || ''}`,
-      );
       const isSuccess = result?.success === true;
-      await fsAddJobEvent(jobId, isSuccess ? 'BOOKING_SUCCESS' : 'BOOKING_FAILED', {
-        result: result?.result || (isSuccess ? 'success' : 'failed'),
-        bookedTime: result?.bookedTime || null,
-        error: isSuccess ? null : result?.error || 'clicked but no confirmation',
-        releaseDetectDeltaMs: result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
-        clickDeltaMs: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
-        verificationSignal: result?.verification_signal ?? result?.verificationSignal ?? null,
-      });
+      const isProof = isProofDryRunJob(runJob);
+      const reachedDryRunBoundary = result?.result === 'DRY_RUN_PREBOOK_REACHED';
+      if (reachedDryRunBoundary) {
+        await fsAddJobEvent(jobId, 'DRY_RUN_PREBOOK_REACHED', {
+          bookedTime: result?.bookedTime || null,
+          teeSelected: result?.teeSelected || null,
+          verificationSignal: result?.verification_signal ?? result?.verificationSignal ?? null,
+        });
+      }
+      if (isProof) {
+        await fsAddJobEvent(jobId, reachedDryRunBoundary ? 'PROOF_SUCCESS' : 'PROOF_FAILED', {
+          result: result?.result || null,
+          error: reachedDryRunBoundary ? null : result?.error || 'proof-boundary-not-reached',
+        });
+      }
+      if (!(isProof && reachedDryRunBoundary)) {
+        await fsAddJobEvent(jobId, isSuccess ? 'BOOKING_SUCCESS' : 'BOOKING_FAILED', {
+          result: result?.result || (isSuccess ? 'success' : 'failed'),
+          bookedTime: result?.bookedTime || null,
+          error: isSuccess ? null : result?.error || 'clicked but no confirmation',
+          releaseDetectDeltaMs: result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
+          clickDeltaMs: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
+          verificationSignal: result?.verification_signal ?? result?.verificationSignal ?? null,
+        });
+      }
       await fsUpdateJob(jobId, {
         status: isSuccess ? 'finished' : 'error',
         state: isSuccess ? 'finished' : 'error',
@@ -1724,58 +1978,61 @@ async function scheduleClaimedJob(job) {
           result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
       });
     } catch (error) {
-      console.log(`[RUNNER] runBooking error ${jobId}: ${error?.message || error}`);
       await fsAddJobEvent(jobId, 'BOOKING_FAILED', {
         error: error?.message || String(error),
       });
       await markJobError(jobId, error?.message || String(error));
-    }
-  }, delayMs);
-
-  jobTimers.set(jobId, {
-    timerId,
-    timeoutId,
-    jobId,
-    state: 'registered',
-    fireTimeUtc: scheduleAt.toISOString(),
-    fireTimeLocal: scheduleAtLocal,
-    timerCreatedAt: new Date().toISOString(),
-    scheduledStartAt: new Date(startMs).toISOString(),
-    delayMs,
-    runnerInstanceId: AGENT_ID,
-  });
-
-  try {
-    const username = job.brs_email || job.brsEmail || job.username;
-    const password = job.brs_password || job.brsPassword || job.password;
-    if (!username || !password) {
-      clearTimeout(timeoutId);
+    } finally {
+      const latest = jobTimers.get(jobId);
+      if (latest?.prepTimer?.timeoutId) clearTimeout(latest.prepTimer.timeoutId);
+      if (latest?.fireTimer?.timeoutId) clearTimeout(latest.fireTimer.timeoutId);
       jobTimers.delete(jobId);
-      await markJobError(jobId, 'missing-credentials');
-      return;
     }
-    console.log(`[RUNNER] Warm start ${jobId}`);
-    await fsAddJobEvent(jobId, 'WARMUP_STARTED', {
-      targetDate: targetDateKey,
+  };
+
+  const prepTimerId = nextTimerId('prep');
+  const fireTimerId = nextTimerId('fire');
+  const prepTimeoutId = setTimeout(async () => {
+    const entry = jobTimers.get(jobId);
+    if (!entry || !entry.prepTimer) return;
+    entry.prepTimer.state = 'fired';
+    entry.prepTimer.firedAt = new Date().toISOString();
+    entry.state = 'warming';
+    await fsAddJobEvent(jobId, 'PREP_TIMER_FIRED', {
+      timerId: prepTimerId,
+      prepTimeUtc: prepAt.toISOString(),
     });
-    await fsUpdateJob(jobId, { warm_state: 'warming', state: 'warming' });
-    warmPage = await warmSession.getWarmPage(targetPlayDate, username, password);
-    await fsUpdateJob(jobId, { warm_state: 'warmed', state: 'ready' });
-    await fsAddJobEvent(jobId, 'BRS_AUTHENTICATED', {
-      targetDate: targetDateKey,
-    });
-    await fsAddJobEvent(jobId, 'READY', {
-      timerId,
-      fireTimeUtc: scheduleAt.toISOString(),
-    });
-    console.log(`[RUNNER] Warm success ${jobId}`);
-  } catch (error) {
-    await fsUpdateJob(jobId, { warm_state: 'warm_error', warm_error: error?.message || String(error), state: 'timer_registered' });
-    await fsAddJobEvent(jobId, 'WARMUP_FAILED', {
-      error: error?.message || String(error),
-    });
-    console.log(`[RUNNER] Warm fail ${jobId}: ${error?.message || error}`);
-  }
+    await fsUpdateJob(jobId, { state: 'warming' });
+    try {
+      await runPrepWarmup('prep-timer');
+    } catch (_error) {
+      // warm-up failure is already recorded; fire timer still executes independently
+    }
+  }, prepDelayMs);
+
+  const fireTimeoutId = setTimeout(async () => {
+    await fireNow('fire-timer');
+  }, fireDelayMs);
+
+  timerEntry.prepTimer = {
+    timerId: prepTimerId,
+    timeoutId: prepTimeoutId,
+    state: 'registered',
+    timerCreatedAt: new Date().toISOString(),
+    scheduledStartAt: new Date(Math.max(now, prepMs)).toISOString(),
+    delayMs: prepDelayMs,
+  };
+  timerEntry.fireTimer = {
+    timerId: fireTimerId,
+    timeoutId: fireTimeoutId,
+    state: 'registered',
+    timerCreatedAt: new Date().toISOString(),
+    scheduledStartAt: scheduleAt.toISOString(),
+    delayMs: fireDelayMs,
+  };
+
+  if (prepMs <= now) timerEntry.prepTimer.recovered = true;
+  if (fireMs <= now) timerEntry.fireTimer.recovered = true;
 }
 
 async function handleReadyJob(job) {
@@ -1817,7 +2074,7 @@ async function resumeRunningJobs() {
       }
 
       const pastFireMs = now - fireMs;
-      if (fireMs > now || pastFireMs <= CONFIG.SNIPER_RUNNING_RESUME_GRACE_MS) {
+      if (fireMs > now || pastFireMs <= CONFIG.SNIPER_MISSED_FIRE_GRACE_MS) {
         const resumed = await fsResumeRunningSniperJob(job.id);
         if (!resumed) continue;
         console.log(
@@ -1825,7 +2082,7 @@ async function resumeRunningJobs() {
         );
         await scheduleClaimedJob({ ...job, ...resumed });
       } else {
-        await markJobError(job.id, 'agent restart during run');
+        await markJobError(job.id, 'MISSED_FIRE_TIME');
       }
     }
   } catch (error) {
@@ -2181,7 +2438,6 @@ if (process.env.AGENT_RUN_MAIN === 'true') {
   if (!schedulerRunning) {
     schedulerRunning = true;
     startSniperRunner();
-    startWarmUpScheduler();
   }
 }
 
@@ -4380,7 +4636,7 @@ async function runBooking(config) {
                 `Direct dry-run reached booking form for ${candidate.time}; navigation=${directResult.navigationMs}ms`,
               );
               await fsFinishRun(runId, {
-                result: 'dry_run',
+                result: 'DRY_RUN_PREBOOK_REACHED',
                 notes: `Direct dry-run; ${notes.join(' | ')}`,
                 latency_ms: Date.now() - startTime,
                 chosen_time: bookedTime,
@@ -4395,7 +4651,7 @@ async function runBooking(config) {
               if (browser && !isWarm) await browser.close();
               return {
                 success: true,
-                result: 'dry_run',
+                result: 'DRY_RUN_PREBOOK_REACHED',
                 bookedTime,
                 fallbackLevel,
                 latencyMs: Date.now() - startTime,
@@ -4582,7 +4838,7 @@ async function runBooking(config) {
           fallbackLevel = 0;
           notes.push(`Dry-run; fire_latency=${fireLatencyMs}ms`);
           await fsFinishRun(runId, {
-            result: 'dry_run',
+            result: 'DRY_RUN_PREBOOK_REACHED',
             notes: `Dry-run; ${notes.join(' | ')}`,
             latency_ms: Date.now() - startTime,
             chosen_time: bookedTime,
@@ -4592,7 +4848,7 @@ async function runBooking(config) {
           if (browser && !isWarm) await browser.close();
           return {
             success: true,
-            result: 'dry_run',
+            result: 'DRY_RUN_PREBOOK_REACHED',
             bookedTime,
             fallbackLevel,
             latencyMs: Date.now() - startTime,
