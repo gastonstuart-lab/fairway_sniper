@@ -723,7 +723,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             ),
           TextButton(
             onPressed: _currentPage == 4 ? _saveJob : null,
-            child: const Text('Save',
+            child: const Text('Schedule',
                 style: TextStyle(
                     color: Colors.white, fontWeight: FontWeight.bold)),
           )
@@ -813,7 +813,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                           '• Tee: ${_teeTarget == 10 ? '10th Tee' : '1st Tee'}\n'
                           '• Preferred Times: ${_preferredTimes.isNotEmpty ? _preferredTimes.join(', ') : 'Not selected'}\n'
                           '• Total Players: $_partySize\n\n'
-                          'Job saved as draft / paused. It will not contact BRS until armed.',
+                          'Completing this will schedule the sniper with production immediately.',
                           style: Theme.of(context)
                               .textTheme
                               .bodySmall
