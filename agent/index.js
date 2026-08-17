@@ -2438,7 +2438,6 @@ if (process.env.AGENT_RUN_MAIN === 'true') {
   if (!schedulerRunning) {
     schedulerRunning = true;
     startSniperRunner();
-    startWarmUpScheduler();
   }
 }
 

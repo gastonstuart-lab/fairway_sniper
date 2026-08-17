@@ -57,6 +57,12 @@ test('scheduler records persistent lifecycle events for production reconstructio
   }
 });
 
+test('production startup uses only the deterministic PREP/FIRE runner', () => {
+  const startup = agentSource.slice(agentSource.indexOf("if (process.env.AGENT_RUN_MAIN === 'true')"));
+  assert(startup.includes('startSniperRunner();'));
+  assert(!startup.includes('startWarmUpScheduler();'));
+});
+
 test('expired pre-fire jobs are explicitly failed instead of waiting forever', () => {
   const body = functionBody(agentSource, 'scheduleClaimedJob');
   assert(body.includes('SNIPER_MISSED_FIRE_GRACE_MS'));
