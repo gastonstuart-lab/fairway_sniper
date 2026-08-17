@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart' show Firebase;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/booking_prefetch_service.dart';
 import 'package:fairway_sniper/services/agent_base_url.dart';
+import 'package:fairway_sniper/services/safe_proof_builder.dart';
+import 'package:fairway_sniper/services/safe_proof_status.dart';
 import 'package:fairway_sniper/services/weather_service.dart';
 import 'package:fairway_sniper/services/golf_news_service.dart';
 import 'package:fairway_sniper/models/booking_job.dart';
@@ -45,6 +46,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   bool _proofRunning = false;
   String? _proofJobId;
   String? _proofStatusMessage;
+  StreamSubscription<Map<String, dynamic>?>? _proofWatchSub;
 
   @override
   void initState() {
@@ -59,6 +61,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
+    _proofWatchSub?.cancel();
     _newsScrollController.dispose();
     super.dispose();
   }
@@ -169,28 +172,148 @@ class _DashboardScreenState extends State<DashboardScreen> {
         'Production agent has not registered both PREP and FIRE timers yet.',
       );
     }
+    final secondsUntilPrep = data['secondsUntilPrep'];
+    final secondsUntilFire = data['secondsUntilFire'];
+    if (secondsUntilPrep is num &&
+        secondsUntilFire is num &&
+        !(secondsUntilPrep > 0 && secondsUntilFire > secondsUntilPrep)) {
+      throw Exception(
+        'Safe proof timers are not future-scheduled: prep=${secondsUntilPrep}s, fire=${secondsUntilFire}s.',
+      );
+    }
 
     final fireTime = data['computedFireTimeUtc'] ?? data['scheduledFor'];
     final prepTime = data['computedPrepTimeUtc'];
     final warmState = data['warmState'] ?? 'not warmed yet';
     final timerDetails = data['timerDetails'];
-final prepTimer = timerDetails is Map ? timerDetails['prepTimer'] : null;
-final fireTimer = timerDetails is Map ? timerDetails['fireTimer'] : null;
-final prepTimerId = prepTimer is Map ? prepTimer['timerId'] : null;
-final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
+    final prepTimer = timerDetails is Map ? timerDetails['prepTimer'] : null;
+    final fireTimer = timerDetails is Map ? timerDetails['fireTimer'] : null;
+    final prepTimerId = prepTimer is Map ? prepTimer['timerId'] : null;
+    final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
     final shortId = jobId.length <= 6 ? jobId : jobId.substring(0, 6);
     return 'Production confirmed job $shortId: prep=$prepTime (timer=$prepTimerId), fire=$fireTime (timer=$fireTimerId), warm=$warmState.';
   }
 
   void _showSnack(String message) {
-  if (!mounted) return;
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text(message)),
-  );
-}
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Future<Duration> _loadProductionPrepLead() async {
+    final baseUrl = await getAgentBaseUrl();
+    final response = await http
+        .get(Uri.parse('$baseUrl/api/runtime-status'))
+        .timeout(const Duration(seconds: 12));
+    if (response.statusCode != 200) {
+      return const Duration(minutes: 4);
+    }
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final raw = data['sniperPrepLeadMs'];
+    if (raw is int && raw >= 0) return Duration(milliseconds: raw);
+    return const Duration(minutes: 4);
+  }
+
+  int? _slotOpenSlots(Map<String, dynamic> slot) {
+    final raw = slot['openSlots'] ?? slot['open_slots'];
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    return int.tryParse(raw?.toString() ?? '');
+  }
+
+  Future<SafeProofCandidate> _findSafeProofCandidate(
+    BookingJob template,
+    Map<String, String> creds,
+  ) async {
+    final baseUrl = await getAgentBaseUrl();
+    final start = DateTime.now();
+    final startKey =
+        '${start.year.toString().padLeft(4, '0')}-${start.month.toString().padLeft(2, '0')}-${start.day.toString().padLeft(2, '0')}';
+    final response = await http
+        .post(
+          Uri.parse('$baseUrl/api/fetch-tee-times-range'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'startDate': startKey,
+            'days': 14,
+            'username': creds['username'],
+            'password': creds['password'],
+            'reuseBrowser': true,
+            'teeMode': template.teeMode,
+            'teeTarget': template.teeTarget,
+            'includeUnavailable': false,
+            'partySize': template.partySize ?? template.players.length + 1,
+          }),
+        )
+        .timeout(const Duration(minutes: 3));
+    if (response.statusCode != 200) {
+      throw StateError('safe-availability-fetch-failed');
+    }
+    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final days = decoded['days'];
+    if (decoded['success'] != true || days is! List) {
+      throw StateError('safe-availability-fetch-failed');
+    }
+
+    final partySize = template.partySize ?? template.players.length + 1;
+    final preferred = template.preferredTimes.toSet();
+    SafeProofCandidate? fallback;
+    final preferredTee = template.teeTarget == 10 ? 10 : 1;
+    final teeKey = preferredTee == 10 ? 'tee10' : 'tee1';
+    bool isBookableSlot(Map<String, dynamic> slot) {
+      final state = slot['state']?.toString().toLowerCase();
+      final bookable = slot['bookable'];
+      final href = slot['href']?.toString();
+      return state == 'bookable' &&
+          bookable == true &&
+          href != null &&
+          href.isNotEmpty;
+    }
+
+    for (final rawDay in days.whereType<Map>()) {
+      final day = rawDay.cast<String, dynamic>();
+      final date = day['date']?.toString();
+      if (date == null || date.isEmpty) continue;
+      final teeData = day[teeKey];
+      final slots = (teeData is Map && teeData['safeProofCandidates'] is List)
+          ? teeData['safeProofCandidates'] as List
+          : (day['safeProofCandidates'] is List)
+              ? day['safeProofCandidates'] as List
+              : (day['slots'] is List)
+                  ? day['slots'] as List
+                  : (teeData is Map && teeData['slots'] is List)
+                      ? teeData['slots'] as List
+                      : const [];
+      for (final rawSlot in slots.whereType<Map>()) {
+        final slot = rawSlot.cast<String, dynamic>();
+        final time = slot['time']?.toString();
+        if (time == null || time.isEmpty) continue;
+        if (!isBookableSlot(slot)) continue;
+        final openSlots = _slotOpenSlots(slot);
+        if (partySize > 1 && (openSlots == null || openSlots < partySize)) {
+          continue;
+        }
+        final candidate = SafeProofCandidate(
+          date: date,
+          time: time,
+          tee: preferredTee,
+        );
+        if (date == template.targetDate && preferred.contains(time)) {
+          return candidate;
+        }
+        fallback ??= candidate;
+      }
+    }
+    if (fallback == null) {
+      throw StateError('no-current-bookable-proof-candidate');
+    }
+    return fallback;
+  }
 
   Future<void> _runSafeProductionProof(List<BookingJob> jobs) async {
     if (_proofRunning) return;
+    _proofWatchSub?.cancel();
     final uid = _firebaseService.currentUserId;
     if (uid == null) {
       _showSnack('Not logged in');
@@ -211,46 +334,20 @@ final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
 
     try {
       final nowUtc = DateTime.now().toUtc();
-      final fireOverrideUtc = nowUtc.add(const Duration(minutes: 3));
-      final template = jobs.where((j) => j.bookingMode == BookingMode.sniper).toList();
-      final base = template.isNotEmpty ? template.first : null;
-      final targetDate = base?.targetDate ??
-          DateFormat('yyyy-MM-dd').format(nowUtc.add(const Duration(days: 1)));
-      final targetDateParts = targetDate.split('-').map(int.parse).toList();
-      final targetPlayDateUtc = DateTime.utc(
-        targetDateParts[0],
-        targetDateParts[1],
-        targetDateParts[2],
+      final template = selectSafeProofTemplate(jobs);
+      if (template == null) {
+        throw StateError(
+            'No real sniper job is available as a proof template.');
+      }
+      final prepLead = await _loadProductionPrepLead();
+      final candidate = await _findSafeProofCandidate(template, creds);
+      final proofData = buildSafeProofPayload(
+        ownerUid: uid,
+        template: template,
+        nowUtc: nowUtc,
+        prepLead: prepLead,
+        candidate: candidate,
       );
-      final preferredTimes = base?.preferredTimes.isNotEmpty == true
-          ? base!.preferredTimes
-          : <String>['11:12'];
-      final proofData = <String, dynamic>{
-        'ownerUid': uid,
-        'mode': 'sniper',
-        'status': 'active',
-        'state': 'queued',
-        'club': base?.club ?? 'galgorm',
-        'tz': 'Europe/London',
-        'release_day': DateFormat('EEEE').format(targetPlayDateUtc),
-        'release_time_local': '19:20',
-        'target_day': DateFormat('EEEE').format(targetPlayDateUtc),
-        'target_date': targetDate,
-        'target_play_date': Timestamp.fromDate(targetPlayDateUtc),
-        'preferred_times': preferredTimes,
-        'players': const <String>[],
-        'party_size': 1,
-        'tee': base?.teeTarget ?? 1,
-        'tee_target': base?.teeTarget ?? 1,
-        'tee_mode': base?.teeMode ?? 'single',
-        'fallback_tee': base?.fallbackTee ?? false,
-        'dry_run': true,
-        'proof_run': true,
-        'proof_label': 'safe_production_proof',
-        'proof_fire_time_override_utc': Timestamp.fromDate(fireOverrideUtc),
-        'created_at': FieldValue.serverTimestamp(),
-        'updated_at': FieldValue.serverTimestamp(),
-      };
 
       final proofJobId = await _firebaseService.createJobFromMap(proofData);
       final message = await _verifyProductionAgentCanSeeJob(proofJobId);
@@ -259,12 +356,14 @@ final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
         _proofJobId = proofJobId;
         _proofStatusMessage = message;
       });
+      _watchSafeProofUntilTerminal(proofJobId);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(message), duration: const Duration(seconds: 8)),
       );
     } catch (e) {
       if (!mounted) return;
       setState(() {
+        _proofRunning = false;
         _proofStatusMessage = 'Proof failed to start: $e';
       });
       ScaffoldMessenger.of(context).showSnackBar(
@@ -274,13 +373,58 @@ final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
           duration: const Duration(seconds: 10),
         ),
       );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _proofRunning = false;
-        });
-      }
     }
+  }
+
+  void _watchSafeProofUntilTerminal(String proofJobId) {
+    _proofWatchSub?.cancel();
+    _proofWatchSub = _firebaseService.watchJob(proofJobId).listen((data) {
+      if (!mounted || data == null) return;
+      final view = classifySafeProofStatus(data);
+      if (!view.isTerminal) return;
+      setState(() {
+        _proofRunning = false;
+        _proofStatusMessage = view.title;
+      });
+      _proofWatchSub?.cancel();
+      _proofWatchSub = null;
+    }, onError: (Object error) {
+      if (!mounted) return;
+      setState(() {
+        _proofRunning = false;
+        _proofStatusMessage = 'Proof watch failed: $error';
+      });
+    });
+  }
+
+  String _proofDisplayText(String jobId, Map<String, dynamic> data) {
+    final status = (data['status'] ?? '').toString();
+    final state = (data['state'] ?? '').toString();
+    final result = (data['result'] ?? '').toString();
+    final error = (data['error_message'] ?? '').toString();
+    final boundary = data['prebook_boundary'];
+    final view = classifySafeProofStatus(data);
+    final shortId = jobId.length <= 6 ? jobId : jobId.substring(0, 6);
+    final parts = <String>[
+      view.title,
+      'Job $shortId: ${status.toUpperCase()}${state.isNotEmpty ? ' / ${state.toUpperCase()}' : ''}${result.isNotEmpty ? ' / $result' : ''}',
+      if (data['proof_template_job_id'] != null)
+        'Template: ${data['proof_template_job_id']}',
+      if (data['proof_party_size'] != null)
+        'Party size: ${data['proof_party_size']}',
+      if (data['proof_candidate_date'] != null &&
+          data['proof_candidate_time'] != null)
+        'Candidate: ${data['proof_candidate_date']} ${data['proof_candidate_time']} tee ${data['proof_candidate_tee']}',
+      if (data['fire_timer_drift_ms'] != null)
+        'Fire drift: ${data['fire_timer_drift_ms']}ms',
+      if (boundary is Map) ...[
+        'Players validated: ${boundary['playersFilledOk'] == true ? 'YES' : 'NO'}',
+        'Final submit verified: ${boundary['confirmControlVisible'] == true && boundary['confirmControlEnabled'] == true ? 'YES' : 'NO'}',
+        'Real booking submitted: NO',
+      ],
+      if (error.isNotEmpty) 'Error: $error',
+    ];
+    return parts.join('\n');
   }
 
   String _partySizeLabel(BookingJob job) {
@@ -2033,7 +2177,8 @@ final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
             ),
             const SizedBox(height: 12),
             ElevatedButton.icon(
-              onPressed: _proofRunning ? null : () => _runSafeProductionProof(jobs),
+              onPressed:
+                  _proofRunning ? null : () => _runSafeProductionProof(jobs),
               icon: _proofRunning
                   ? const SizedBox(
                       width: 16,
@@ -2042,7 +2187,7 @@ final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
                     )
                   : const Icon(Icons.play_arrow),
               label: Text(_proofRunning
-                  ? 'Starting proof...'
+                  ? 'Proof running...'
                   : 'Run Safe Production Proof'),
             ),
             if (_proofStatusMessage != null) ...[
@@ -2055,16 +2200,7 @@ final fireTimerId = fireTimer is Map ? fireTimer['timerId'] : null;
                 stream: _firebaseService.watchJob(_proofJobId!),
                 builder: (context, snapshot) {
                   final data = snapshot.data ?? const <String, dynamic>{};
-                  final status = (data['status'] ?? '').toString();
-                  final state = (data['state'] ?? '').toString();
-                  final result = (data['result'] ?? '').toString();
-                  final error = (data['error_message'] ?? '').toString();
-                  final shortId = _proofJobId!.length <= 6
-                      ? _proofJobId!
-                      : _proofJobId!.substring(0, 6);
-                  return Text(
-                    'Proof job $shortId: ${status.toUpperCase()}${state.isNotEmpty ? ' / ${state.toUpperCase()}' : ''}${result.isNotEmpty ? ' / $result' : ''}${error.isNotEmpty ? ' / $error' : ''}',
-                  );
+                  return Text(_proofDisplayText(_proofJobId!, data));
                 },
               ),
             ],

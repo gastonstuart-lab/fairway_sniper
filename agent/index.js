@@ -14,6 +14,17 @@ import {
   evaluateSlotCandidate,
 } from './slot_policy.js';
 import { getEntryOpenSlots } from './tee_data_policy.js';
+import {
+  DRY_RUN_PREBOOK_REACHED,
+  inspectConfirmControl,
+  validatePrebookBoundary,
+} from './prebook_boundary.js';
+import { validatePartyPlayers } from './party_validation.js';
+import {
+  filterSafeProofCandidates,
+  normalizeSafeAvailabilityFromTeeData,
+} from './safe_availability.js';
+import { resolveRunLogId } from './run_log_timing.js';
 import os from 'os';
 import crypto from 'crypto';
 
@@ -272,6 +283,7 @@ app.get('/api/runtime-status', (_req, res) => {
     firestoreConnected: Boolean(db && firebaseAdminReady),
     agentRunMain: process.env.AGENT_RUN_MAIN === 'true',
     sniperRunnerStarted,
+    sniperPrepLeadMs: getPrepLeadMs(),
     activeSniperTimers: timerSummary,
     acceptedActiveJobs: timerSummary.jobs,
     timers: Array.from(jobTimers.values()).map((entry) => ({
@@ -335,10 +347,10 @@ const isAdminDevToolRequest = (req) =>
 
 const blockAccidentalLiveEndpoint = (req, res, endpointName) => {
   const dryRun = parseBooleanFlag(req?.body?.dryRun, false);
-  if (dryRun || isAdminDevToolRequest(req)) return false;
+  if (dryRun) return false;
   res.status(403).json({
     success: false,
-    error: `${endpointName} is an admin/dev live-booking tool. Use Firestore scheduled sniper jobs for production live bookings.`,
+    error: `${endpointName} cannot perform live bookings from client/dev requests. Use Firestore scheduled sniper jobs for production live bookings.`,
   });
   return true;
 };
@@ -347,6 +359,11 @@ const markDiagContext = (page, dateStr, tee) => {
   if (!page || !page.context) return;
   if (dateStr) page.context()._dateForDiagnostics = dateStr;
   page.context()._teeForDiagnostics = tee;
+};
+
+const normalizeCapacityValue = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  return Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : null;
 };
 
 const TEE_ROW_SELECTOR =
@@ -365,7 +382,7 @@ const TEE_CONTAINER_SELECTORS = [
 ];
 const TEE_TIME_REGEX_SOURCE = '\\b(?:[01]\\d|2[0-3]):[0-5]\\d\\b';
 
-async function collectTeeResult(page, tee, dateStr, includeUnavailable = false) {
+async function collectTeeResult(page, tee, dateStr, includeUnavailable = false, partySize = null) {
   try {
     await ensureTeeSelected(page, tee);
   } catch (error) {
@@ -377,14 +394,57 @@ async function collectTeeResult(page, tee, dateStr, includeUnavailable = false) 
   } catch (err) {
     console.warn('[TEE] Waiting for tee rows:', err?.message || err);
   }
+  const teeDataSlots = await fetchTeeDataAvailabilitySlots(page, dateStr, tee, includeUnavailable);
+  if (teeDataSlots.length) {
+    const result = {
+      tee,
+      count: teeDataSlots.length,
+      times: teeDataSlots.map((slot) => slot.time),
+      slots: teeDataSlots,
+      source: 'brs-tee-data',
+    };
+    if (partySize !== null && partySize !== undefined) {
+      result.safeProofCandidates = filterSafeProofCandidates(teeDataSlots, { partySize });
+    }
+    return result;
+  }
   const { times, slots, debug } = await scrapeAvailableTimes(page, { includeUnavailable });
-  return {
+  const result = {
     tee,
     count: Array.isArray(times) ? times.length : 0,
     times,
     slots,
     debug,
   };
+  if (partySize !== null && partySize !== undefined) {
+    result.safeProofCandidates = filterSafeProofCandidates(slots, { partySize });
+  }
+  return result;
+}
+
+async function fetchTeeDataAvailabilitySlots(page, dateStr, tee, includeUnavailable = false) {
+  if (!page?.context) return [];
+  try {
+    const response = await page.context().request.get(teeSheetDataUrlForDate(dateStr, tee), {
+      headers: {
+        'x-requested-with': 'XMLHttpRequest',
+        accept: 'application/json, text/javascript, */*; q=0.01',
+        'cache-control': 'no-cache, no-store, max-age=0',
+        pragma: 'no-cache',
+      },
+      timeout: 3500,
+    });
+    if (!response.ok()) return [];
+    const payload = await response.json();
+    return normalizeSafeAvailabilityFromTeeData(payload, {
+      date: dateStr,
+      tee,
+      includeUnavailable,
+    });
+  } catch (error) {
+    console.warn('[TEE] BRS tee-data availability unavailable:', error?.message || error);
+    return [];
+  }
 }
 
 // Fetch available tee times for a single date
@@ -400,6 +460,9 @@ app.post('/api/fetch-tee-times', async (req, res) => {
       req.body?.includeUnavailable ?? req.query?.includeUnavailable,
       false,
     );
+    const partySizeForProof = Number.isFinite(Number(req.body?.partySize ?? req.query?.partySize))
+      ? Math.max(1, Math.min(4, Number.parseInt(req.body?.partySize ?? req.query?.partySize, 10)))
+      : null;
 
     if (!date || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing date/username/password' });
@@ -443,12 +506,12 @@ app.post('/api/fetch-tee-times', async (req, res) => {
     };
 
     if (teeMode === 'both') {
-      const tee1 = await collectTeeResult(page, 1, date, includeUnavailable);
-      const tee10 = await collectTeeResult(page, 10, date, includeUnavailable);
+      const tee1 = await collectTeeResult(page, 1, date, includeUnavailable, partySizeForProof);
+      const tee10 = await collectTeeResult(page, 10, date, includeUnavailable, partySizeForProof);
       response.tee1 = tee1;
       response.tee10 = tee10;
     } else {
-      const single = await collectTeeResult(page, teeTarget, date, includeUnavailable);
+      const single = await collectTeeResult(page, teeTarget, date, includeUnavailable, partySizeForProof);
       response.count = single.count;
       response.times = single.times;
       response.slots = single.slots;
@@ -476,6 +539,9 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
       req.body?.includeUnavailable ?? req.query?.includeUnavailable,
       false,
     );
+    const partySizeForProof = Number.isFinite(Number(req.body?.partySize ?? req.query?.partySize))
+      ? Math.max(1, Math.min(4, Number.parseInt(req.body?.partySize ?? req.query?.partySize, 10)))
+      : null;
     if (!startDate || !username || !password) {
       return res.status(400).json({ success: false, error: 'Missing startDate/username/password' });
     }
@@ -521,8 +587,8 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
       }
 
       if (teeMode === 'both') {
-        const tee1 = await collectTeeResult(page, 1, targetDate, includeUnavailable);
-        const tee10 = await collectTeeResult(page, 10, targetDate, includeUnavailable);
+        const tee1 = await collectTeeResult(page, 1, targetDate, includeUnavailable, partySizeForProof);
+        const tee10 = await collectTeeResult(page, 10, targetDate, includeUnavailable, partySizeForProof);
         results.push({
           date: targetDate,
           teeMode,
@@ -531,7 +597,7 @@ app.post('/api/fetch-tee-times-range', async (req, res) => {
           tee10,
         });
       } else {
-        const single = await collectTeeResult(page, teeTarget, targetDate, includeUnavailable);
+        const single = await collectTeeResult(page, teeTarget, targetDate, includeUnavailable, partySizeForProof);
         const entry = {
           date: targetDate,
           teeMode,
@@ -1098,6 +1164,12 @@ app.post('/api/sniper-test', async (req, res) => {
     if (!username || !password || !targetDate) {
       return res.status(400).json({ error: 'Missing required fields: username, password, targetDate' });
     }
+    const dryRun = parseBooleanFlag(req.body?.dryRun, true);
+    if (!dryRun) {
+      return res.status(403).json({
+        error: '/api/sniper-test is dry-run only; use Firestore scheduled sniper jobs for production live bookings.',
+      });
+    }
     const jobId = `sniper-${Date.now()}`;
     setJob(jobId, { status: 'queued', createdAt: new Date().toISOString() });
     const normalizedTeeTarget = parseTeeTarget(teeTarget ?? req.body?.tee);
@@ -1113,7 +1185,7 @@ app.post('/api/sniper-test', async (req, res) => {
       fireTimeUtc,
       teeTarget: normalizedTeeTarget,
       fallbackTee: normalizedFallbackTee,
-      dryRun: parseBooleanFlag(req.body?.dryRun, true),
+      dryRun,
     });
     const job = getJob(jobId);
     res.json({ jobId, scheduledFor: job?.scheduledFor, status: job?.status });
@@ -1519,8 +1591,21 @@ function buildFirestoreJobStatus(docId, data) {
     claimedBy: job.claimed_by || job.claimedBy || null,
     runId: job.run_id || job.runId || null,
     preferredTimes: serializeStatusValue(job.preferred_times || job.preferredTimes || []),
+    partySize: job.party_size ?? job.partySize ?? null,
+    playersCount: Array.isArray(job.players) ? job.players.length : null,
     tee: job.tee_target || job.teeTarget || job.tee || null,
     fallbackTee: job.fallback_tee || job.fallbackTee || false,
+    dryRun: parseBooleanFlag(job.dry_run ?? job.dryRun, false),
+    proofRun: parseBooleanFlag(job.proof_run ?? job.proofRun ?? job.safe_proof ?? job.safeProof, false),
+    proofTemplateJobId: job.proof_template_job_id || job.proofTemplateJobId || null,
+    proofCandidateDate: job.proof_candidate_date || job.proofCandidateDate || null,
+    proofCandidateTime: job.proof_candidate_time || job.proofCandidateTime || null,
+    proofCandidateTee: job.proof_candidate_tee || job.proofCandidateTee || null,
+    proofPartySize: job.proof_party_size || job.proofPartySize || null,
+    prebookBoundary: serializeStatusValue(job.prebook_boundary || job.prebookBoundary || null),
+    fireTimerDriftMs: job.fire_timer_drift_ms ?? job.fireTimerDriftMs ?? null,
+    bookingHotPathDeltaMs: job.booking_hot_path_delta_ms ?? job.bookingHotPathDeltaMs ?? null,
+    firstBrsActionDeltaMs: job.first_brs_action_delta_ms ?? job.firstBrsActionDeltaMs ?? null,
     result: job.result || null,
     bookedTime: job.booked_time || job.bookedTime || null,
     errorMessage: job.error_message || job.last_error || job.error || null,
@@ -1726,6 +1811,15 @@ async function scheduleClaimedJob(job) {
   const preferredTimesForLog = Array.isArray(job.preferred_times)
     ? normalizeStringList(job.preferred_times)
     : normalizeStringList(job.preferredTimes ?? job.preferred_times);
+  const playersForValidation = Array.isArray(job.players) ? job.players : [];
+  const partyValidation = validatePartyPlayers({
+    partySize: job.party_size ?? job.partySize ?? playersForValidation.length + 1,
+    players: playersForValidation,
+  });
+  if (!partyValidation.ok) {
+    await markJobError(jobId, partyValidation.error);
+    return;
+  }
   const ukNow = DateTime.now().setZone(job.tz || job.timezone || CONFIG.TZ_LONDON).toISO();
 
   console.log(`[RUNNER] Job found ${jobId}`);
@@ -1776,6 +1870,10 @@ async function scheduleClaimedJob(job) {
     prepTimer: null,
     fireTimer: null,
     bookingAttempted: false,
+    cachedJob: job,
+    cachedCreds: null,
+    preparedRunId: null,
+    preparedRunPromise: null,
   };
   jobTimers.set(jobId, timerEntry);
 
@@ -1789,6 +1887,24 @@ async function scheduleClaimedJob(job) {
       const creds = await resolveJobCredentials(job);
       if (!creds?.username || !creds?.password) {
         throw new Error('missing-credentials');
+      }
+      entry.cachedCreds = creds;
+      entry.cachedJob = { ...job, players: partyValidation.players, party_size: partyValidation.partySize };
+      if (!entry.preparedRunId && !entry.preparedRunPromise) {
+        entry.preparedRunPromise = fsAddRun(
+          jobId,
+          job.ownerUid || job.owner_uid || 'unknown',
+          new Date(),
+          'Prepared during PREP warm-up',
+        )
+          .then((runId) => {
+            entry.preparedRunId = runId || null;
+            return entry.preparedRunId;
+          })
+          .catch((error) => {
+            console.warn('[RUN] PREP run-log creation failed:', error?.message || error);
+            return null;
+          });
       }
 
       entry.warmState = 'warming';
@@ -1837,6 +1953,8 @@ async function scheduleClaimedJob(job) {
   };
 
   const fireNow = async (source = 'fire-timer') => {
+    const fireCallbackAtMs = Date.now();
+    const fireTimerDriftMs = fireCallbackAtMs - fireMs;
     const entry = jobTimers.get(jobId);
     if (!entry || entry.bookingAttempted) return;
     entry.bookingAttempted = true;
@@ -1845,25 +1963,21 @@ async function scheduleClaimedJob(job) {
       entry.fireTimer.state = 'fired';
       entry.fireTimer.firedAt = new Date().toISOString();
     }
-    await fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED', {
+    void fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED', {
       source,
       fireTimeUtc: scheduleAt.toISOString(),
+      fireCallbackAtUtc: new Date(fireCallbackAtMs).toISOString(),
+      fireTimerDriftMs,
     });
-    await fsUpdateJob(jobId, { state: 'firing' });
+    void fsUpdateJob(jobId, {
+      state: 'firing',
+      fire_callback_at: admin.firestore.Timestamp.fromMillis(fireCallbackAtMs),
+      fire_timer_drift_ms: fireTimerDriftMs,
+    });
     try {
-      let runJob = job;
-      if (db) {
-        try {
-          const latestSnap = await db.collection(JOBS_COLLECTION).doc(jobId).get();
-          if (latestSnap.exists) runJob = { id: latestSnap.id, ...latestSnap.data() };
-        } catch (latestError) {
-          await fsAddJobEvent(jobId, 'JOB_REREAD_FAILED', {
-            error: latestError?.message || String(latestError),
-          });
-        }
-      }
+      let runJob = entry.cachedJob || job;
       const ownerUid = runJob.ownerUid || runJob.owner_uid || 'unknown';
-      const creds = await resolveJobCredentials(runJob);
+      const creds = entry.cachedCreds || await resolveJobCredentials(runJob);
       const preferredTimes = Array.isArray(runJob.preferred_times)
         ? normalizeStringList(runJob.preferred_times)
         : normalizeStringList(runJob.preferredTimes ?? runJob.preferred_times);
@@ -1878,8 +1992,9 @@ async function scheduleClaimedJob(job) {
 
       let fireWarmPage = warmPage;
       if (!fireWarmPage) {
-        await fsAddJobEvent(jobId, 'BRS_NOT_READY_AT_FIRE_TIME', {
+        void fsAddJobEvent(jobId, 'BRS_NOT_READY_AT_FIRE_TIME', {
           warmState: entry.warmState || 'pending',
+          fireTimerDriftMs,
         });
         try {
           fireWarmPage = await Promise.race([
@@ -1893,13 +2008,20 @@ async function scheduleClaimedJob(job) {
         }
       }
 
-      await fsUpdateJob(jobId, { state: 'booking' });
-      await fsAddJobEvent(jobId, 'BOOKING_STARTED', {
+      const bookingHotPathStartMs = Date.now();
+      void fsUpdateJob(jobId, {
+        state: 'booking',
+        booking_hot_path_start_at: admin.firestore.Timestamp.fromMillis(bookingHotPathStartMs),
+        booking_hot_path_delta_ms: bookingHotPathStartMs - fireCallbackAtMs,
+      });
+      void fsAddJobEvent(jobId, 'BOOKING_STARTED', {
         fireTimeUtc: scheduleAt.toISOString(),
         targetDate: getTargetDateKeyFromJob(runJob) || targetDateKey,
         preferredTimes,
         teeTarget: teeConfig.teeTarget,
         dryRun,
+        fireTimerDriftMs,
+        bookingHotPathDeltaMs: bookingHotPathStartMs - fireCallbackAtMs,
       });
 
       const result = await runBooking({
@@ -1924,22 +2046,39 @@ async function scheduleClaimedJob(job) {
         teeTarget: teeConfig.teeTarget,
         fallbackTee: teeConfig.fallbackTee,
         sourcePath: 'firestore-runner',
+        preparedRunId: entry.preparedRunId,
+        fireCallbackAtMs,
+        bookingHotPathStartMs,
       });
 
-      const isSuccess = result?.success === true;
+      const rawSuccess = result?.success === true;
       const isProof = isProofDryRunJob(runJob);
-      const reachedDryRunBoundary = result?.result === 'DRY_RUN_PREBOOK_REACHED';
+      const boundaryConsistency = isProof
+        ? validateProofBoundaryConsistency(runJob, result)
+        : { ok: true, error: null };
+      const reachedDryRunBoundary =
+        result?.result === 'DRY_RUN_PREBOOK_REACHED' && boundaryConsistency.ok;
+      const isSuccess = rawSuccess && (!isProof || reachedDryRunBoundary);
       if (reachedDryRunBoundary) {
         await fsAddJobEvent(jobId, 'DRY_RUN_PREBOOK_REACHED', {
           bookedTime: result?.bookedTime || null,
           teeSelected: result?.teeSelected || null,
           verificationSignal: result?.verification_signal ?? result?.verificationSignal ?? null,
+          prebookBoundary: result?.prebookBoundary || result?.prebook_boundary || null,
+          fireTimerDriftMs: result?.fire_timer_drift_ms ?? result?.fireTimerDriftMs ?? fireTimerDriftMs,
+          bookingHotPathDeltaMs:
+            result?.booking_hot_path_delta_ms ?? result?.bookingHotPathDeltaMs ?? null,
+          firstBrsActionDeltaMs:
+            result?.first_brs_action_delta_ms ?? result?.firstBrsActionDeltaMs ?? null,
         });
       }
       if (isProof) {
         await fsAddJobEvent(jobId, reachedDryRunBoundary ? 'PROOF_SUCCESS' : 'PROOF_FAILED', {
           result: result?.result || null,
-          error: reachedDryRunBoundary ? null : result?.error || 'proof-boundary-not-reached',
+          error: reachedDryRunBoundary
+            ? null
+            : boundaryConsistency.error || result?.error || 'proof-boundary-not-reached',
+          prebookBoundary: result?.prebookBoundary || result?.prebook_boundary || null,
         });
       }
       if (!(isProof && reachedDryRunBoundary)) {
@@ -1961,13 +2100,23 @@ async function scheduleClaimedJob(job) {
         players_requested: result?.playersRequested || null,
         players_filled: result?.playersFilled || null,
         field_diagnostics: result?.fieldDiagnostics || null,
+        prebook_boundary: result?.prebookBoundary || result?.prebook_boundary || null,
         candidate_diagnostics: result?.candidateDiagnostics || null,
         available_times: result?.availableTimes || null,
         tee_selected: result?.teeSelected || null,
         requested_tee: teeConfig.teeTarget,
         finished_at: admin.firestore.FieldValue.serverTimestamp(),
-        error_message: isSuccess ? null : result?.error || 'clicked but no confirmation',
+        error_message:
+          isSuccess ? null : boundaryConsistency.error || result?.error || 'clicked but no confirmation',
         click_delta_ms: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
+        fire_timer_drift_ms: result?.fire_timer_drift_ms ?? result?.fireTimerDriftMs ?? fireTimerDriftMs,
+        booking_hot_path_delta_ms:
+          result?.booking_hot_path_delta_ms ?? result?.bookingHotPathDeltaMs ?? null,
+        first_brs_action_delta_ms:
+          result?.first_brs_action_delta_ms ?? result?.firstBrsActionDeltaMs ?? null,
+        booking_form_reached_ms: result?.bookingFormReachedMs ?? result?.booking_form_reached_ms ?? null,
+        prebook_boundary_reached_ms:
+          result?.prebook_boundary_reached_ms ?? result?.prebookBoundaryReachedMs ?? null,
         verification_url: result?.verification_url ?? result?.verificationUrl ?? null,
         verification_signal: result?.verification_signal ?? result?.verificationSignal ?? null,
         booking_links_count_after_click:
@@ -2591,9 +2740,10 @@ function teeSheetUrlForDate(date) {
   return `https://members.brsgolf.com/galgorm/tee-sheet/1/${year}/${month}/${day}`;
 }
 
-function teeSheetDataUrlForDate(date) {
+function teeSheetDataUrlForDate(date, tee = 1) {
   const { year, month, day } = datePartsForTeeSheet(date);
-  return `https://members.brsgolf.com/galgorm/tee-sheet/data/1/${year}/${month}/${day}?_=${Date.now()}`;
+  const teeSegment = parseTeeTarget(tee);
+  return `https://members.brsgolf.com/galgorm/tee-sheet/data/${teeSegment}/${year}/${month}/${day}?_=${Date.now()}`;
 }
 
 function pageMatchesDate(page, date) {
@@ -2746,6 +2896,9 @@ async function scrapeAvailableTimes(page, { includeUnavailable = false } = {}) {
   }
 
   let slots = Array.from(timeMap.values());
+  if (!includeUnavailable) {
+    slots = slots.filter((slot) => slot.state === 'bookable' && (slot.href || slot.source === 'booking-link-fallback'));
+  }
   slots.sort((a, b) => a.time.localeCompare(b.time));
 
   let times = slots.map((slot) => slot.time);
@@ -2813,13 +2966,16 @@ function escapeRegex(str) {
  * @param {number} openSlots - Number of available slots (1-4)
  * @returns {Promise<{filled: string[], skippedReason?: string, confirmationText?: string}>}
  */
-async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun = false) {
+async function fillPlayersAndConfirm(page, players = [], openSlots = null, dryRun = false, options = {}) {
   const result = {
     filled: [],
     skippedReason: null,
     confirmationText: null,
     fieldDiagnostics: [],
   };
+  const partySize = options.partySize !== null && options.partySize !== undefined && options.partySize !== '' && Number.isFinite(Number(options.partySize))
+    ? Math.max(1, Math.min(4, Number.parseInt(options.partySize, 10)))
+    : Math.max(1, Math.min(4, (Array.isArray(players) ? players.length : 0) + 1));
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page
@@ -2828,10 +2984,14 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     })
     .catch(() => {});
 
-  const normalizedOpenSlots = Number.isFinite(Number(openSlots))
-    ? Math.max(0, Number(openSlots))
-    : 3;
-  if (players.length > normalizedOpenSlots) {
+  const normalizedOpenSlots = normalizeCapacityValue(openSlots);
+  if (partySize > 1 && normalizedOpenSlots === null) {
+    console.log('  Capacity is not proven for multi-player party.');
+    result.skippedReason = 'capacity-unproven';
+    result.confirmationText = 'capacity-unproven';
+    return result;
+  }
+  if (normalizedOpenSlots !== null && normalizedOpenSlots < partySize) {
     console.log(
       `  ⚠️ Full party does not fit: ${players.length} additional player(s), ${normalizedOpenSlots} open slot(s).`,
     );
@@ -2840,15 +3000,14 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     return result;
   }
 
-  // Only try to fill as many players as slots permit (max 3 additional players = slots 2, 3, 4)
-  const playersToFill = players.slice(0, Math.min(normalizedOpenSlots, 3));
+  const playersToFill = Array.isArray(players) ? [...players] : [];
 
   console.log(
     `  👥 Attempting to fill ${playersToFill.length} player(s) (${normalizedOpenSlots} slot(s) available)...`,
   );
 
   // If no additional players needed, skip directly to confirmation
-  if (playersToFill.length === 0 && openSlots > 0) {
+  if (playersToFill.length === 0 && (normalizedOpenSlots === null || normalizedOpenSlots > 0)) {
     console.log(
       `  ℹ️ Only logged-in user (Player 1) needed. Skipping player selection.`,
     );
@@ -2867,8 +3026,10 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
     try {
       console.log(`    🔍 Player ${playerNum}: "${playerName}"...`);
 
+      const isNumericPlayerId = /^\d+$/.test(playerName);
+
       // Strategy 0: Select by ID (preferred for sniper jobs)
-      if (/^\d+$/.test(playerName)) {
+      if (isNumericPlayerId) {
         const selectId = `#member_booking_form_player_${playerNum}`;
         const selectElem = page.locator(selectId).first();
         if (await selectElem.count()) {
@@ -2895,7 +3056,16 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
               };
             }, playerName)
             .catch((error) => ({ error: error?.message || String(error) }));
-          result.fieldDiagnostics.push({ playerNum, requested: playerName, ...fieldInfo });
+          result.fieldDiagnostics.push({
+            playerNum,
+            requested: playerName,
+            numericId: true,
+            strategy: 'select-by-id',
+            fieldExists: true,
+            selectSucceeded: false,
+            selectedRequestedValue: false,
+            ...fieldInfo,
+          });
           if (fieldInfo?.disabled) {
             console.log(`    ⚠️ Player ${playerNum}: field ${selectId} is disabled`);
             continue;
@@ -2907,16 +3077,50 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
           try {
             await selectElem.selectOption({ value: playerName }, { timeout: 2000 });
             await page.waitForTimeout(500);
+            const selectedAfter = await selectElem
+              .evaluate((el) => ({
+                selectedValue: el.value || '',
+                selectedText:
+                  el.selectedOptions && el.selectedOptions[0]
+                    ? (el.selectedOptions[0].textContent || '').replace(/\s+/g, ' ').trim()
+                    : '',
+              }))
+              .catch(() => null);
+            const diag = result.fieldDiagnostics[result.fieldDiagnostics.length - 1];
+            if (diag && selectedAfter) {
+              diag.selectSucceeded = true;
+              diag.selectedValueAfterSelect = selectedAfter.selectedValue;
+              diag.selectedTextAfterSelect = selectedAfter.selectedText;
+              diag.selectedRequestedValue = selectedAfter.selectedValue === String(playerName);
+            }
             console.log(
               `    ✅ Player ${playerNum}: ${playerName} (select by id)`,
             );
-            result.filled.push(playerName);
-            filled = true;
+            if (selectedAfter?.selectedValue === String(playerName)) {
+              result.filled.push(playerName);
+              filled = true;
+            } else {
+              console.log(`    Player ${playerNum}: selected value did not match ${playerName}`);
+            }
           } catch (e) {
             console.log(
               `    ℹ️ Strategy 0 (select by id) failed: ${e.message.substring(0, 50)}`,
             );
           }
+        } else {
+          result.fieldDiagnostics.push({
+            playerNum,
+            requested: playerName,
+            numericId: true,
+            strategy: 'select-by-id',
+            fieldExists: false,
+            selectSucceeded: false,
+            selectedRequestedValue: false,
+          });
+        }
+        if (!filled) {
+          console.log(`    Numeric member ID ${playerName} was not exactly verified; fuzzy fallback disabled`);
+          continue;
         }
       }
 
@@ -3088,7 +3292,20 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
 
   if (dryRun) {
     console.log('  💤 Dry-run enabled: skipping Create Booking click');
-    result.confirmationText = 'dry-run-no-confirm';
+    const boundary = await validatePrebookBoundary(page, {
+      players,
+      openSlots: normalizedOpenSlots,
+      partySize,
+      confirmResult: result,
+      candidateTime: options.candidateTime ?? null,
+      teeSelected: options.teeSelected ?? null,
+      capacityValidated:
+        normalizedOpenSlots === null ? partySize <= 1 : normalizedOpenSlots >= partySize,
+    });
+    result.prebookBoundary = boundary;
+    result.confirmationText = boundary.prebookBoundaryReached
+      ? DRY_RUN_PREBOOK_REACHED
+      : boundary.error;
     return result;
   }
 
@@ -3096,30 +3313,19 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
   console.log(`  🎯 Clicking Confirm button...`);
 
   try {
-    // Strategy 1: getByRole button with confirm text
-    let confirmBtn = page
-      .locator('#member_booking_form_confirm_booking')
+    const confirmState = await inspectConfirmControl(page);
+    const confirmBtn = page
+      .locator('form[name="member_booking_form"]')
+      .first()
+      .locator(
+        'button#member_booking_form_confirm_booking, input#member_booking_form_confirm_booking, button[type="submit"], input[type="submit"]',
+      )
       .first();
-
-    let btnVisible = await confirmBtn
-      .isVisible({ timeout: 3000 })
-      .catch(() => false);
-
-    // Strategy 2: Fallback locators
-    if (!btnVisible) {
-      confirmBtn = page
-        .locator(
-          'button#member_booking_form_confirm_booking, form[name="member_booking_form"] button[type="submit"], button:has-text("Create Booking"), button:has-text("Confirm"), button:has-text("Book"), button:has-text("Complete")',
-        )
-        .first();
-      btnVisible = await confirmBtn
-        .isVisible({ timeout: 2000 })
-        .catch(() => false);
-    }
+    const btnVisible = confirmState.visible && confirmState.enabled;
 
     if (btnVisible) {
       await confirmBtn.scrollIntoViewIfNeeded().catch(() => {});
-      await confirmBtn.click({ timeout: 5000, force: true });
+      await confirmBtn.click({ timeout: 5000 });
       console.log(`    ✅ Confirm button clicked`);
 
       // Wait for navigation/response
@@ -3180,7 +3386,9 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = 3, dryRun =
       return result;
     } else {
       console.log(`    ❌ Confirm button not found (timeout)`);
-      result.confirmationText = 'confirm-button-not-found';
+      result.confirmationText = confirmState.visible
+        ? 'confirm-control-disabled'
+        : 'confirm-button-not-found';
       return result;
     }
   } catch (error) {
@@ -3194,11 +3402,12 @@ async function tryBookTime(
   page,
   time,
   players = [],
-  openSlots = 3,
+  openSlots = null,
   cachedLocator = null,
   targetFireTime = Date.now(),
   jobId = null,
   dryRun = false,
+  options = {},
 ) {
   // Wait for tee sheet rows to exist
   console.log(`  ⏳ Waiting for tee sheet to load...`);
@@ -3254,21 +3463,32 @@ async function tryBookTime(
     console.log(`[FIRE] Delta ms: ${clickTime - targetFireTime}ms`);
     await page.waitForTimeout(2000);
 
-    const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
-    const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
-    const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
-    const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+    const capacityForPlayers = normalizeCapacityValue(openSlots);
+    const partySizeForBoundary = options.partySize !== null && options.partySize !== undefined && options.partySize !== '' && Number.isFinite(Number(options.partySize))
+      ? Number(options.partySize)
+      : players.length + 1;
+    const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun, {
+      partySize: partySizeForBoundary,
+      candidateTime: options.candidateTime ?? timeLabel,
+      teeSelected: options.teeSelected ?? null,
+    });
+    const expectedPlayersCount = players.length;
+    const boundary = confirmResult.prebookBoundary || {};
+    const formValidated = boundary.prebookBoundaryReached === true;
     if (dryRun) {
       return {
         booked: false,
         dryRun: true,
         formValidated,
+        prebookBoundaryReached: formValidated,
+        prebookBoundary: boundary,
+        result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
         playersFilled: confirmResult.filled,
-        playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+        playersRequested: players,
         confirmationText: confirmResult.confirmationText,
         skippedReason: confirmResult.skippedReason,
         fieldDiagnostics: confirmResult.fieldDiagnostics,
-        error: formValidated ? null : 'dry-run-players-missing',
+        error: formValidated ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
       };
     }
     const rowBooked =
@@ -3277,7 +3497,7 @@ async function tryBookTime(
     return {
       booked: rowBooked,
       playersFilled: confirmResult.filled,
-      playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+      playersRequested: players,
       confirmationText: confirmResult.confirmationText,
       skippedReason: confirmResult.skippedReason,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -3307,22 +3527,33 @@ async function tryBookTime(
   page.on('dialog', (dialog) => dialog.accept());
 
   // Call the unified player selection and confirmation helper
-  const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
-  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
-  const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
-  const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+  const capacityForPlayers = normalizeCapacityValue(openSlots);
+  const partySizeForBoundary = options.partySize !== null && options.partySize !== undefined && options.partySize !== '' && Number.isFinite(Number(options.partySize))
+    ? Number(options.partySize)
+    : players.length + 1;
+  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun, {
+    partySize: partySizeForBoundary,
+    candidateTime: options.candidateTime ?? time,
+    teeSelected: options.teeSelected ?? null,
+  });
+  const expectedPlayersCount = players.length;
+  const boundary = confirmResult.prebookBoundary || {};
+  const formValidated = boundary.prebookBoundaryReached === true;
   if (dryRun) {
     return {
       booked: false,
       dryRun: true,
       formValidated,
+      prebookBoundaryReached: formValidated,
+      prebookBoundary: boundary,
+      result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
       playersFilled: confirmResult.filled,
-      playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+      playersRequested: players,
       confirmationText: confirmResult.confirmationText,
       skippedReason: confirmResult.skippedReason,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs,
-      error: formValidated ? null : 'dry-run-players-missing',
+      error: formValidated ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
     };
   }
 
@@ -3345,7 +3576,7 @@ async function tryBookTime(
       verification.confirmed &&
       !confirmationBlocked(confirmResult.confirmationText),
     playersFilled: confirmResult.filled,
-    playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+    playersRequested: players,
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
     fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -3443,6 +3674,7 @@ async function executeReleaseBooking(
   dryRun = false,
   skipClick = false,
   clickDeltaOverride = null,
+  options = {},
 ) {
   // Click already executed in page context (skipClick=true for release mode)
   // clickDeltaOverride contains the fireLatencyMs from MutationObserver
@@ -3460,8 +3692,32 @@ async function executeReleaseBooking(
   }
   
   // Always run the normal booking flow to fill players (if any) and confirm
-  const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun);
+  const confirmResult = await fillPlayersAndConfirm(page, additionalPlayers, openSlots, dryRun, {
+    partySize: options.partySize ?? additionalPlayers.length + 1,
+    candidateTime: options.candidateTime ?? null,
+    teeSelected: options.teeSelected ?? null,
+  });
   const playersFilled = confirmResult.filled || [];
+  if (dryRun) {
+    const boundary = confirmResult.prebookBoundary || {};
+    const reached = boundary.prebookBoundaryReached === true;
+    return {
+      booked: false,
+      dryRun: true,
+      formValidated: reached,
+      prebookBoundaryReached: reached,
+      prebookBoundary: boundary,
+      result: reached ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
+      confirmationText: confirmResult.confirmationText,
+      playersFilled,
+      playersRequested: additionalPlayers,
+      fieldDiagnostics: confirmResult.fieldDiagnostics,
+      clickDeltaMs: fireLatencyMs,
+      verificationSignal: reached ? 'dry-run-prebook-boundary' : boundary.error,
+      verificationUrl: boundary.verificationUrl || page.url(),
+      error: reached ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
+    };
+  }
   // Wait for confirmation
   let confirmationText = confirmResult.confirmationText || '';
   let booked = false;
@@ -3633,7 +3889,7 @@ async function tryDirectBookingHref(
   page,
   candidate,
   players = [],
-  openSlots = 3,
+  openSlots = null,
   targetFireTime = Date.now(),
   jobId = null,
   dryRun = false,
@@ -3658,7 +3914,7 @@ async function tryDirectBookingHref(
   const navigationMs = Date.now() - navigationStarted;
   await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
 
-  const formSelector = '#member_booking_form_confirm_booking, form[name="member_booking_form"]';
+  const formSelector = 'form[name="member_booking_form"]';
   const formVisible = await page
     .locator(formSelector)
     .first()
@@ -3685,29 +3941,42 @@ async function tryDirectBookingHref(
     };
   }
 
-  const capacityForPlayers = Number.isFinite(Number(openSlots)) ? Number(openSlots) : 1;
-  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun);
-  const expectedPlayersCount = players.slice(0, Math.min(capacityForPlayers, 3)).length;
+  const bookingFormReachedMs = Date.now();
+  const capacityForPlayers = normalizeCapacityValue(openSlots);
+  const partySizeForBoundary = candidate?.partySize !== null && candidate?.partySize !== undefined && candidate?.partySize !== '' && Number.isFinite(Number(candidate?.partySize))
+    ? Number(candidate.partySize)
+    : players.length + 1;
+  const confirmResult = await fillPlayersAndConfirm(page, players, capacityForPlayers, dryRun, {
+    partySize: partySizeForBoundary,
+    candidateTime: candidate?.time ?? null,
+    teeSelected: candidate?.tee ?? null,
+  });
   if (dryRun) {
-    const formValidated = (confirmResult.filled || []).length >= expectedPlayersCount;
+    const boundary = confirmResult.prebookBoundary || {};
+    const formValidated = boundary.prebookBoundaryReached === true;
     const evidence = await savePageEvidence(page, `${jobId || 'direct'}-${time}-dry-run`);
     return {
       booked: false,
       dryRun: true,
       formValidated,
-      error: formValidated ? null : 'dry-run-players-missing',
+      prebookBoundaryReached: formValidated,
+      prebookBoundary: boundary,
+      result: formValidated ? DRY_RUN_PREBOOK_REACHED : 'DRY_RUN_PREBOOK_FAILED',
+      error: formValidated ? null : boundary.error || 'dry-run-prebook-boundary-not-reached',
       confirmationText: confirmResult.confirmationText,
       playersFilled: confirmResult.filled,
-      playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+      playersRequested: players,
       fieldDiagnostics: confirmResult.fieldDiagnostics,
       clickDeltaMs,
       navigationMs,
-      verificationSignal: 'dry-run',
-      verificationUrl: page.url(),
+      bookingFormReachedMs,
+      verificationSignal: formValidated ? 'dry-run-prebook-boundary' : boundary.error,
+      verificationUrl: boundary.verificationUrl || page.url(),
       ...evidence,
     };
   }
 
+  const expectedPlayersCount = players.length;
   const verification = await verifyBookingConfirmation(page, time, 8000);
   if (expectedPlayersCount > 0 && (confirmResult.filled || []).length < expectedPlayersCount) {
     verification.confirmed = false;
@@ -3723,7 +3992,7 @@ async function tryDirectBookingHref(
       verification.confirmed &&
       !confirmationBlocked(confirmResult.confirmationText),
     playersFilled: confirmResult.filled,
-    playersRequested: players.slice(0, Math.min(capacityForPlayers, 3)),
+    playersRequested: players,
     confirmationText: confirmResult.confirmationText,
     skippedReason: confirmResult.skippedReason,
     fieldDiagnostics: confirmResult.fieldDiagnostics,
@@ -3732,6 +4001,7 @@ async function tryDirectBookingHref(
     bookingLinksCountAfterClick: verification.bookingLinksCountAfterClick,
     clickDeltaMs,
     navigationMs,
+    bookingFormReachedMs,
     error:
       !verification.confirmed
         ? 'direct-clicked-but-no-confirmation'
@@ -3894,8 +4164,39 @@ function confirmationBlocked(confirmationText) {
     'confirm-clicked-no-confirmation-text',
     'players-missing-before-confirm',
     'insufficient-open-slots',
-    'dry-run-no-confirm',
   ].includes(confirmationText);
+}
+
+function normalizeTeeEvidence(value) {
+  if (value === null || value === undefined || value === '') return null;
+  return String(value).includes('10') ? 10 : 1;
+}
+
+function validateProofBoundaryConsistency(job, result) {
+  const boundary = result?.prebookBoundary || result?.prebook_boundary || null;
+  const candidateTime = normalizeTimeLabel(boundary?.candidateTime);
+  const bookedTime = normalizeTimeLabel(result?.bookedTime);
+  const expectedTime = normalizeTimeLabel(job?.proof_candidate_time);
+  const boundaryTee = normalizeTeeEvidence(boundary?.teeSelected);
+  const resultTee = normalizeTeeEvidence(result?.teeSelected);
+  const expectedTee = normalizeTeeEvidence(job?.proof_candidate_tee);
+
+  if (!candidateTime || !boundaryTee) {
+    return { ok: false, error: 'proof-boundary-missing-candidate-evidence' };
+  }
+  if (bookedTime && candidateTime !== bookedTime) {
+    return { ok: false, error: 'proof-boundary-candidate-time-mismatch' };
+  }
+  if (expectedTime && candidateTime !== expectedTime) {
+    return { ok: false, error: 'proof-boundary-proof-candidate-time-mismatch' };
+  }
+  if (resultTee && boundaryTee !== resultTee) {
+    return { ok: false, error: 'proof-boundary-tee-mismatch' };
+  }
+  if (expectedTee && boundaryTee !== expectedTee) {
+    return { ok: false, error: 'proof-boundary-proof-candidate-tee-mismatch' };
+  }
+  return { ok: true, error: null };
 }
 
 function preferredSlotRank(timeLabel, preferredLabels, nearestWindowMinutes = Number.POSITIVE_INFINITY) {
@@ -4205,6 +4506,9 @@ async function runBooking(config) {
     fallbackTee = false,
     includeUnavailable = false,
     sourcePath = 'endpoint/dev',
+    preparedRunId = null,
+    fireCallbackAtMs = null,
+    bookingHotPathStartMs = null,
   } = config;
   const normalizedTeeMode = teeMode === 'both' ? 'both' : 'single';
   const teeWasMissing = teeTarget === undefined && tee === undefined;
@@ -4227,11 +4531,20 @@ async function runBooking(config) {
   const notes = [];
   const requestedPreferredTimes = normalizeStringList(preferredTimes);
   const normalizedPreferredTimes = normalizePreferredTimeLabels(requestedPreferredTimes);
+  const effectivePartySize =
+    partySize === undefined || partySize === null ? players.length + 1 : partySize;
+  const partyValidation = validatePartyPlayers({
+    partySize: effectivePartySize,
+    players,
+  });
+  if (!partyValidation.ok) {
+    throw new Error(partyValidation.error);
+  }
   const slotPolicy = buildSlotPolicy({
     targetDate: targetDateStr,
     tee: normalizedTeeTarget,
     preferredTimes: normalizedPreferredTimes,
-    partySize,
+    partySize: partyValidation.partySize,
   });
   let bookedTime = null;
   let fallbackLevel = 0;
@@ -4259,7 +4572,11 @@ async function runBooking(config) {
       console.log(`[BOOKING] Fire time UTC: ${new Date(targetFireTime).toISOString()}`);
     }
     console.log(`[BOOKING] Current UK time: ${DateTime.now().setZone(CONFIG.TZ_LONDON).toISO()}`);
-    runId = await fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started');
+    runId = await resolveRunLogId({
+      preparedRunId,
+      sourcePath,
+      createRun: () => fsAddRun(jobId, ownerUid, new Date(), 'Booking attempt started'),
+    });
     notes.push(
       `source=${sourcePath}; target=${targetDateStr}; tee=${normalizedTeeTarget}; preferred=${normalizedPreferredTimes.join(',')}; party=${slotPolicy.partySize}`,
     );
@@ -4328,9 +4645,7 @@ async function runBooking(config) {
         time: slot.time,
         state: slot.state,
         href: slot.href,
-        openSlots: Number.isFinite(Number(slot.openSlots))
-          ? Number(slot.openSlots)
-          : null,
+        openSlots: normalizeCapacityValue(slot.openSlots),
       }));
     };
     let bookingSlots = Array.isArray(slotsData) ? [...slotsData] : [];
@@ -4342,7 +4657,7 @@ async function runBooking(config) {
         `[TEE] Available booking times detected: ${bookingSlots.map((slot) => slot.time).filter(Boolean).join(', ') || '(none)'}`,
       );
     }
-    const desiredAdditionalCount = typeof partySize === 'number' ? Math.max(0, partySize - 1) : players.length;
+    const desiredAdditionalCount = partyValidation.expectedAdditionalPlayers;
     const desiredPartySize = desiredAdditionalCount + 1;
     additionalPlayers = players.slice(0, desiredAdditionalCount);
     const selectPreferredTimesFromSlots = (slots, { bookableOnly = false } = {}) => {
@@ -4350,10 +4665,11 @@ async function runBooking(config) {
         (Array.isArray(slots) ? slots : [])
           .filter((slot) => {
             if (!slot?.time) return false;
-            if (desiredPartySize > 1 && !Number.isFinite(Number(slot.openSlots))) {
+            const slotOpenSlots = normalizeCapacityValue(slot.openSlots);
+            if (desiredPartySize > 1 && slotOpenSlots === null) {
               return false;
             }
-            if (Number.isFinite(Number(slot.openSlots)) && Number(slot.openSlots) < desiredPartySize) {
+            if (slotOpenSlots !== null && slotOpenSlots < desiredPartySize) {
               return false;
             }
             return !bookableOnly || slot.state === 'bookable' || !!slot.href;
@@ -4477,6 +4793,7 @@ async function runBooking(config) {
             notes.push(msg);
             continue;
           }
+          markFirstBrsAction();
           const bookingResult = await tryBookTime(
             page,
             time,
@@ -4486,6 +4803,11 @@ async function runBooking(config) {
             targetFireTime,
             jobId,
             dryRun,
+            {
+              partySize: desiredPartySize,
+              candidateTime: time,
+              teeSelected: teeCtx?.teeTarget ?? normalizedTeeTarget,
+            },
           );
           if (bookingResult && bookingResult.booked) {
             bookedTime = time;
@@ -4495,10 +4817,14 @@ async function runBooking(config) {
               `Booked ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}; Confirmation: ${bookingResult.confirmationText}`,
             );
             break;
-          } else if (bookingResult?.dryRun && bookingResult?.formValidated) {
+          } else if (bookingResult?.dryRun && bookingResult?.prebookBoundaryReached) {
             bookedTime = time;
             const preferenceIndex = normalizedPreferredTimes.indexOf(time);
             fallbackLevel = preferenceIndex >= 0 ? preferenceIndex : index;
+            finalPrebookBoundary = bookingResult.prebookBoundary ?? null;
+            finalClickDeltaMs = bookingResult.clickDeltaMs ?? finalClickDeltaMs;
+            finalVerificationUrl = bookingResult.verificationUrl ?? finalVerificationUrl;
+            finalVerificationSignal = bookingResult.verificationSignal ?? 'dry-run-prebook-boundary';
             notes.push(
               `Dry-run validated ${time}; Players filled: ${bookingResult.playersFilled?.join(', ') || 'none'}`,
             );
@@ -4551,6 +4877,11 @@ async function runBooking(config) {
     let finalError = null;
     let finalAvailableTimes = null;
     let finalCandidateDiagnostics = null;
+    let finalPrebookBoundary = null;
+    let firstBrsActionMs = null;
+    const markFirstBrsAction = () => {
+      if (!firstBrsActionMs) firstBrsActionMs = Date.now();
+    };
     let directCapacityRequired = false;
     let directCapacityFailed = false;
     let directCandidatesExhausted = false;
@@ -4563,6 +4894,7 @@ async function runBooking(config) {
         CONFIG.SNIPER_DIRECT_POLL_ENABLED &&
         (teeCtx?.teeTarget ?? normalizedTeeTarget) === 1
       ) {
+        markFirstBrsAction();
         const directPollResult = await pollPreferredBookingLinks(
           page,
           targetDateStr,
@@ -4597,6 +4929,7 @@ async function runBooking(config) {
               ...candidate,
               date: targetDateStr,
               tee: teeCtx?.teeTarget ?? normalizedTeeTarget,
+              partySize: desiredPartySize,
             };
             const evaluation = evaluateSlotCandidate(slotPolicy, candidateWithContext);
             console.log(
@@ -4609,13 +4942,15 @@ async function runBooking(config) {
               continue;
             }
             const slotInfo = bookingSlots.find((slot) => slot.time === candidate.time);
+            const candidateOpenSlots = normalizeCapacityValue(candidate.openSlots);
+            const slotInfoOpenSlots = normalizeCapacityValue(slotInfo?.openSlots);
             const openSlots =
-              Number.isFinite(Number(candidate.openSlots)) && Number(candidate.openSlots) > 0
-                ? Number(candidate.openSlots)
-                : slotInfo && slotInfo.openSlots > 0
-                  ? slotInfo.openSlots
+              candidateOpenSlots !== null && candidateOpenSlots > 0
+                ? candidateOpenSlots
+                : slotInfoOpenSlots !== null && slotInfoOpenSlots > 0
+                  ? slotInfoOpenSlots
                   : null;
-            if (desiredPartySize > 1 && !Number.isFinite(Number(openSlots))) {
+            if (desiredPartySize > 1 && openSlots === null) {
               notes.push(`Rejected direct candidate ${candidate.time}: capacity-unproven`);
               continue;
             }
@@ -4629,7 +4964,7 @@ async function runBooking(config) {
               dryRun,
             );
 
-            if (directResult?.dryRun && directResult?.formValidated) {
+            if (directResult?.dryRun && directResult?.prebookBoundaryReached) {
               bookedTime = candidate.time;
               fallbackLevel = candidate.preferredIndex ?? normalizedPreferredTimes.indexOf(candidate.time);
               notes.push(
@@ -4644,6 +4979,17 @@ async function runBooking(config) {
                 click_delta_ms: directResult.clickDeltaMs ?? null,
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
+                prebook_boundary: directResult.prebookBoundary ?? null,
+                fire_timer_drift_ms:
+                  Number.isFinite(fireCallbackAtMs) ? fireCallbackAtMs - targetFireTime : null,
+                booking_hot_path_delta_ms:
+                  Number.isFinite(bookingHotPathStartMs) && Number.isFinite(fireCallbackAtMs)
+                    ? bookingHotPathStartMs - fireCallbackAtMs
+                    : null,
+                first_brs_action_delta_ms:
+                  Number.isFinite(firstBrsActionMs) && Number.isFinite(fireCallbackAtMs)
+                    ? firstBrsActionMs - fireCallbackAtMs
+                    : null,
                 release_detect_delta_ms: directPollResult.detectDeltaMs ?? null,
                 snapshot_path: directResult.snapshotPath ?? null,
                 screenshot_path: directResult.screenshotPath ?? null,
@@ -4658,6 +5004,17 @@ async function runBooking(config) {
                 notes: notes.join(' | '),
                 playersRequested: additionalPlayers,
                 fieldDiagnostics: directResult.fieldDiagnostics ?? null,
+                prebookBoundary: directResult.prebookBoundary ?? null,
+                fire_timer_drift_ms:
+                  Number.isFinite(fireCallbackAtMs) ? fireCallbackAtMs - targetFireTime : null,
+                booking_hot_path_delta_ms:
+                  Number.isFinite(bookingHotPathStartMs) && Number.isFinite(fireCallbackAtMs)
+                    ? bookingHotPathStartMs - fireCallbackAtMs
+                    : null,
+                first_brs_action_delta_ms:
+                  Number.isFinite(firstBrsActionMs) && Number.isFinite(fireCallbackAtMs)
+                    ? firstBrsActionMs - fireCallbackAtMs
+                    : null,
                 click_delta_ms: directResult.clickDeltaMs ?? null,
                 verification_url: directResult.verificationUrl ?? null,
                 verification_signal: directResult.verificationSignal ?? 'dry-run',
@@ -4759,6 +5116,7 @@ async function runBooking(config) {
         );
         try {
           await page.waitForLoadState('domcontentloaded');
+          markFirstBrsAction();
           releaseResult = await waitForBookingRelease(
             page,
             searchTimes,
@@ -4821,6 +5179,7 @@ async function runBooking(config) {
             href: releaseResult.href,
             date: targetDateStr,
             tee: teeCtx?.teeTarget ?? normalizedTeeTarget,
+            partySize: desiredPartySize,
           },
           additionalPlayers,
           desiredPartySize,
@@ -4828,11 +5187,12 @@ async function runBooking(config) {
           jobId,
           dryRun,
         );
-        if (dryRun) {
+        if (dryRun && clickResult?.prebookBoundaryReached) {
           const diagnostics = {
             fire_latency_ms: fireLatencyMs,
-            verification_url: page.url(),
-            verification_signal: 'dry-run',
+            verification_url: clickResult.verificationUrl || page.url(),
+            verification_signal: clickResult.verificationSignal || 'dry-run-prebook-boundary',
+            prebook_boundary: clickResult.prebookBoundary ?? null,
           };
           bookedTime = releaseClickedTime;
           fallbackLevel = 0;
@@ -4854,8 +5214,51 @@ async function runBooking(config) {
             latencyMs: Date.now() - startTime,
             notes: notes.join(' | '),
             playersRequested: additionalPlayers,
+            fieldDiagnostics: clickResult.fieldDiagnostics ?? null,
+            prebookBoundary: clickResult.prebookBoundary ?? null,
             ...diagnostics,
             ...(dryRun ? { teeSelected: getTeeLabel(), armedAfterTeeSelect: true } : {}),
+          };
+        }
+        if (dryRun && !clickResult?.prebookBoundaryReached) {
+          const evidence = await savePageEvidence(page, runId || jobId || 'release-dry-run-boundary-failed');
+          const boundaryError =
+            clickResult?.prebookBoundary?.error ||
+            clickResult?.error ||
+            clickResult?.confirmationText ||
+            'dry-run-prebook-boundary-not-reached';
+          notes.push(
+            `Dry-run boundary failed for ${releaseClickedTime}: ${boundaryError}; snapshot=${evidence.snapshotPath || 'n/a'} screenshot=${evidence.screenshotPath || 'n/a'}`,
+          );
+          await fsFinishRun(runId, {
+            result: 'DRY_RUN_PREBOOK_FAILED',
+            notes: notes.join(' | '),
+            latency_ms: Date.now() - startTime,
+            chosen_time: null,
+            fallback_level: fallbackLevel,
+            fire_latency_ms: fireLatencyMs,
+            verification_url: clickResult?.verificationUrl || page.url(),
+            verification_signal: boundaryError,
+            prebook_boundary: clickResult?.prebookBoundary ?? null,
+            snapshot_path: evidence.snapshotPath,
+            screenshot_path: evidence.screenshotPath,
+          });
+          if (browser && !isWarm) await browser.close();
+          return {
+            success: false,
+            result: 'DRY_RUN_PREBOOK_FAILED',
+            bookedTime: null,
+            fallbackLevel,
+            latencyMs: Date.now() - startTime,
+            notes: notes.join(' | '),
+            playersRequested: additionalPlayers,
+            error: boundaryError,
+            snapshotPath: evidence.snapshotPath,
+            screenshotPath: evidence.screenshotPath,
+            teeSelected: getTeeLabel(),
+            prebookBoundary: clickResult?.prebookBoundary ?? null,
+            verification_url: clickResult?.verificationUrl || page.url(),
+            verification_signal: boundaryError,
           };
         }
         console.log('[SNIPER] Verification started...');
@@ -5048,6 +5451,67 @@ async function runBooking(config) {
         bookingSuccess = await runPreferredTimesLoop(searchTimes);
       }
     }
+    const timingDiagnostics = {
+      fire_timer_drift_ms:
+        Number.isFinite(fireCallbackAtMs) && Number.isFinite(targetFireTime)
+          ? fireCallbackAtMs - targetFireTime
+          : null,
+      booking_hot_path_delta_ms:
+        Number.isFinite(bookingHotPathStartMs) && Number.isFinite(fireCallbackAtMs)
+          ? bookingHotPathStartMs - fireCallbackAtMs
+          : null,
+      first_brs_action_delta_ms:
+        Number.isFinite(firstBrsActionMs) && Number.isFinite(fireCallbackAtMs)
+          ? firstBrsActionMs - fireCallbackAtMs
+          : null,
+    };
+
+    if (dryRun && bookedTime && finalPrebookBoundary?.prebookBoundaryReached === true) {
+      const finalNotes = notes.join(' | ') || 'dry-run-prebook-boundary-reached';
+      await fsFinishRun(runId, {
+        result: DRY_RUN_PREBOOK_REACHED,
+        notes: finalNotes,
+        latency_ms: Date.now() - startTime,
+        chosen_time: bookedTime,
+        fallback_level: fallbackLevel,
+        click_delta_ms: finalClickDeltaMs,
+        verification_url: finalVerificationUrl,
+        verification_signal: finalVerificationSignal || 'dry-run-prebook-boundary',
+        prebook_boundary: finalPrebookBoundary,
+        ...timingDiagnostics,
+        available_times: finalAvailableTimes,
+        candidate_diagnostics: finalCandidateDiagnostics,
+        source_path: sourcePath,
+        requested_tee: normalizedTeeTarget,
+        tee_selected: getTeeLabel(),
+      });
+      if (browser && !isWarm) await browser.close();
+      return {
+        success: true,
+        result: DRY_RUN_PREBOOK_REACHED,
+        bookedTime,
+        fallbackLevel,
+        latencyMs: Date.now() - startTime,
+        notes: finalNotes,
+        playersRequested: additionalPlayers,
+        prebookBoundary: finalPrebookBoundary,
+        ...timingDiagnostics,
+        availableTimes: finalAvailableTimes,
+        candidateDiagnostics: finalCandidateDiagnostics,
+        sourcePath,
+        requestedTee: normalizedTeeTarget,
+        teeSelected: getTeeLabel(),
+        click_delta_ms: finalClickDeltaMs,
+        verification_url: finalVerificationUrl,
+        verification_signal: finalVerificationSignal || 'dry-run-prebook-boundary',
+      };
+    }
+
+    if (dryRun && bookedTime) {
+      finalError = finalError || 'dry-run-prebook-boundary-not-reached';
+      bookedTime = null;
+    }
+
     const success = !!bookedTime;
     const resultType = success
       ? fallbackLevel === 0
@@ -5064,6 +5528,7 @@ async function runBooking(config) {
       chosen_time: bookedTime,
       fallback_level: fallbackLevel,
       click_delta_ms: finalClickDeltaMs,
+      ...timingDiagnostics,
       verification_url: finalVerificationUrl,
       verification_signal: finalVerificationSignal,
       booking_links_count_after_click: finalBookingLinksCountAfterClick,
@@ -5110,6 +5575,7 @@ async function runBooking(config) {
       requestedTee: normalizedTeeTarget,
       teeSelected: getTeeLabel(),
       click_delta_ms: finalClickDeltaMs,
+      ...timingDiagnostics,
       verification_url: finalVerificationUrl,
       verification_signal: finalVerificationSignal,
       booking_links_count_after_click: finalBookingLinksCountAfterClick,

@@ -32,6 +32,8 @@ class BookingJob {
   final String teeMode; // single|both
   final int teeTarget; // 1|10 (primary tee)
   final bool fallbackTee; // when true, allow alternate tee fallback
+  final bool proofRun;
+  final String? proofLabel;
 
   BookingJob({
     this.id,
@@ -58,6 +60,8 @@ class BookingJob {
     this.teeMode = 'single',
     this.teeTarget = 1,
     this.fallbackTee = false,
+    this.proofRun = false,
+    this.proofLabel,
     DateTime? createdAt,
     DateTime? updatedAt,
   })  : createdAt = createdAt ?? DateTime.now(),
@@ -95,6 +99,8 @@ class BookingJob {
         'tee_mode': teeMode,
         'tee_target': teeTarget,
         'fallback_tee': fallbackTee,
+        'proof_run': proofRun,
+        if (proofLabel != null) 'proof_label': proofLabel,
       };
 
   factory BookingJob.fromJson(Map<String, dynamic> json, String id) {
@@ -154,6 +160,8 @@ class BookingJob {
       teeMode: parsedTeeMode,
       teeTarget: parsedTeeTarget,
       fallbackTee: parsedFallback,
+      proofRun: _parseBool(json['proof_run'] ?? json['proofRun'] ?? false),
+      proofLabel: json['proof_label'] as String?,
     );
   }
 
@@ -212,6 +220,8 @@ class BookingJob {
     String? teeMode,
     int? teeTarget,
     bool? fallbackTee,
+    bool? proofRun,
+    String? proofLabel,
   }) =>
       BookingJob(
         id: id ?? this.id,
@@ -240,5 +250,7 @@ class BookingJob {
         teeMode: teeMode ?? this.teeMode,
         teeTarget: teeTarget ?? this.teeTarget,
         fallbackTee: fallbackTee ?? this.fallbackTee,
+        proofRun: proofRun ?? this.proofRun,
+        proofLabel: proofLabel ?? this.proofLabel,
       );
 }

@@ -144,6 +144,43 @@ test('multi-player capacity must be proven', () => {
   assert.deepEqual(result.reasons, ['capacity-unproven']);
 });
 
+test('four available places allow a four-player candidate', () => {
+  const policy = buildSlotPolicy({
+    targetDate: '2026-05-30',
+    tee: 1,
+    preferredTimes: ['11:04'],
+    partySize: 4,
+  });
+
+  const result = evaluateSlotCandidate(policy, {
+    date: '2026-05-30',
+    tee: 1,
+    time: '11:04',
+    openSlots: 4,
+  });
+
+  assert.equal(result.accepted, true);
+});
+
+test('three available places reject a four-player candidate', () => {
+  const policy = buildSlotPolicy({
+    targetDate: '2026-05-30',
+    tee: 1,
+    preferredTimes: ['11:04'],
+    partySize: 4,
+  });
+
+  const result = evaluateSlotCandidate(policy, {
+    date: '2026-05-30',
+    tee: 1,
+    time: '11:04',
+    openSlots: 3,
+  });
+
+  assert.equal(result.accepted, false);
+  assert.deepEqual(result.reasons, ['insufficient-capacity']);
+});
+
 test('preferred time normalization dedupes without reordering', () => {
   assert.deepEqual(normalizePreferredTimeLabels(['11:04', '1104', '11:12']), [
     '11:04',

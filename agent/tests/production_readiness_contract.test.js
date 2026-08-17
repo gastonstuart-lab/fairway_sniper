@@ -9,6 +9,10 @@ const dashboardSource = fs.readFileSync(
   path.join(repoRoot, 'lib', 'screens', 'dashboard_screen.dart'),
   'utf8',
 );
+const safeProofBuilderSource = fs.readFileSync(
+  path.join(repoRoot, 'lib', 'services', 'safe_proof_builder.dart'),
+  'utf8',
+);
 
 function functionBody(source, name) {
   const start = source.indexOf(`async function ${name}`);
@@ -112,6 +116,72 @@ test('proof dry-run surfaces pre-book boundary and one-click UI action', () => {
   assert(agentSource.includes("'PROOF_SUCCESS'"));
   assert(agentSource.includes("'PROOF_FAILED'"));
   assert(dashboardSource.includes('Run Safe Production Proof'));
-  assert(dashboardSource.includes("'proof_run': true"));
-  assert(dashboardSource.includes("'proof_fire_time_override_utc'"));
+  assert(safeProofBuilderSource.includes("'proof_run': true"));
+  assert(safeProofBuilderSource.includes("'proof_fire_time_override_utc'"));
+  assert(safeProofBuilderSource.includes("'proof_template_job_id'"));
+});
+
+test('runtime diagnostics expose effective prep lead', () => {
+  assert(agentSource.includes('sniperPrepLeadMs'));
+  assert(agentSource.includes('getPrepLeadMs()'));
+  assert.equal(agentSource.match(/sniperPrepLeadMs:/g)?.length, 1);
+});
+
+test('fire callback captures drift before asynchronous diagnostics', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  const fireCallback = body.indexOf('const fireNow = async');
+  const driftCapture = body.indexOf('const fireCallbackAtMs = Date.now()', fireCallback);
+  const firstAwait = body.indexOf('await ', fireCallback);
+  assert(driftCapture > fireCallback, 'fire callback timestamp missing');
+  assert(driftCapture < firstAwait, 'fire callback timestamp must be captured before await');
+});
+
+test('fire hot path does not await diagnostic writes before booking starts', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  const fireCallback = body.indexOf('const fireNow = async');
+  const runBooking = body.indexOf('const result = await runBooking', fireCallback);
+  const hotPath = body.slice(fireCallback, runBooking);
+  assert(hotPath.includes("void fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED'"));
+  assert(hotPath.includes("void fsAddJobEvent(jobId, 'BOOKING_STARTED'"));
+  assert(!hotPath.includes("await fsAddJobEvent(jobId, 'FIRE_TIMER_FIRED'"));
+  assert(!hotPath.includes("await fsAddJobEvent(jobId, 'BOOKING_STARTED'"));
+});
+
+test('scheduled fire path uses nonblocking run-log resolver', () => {
+  assert(agentSource.includes("sourcePath !== 'firestore-runner'") === false);
+  assert(agentSource.includes('resolveRunLogId'));
+  assert(agentSource.includes("sourcePath: 'firestore-runner'"));
+});
+
+test('safe availability endpoint returns server-normalized proof candidates with capacity', () => {
+  assert(agentSource.includes('partySizeForProof'));
+  assert(agentSource.includes('safeProofCandidates'));
+  assert(agentSource.includes('filterSafeProofCandidates'));
+  assert(agentSource.includes('normalizeSafeAvailabilityFromTeeData'));
+});
+
+test('proof success requires reached candidate to match expected proof candidate', () => {
+  assert(agentSource.includes('validateProofBoundaryConsistency'));
+  assert(agentSource.includes('proof-boundary-proof-candidate-time-mismatch'));
+  assert(agentSource.includes('proof-boundary-proof-candidate-tee-mismatch'));
+  assert.match(agentSource, /reachedDryRunBoundary =[\s\S]*boundaryConsistency\.ok/);
+});
+
+test('numeric member IDs are exact Strategy-0 only', () => {
+  assert(agentSource.includes('const isNumericPlayerId = /^\\d+$/.test(playerName);'));
+  assert(agentSource.includes("strategy: 'select-by-id'"));
+  assert(agentSource.includes('fieldExists: false'));
+  assert(agentSource.includes('selectSucceeded: false'));
+  assert(agentSource.includes('selectedRequestedValue: false'));
+  assert(agentSource.includes('fuzzy fallback disabled'));
+  assert.match(agentSource, /if \(!filled\) \{[\s\S]*?fuzzy fallback disabled[\s\S]*?continue;/);
+});
+
+test('prebook evidence uses exact verified player IDs', () => {
+  assert(agentSource.includes('selectedValueAfterSelect'));
+  const boundarySource = fs.readFileSync(path.join(repoRoot, 'agent', 'prebook_boundary.js'), 'utf8');
+  assert(boundarySource.includes('playersVerified'));
+  assert(boundarySource.includes('exactPlayersVerified'));
+  assert(!boundarySource.includes('selectedRequestedValue === undefined'));
+  assert(!boundarySource.includes('filled.length >= expected.length'));
 });
