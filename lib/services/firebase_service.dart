@@ -144,6 +144,11 @@ class FirebaseService {
     }
   }
 
+  Future<String> createJobFromMap(Map<String, dynamic> data) async {
+    final docRef = await _firestore.collection('jobs').add(data);
+    return docRef.id;
+  }
+
   Future<void> updateJob(String jobId, Map<String, dynamic> data) async {
     data['updated_at'] = Timestamp.now();
     await _firestore.collection('jobs').doc(jobId).update(data);
@@ -151,6 +156,14 @@ class FirebaseService {
 
   Future<void> deleteJob(String jobId) async {
     await _firestore.collection('jobs').doc(jobId).delete();
+  }
+
+  Stream<Map<String, dynamic>?> watchJob(String jobId) {
+    return _firestore
+        .collection('jobs')
+        .doc(jobId)
+        .snapshots()
+        .map((doc) => doc.data());
   }
 
   Stream<List<BookingRun>> getJobRuns(String jobId) {

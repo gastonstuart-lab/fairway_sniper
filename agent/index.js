@@ -1231,6 +1231,28 @@ async function fsAddJobEvent(jobId, type, metadata = {}) {
   }
 }
 
+async function fsLoadUserBRSProfile(ownerUid) {
+  if (!db || !ownerUid || ownerUid === 'unknown') return null;
+  try {
+    const snap = await db.collection('users').doc(ownerUid).get();
+    if (!snap.exists) return null;
+    const data = snap.data() || {};
+    const username = (data.brs_username || '').toString().trim();
+    const password = (data.brs_password || '').toString();
+    if (!username || !password) return null;
+    return { username, password };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function resolveJobCredentials(job) {
+  const username = (job?.brs_email || job?.brsEmail || job?.username || '').toString().trim();
+  const password = (job?.brs_password || job?.brsPassword || job?.password || '').toString();
+  if (username && password) return { username, password };
+  return await fsLoadUserBRSProfile(job?.ownerUid || job?.owner_uid || null);
+}
+
 async function fsGetActiveSniperJobs(limit = 5) {
   if (!db) return [];
   try {
@@ -1764,9 +1786,8 @@ async function scheduleClaimedJob(job) {
     if (warmupPromise) return warmupPromise;
 
     warmupPromise = (async () => {
-      const username = job.brs_email || job.brsEmail || job.username;
-      const password = job.brs_password || job.brsPassword || job.password;
-      if (!username || !password) {
+      const creds = await resolveJobCredentials(job);
+      if (!creds?.username || !creds?.password) {
         throw new Error('missing-credentials');
       }
 
@@ -1777,7 +1798,11 @@ async function scheduleClaimedJob(job) {
       });
       await fsUpdateJob(jobId, { warm_state: 'warming', state: 'warming' });
 
-      warmPage = await warmSession.getWarmPage(resolveTargetPlayDate(job) || targetPlayDate, username, password);
+      warmPage = await warmSession.getWarmPage(
+        resolveTargetPlayDate(job) || targetPlayDate,
+        creds.username,
+        creds.password,
+      );
       entry.warmState = 'ready';
       entry.brsAuthenticated = true;
       await fsUpdateJob(jobId, { warm_state: 'warmed', state: 'ready' });
@@ -1828,12 +1853,17 @@ async function scheduleClaimedJob(job) {
     try {
       let runJob = job;
       if (db) {
-        const latestSnap = await db.collection(JOBS_COLLECTION).doc(jobId).get();
-        if (latestSnap.exists) runJob = { id: latestSnap.id, ...latestSnap.data() };
+        try {
+          const latestSnap = await db.collection(JOBS_COLLECTION).doc(jobId).get();
+          if (latestSnap.exists) runJob = { id: latestSnap.id, ...latestSnap.data() };
+        } catch (latestError) {
+          await fsAddJobEvent(jobId, 'JOB_REREAD_FAILED', {
+            error: latestError?.message || String(latestError),
+          });
+        }
       }
       const ownerUid = runJob.ownerUid || runJob.owner_uid || 'unknown';
-      const username = runJob.brs_email || runJob.brsEmail || runJob.username;
-      const password = runJob.brs_password || runJob.brsPassword || runJob.password;
+      const creds = await resolveJobCredentials(runJob);
       const preferredTimes = Array.isArray(runJob.preferred_times)
         ? normalizeStringList(runJob.preferred_times)
         : normalizeStringList(runJob.preferredTimes ?? runJob.preferred_times);
@@ -1842,6 +1872,9 @@ async function scheduleClaimedJob(job) {
       const pushToken = runJob.push_token || runJob.pushToken;
       const dryRun = runJob.dry_run === true || runJob.dryRun === true;
       const teeConfig = resolveTeeConfigFromJob(runJob, 'RUNNER');
+      if (!creds?.username || !creds?.password) {
+        throw new Error('missing-credentials');
+      }
 
       let fireWarmPage = warmPage;
       if (!fireWarmPage) {
@@ -1873,8 +1906,8 @@ async function scheduleClaimedJob(job) {
         jobId,
         ownerUid,
         loginUrl: CONFIG.CLUB_LOGIN_URL,
-        username,
-        password,
+        username: creds?.username,
+        password: creds?.password,
         preferredTimes,
         targetFireTime: fireMs,
         targetPlayDate: resolveTargetPlayDate(runJob) || targetPlayDate,
@@ -1909,14 +1942,16 @@ async function scheduleClaimedJob(job) {
           error: reachedDryRunBoundary ? null : result?.error || 'proof-boundary-not-reached',
         });
       }
-      await fsAddJobEvent(jobId, isSuccess ? 'BOOKING_SUCCESS' : 'BOOKING_FAILED', {
-        result: result?.result || (isSuccess ? 'success' : 'failed'),
-        bookedTime: result?.bookedTime || null,
-        error: isSuccess ? null : result?.error || 'clicked but no confirmation',
-        releaseDetectDeltaMs: result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
-        clickDeltaMs: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
-        verificationSignal: result?.verification_signal ?? result?.verificationSignal ?? null,
-      });
+      if (!(isProof && reachedDryRunBoundary)) {
+        await fsAddJobEvent(jobId, isSuccess ? 'BOOKING_SUCCESS' : 'BOOKING_FAILED', {
+          result: result?.result || (isSuccess ? 'success' : 'failed'),
+          bookedTime: result?.bookedTime || null,
+          error: isSuccess ? null : result?.error || 'clicked but no confirmation',
+          releaseDetectDeltaMs: result?.release_detect_delta_ms ?? result?.releaseDetectDeltaMs ?? null,
+          clickDeltaMs: result?.click_delta_ms ?? result?.clickDeltaMs ?? null,
+          verificationSignal: result?.verification_signal ?? result?.verificationSignal ?? null,
+        });
+      }
       await fsUpdateJob(jobId, {
         status: isSuccess ? 'finished' : 'error',
         state: isSuccess ? 'finished' : 'error',

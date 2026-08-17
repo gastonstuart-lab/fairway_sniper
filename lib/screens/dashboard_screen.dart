@@ -238,8 +238,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
         'tee_target': base?.teeTarget ?? 1,
         'tee_mode': base?.teeMode ?? 'single',
         'fallback_tee': base?.fallbackTee ?? false,
-        'brs_email': (creds['username'] ?? '').trim(),
-        'brs_password': creds['password'],
         'dry_run': true,
         'proof_run': true,
         'proof_label': 'safe_production_proof',
@@ -248,12 +246,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
         'updated_at': FieldValue.serverTimestamp(),
       };
 
-      final created =
-          await FirebaseFirestore.instance.collection('jobs').add(proofData);
-      final message = await _verifyProductionAgentCanSeeJob(created.id);
+      final proofJobId = await _firebaseService.createJobFromMap(proofData);
+      final message = await _verifyProductionAgentCanSeeJob(proofJobId);
       if (!mounted) return;
       setState(() {
-        _proofJobId = created.id;
+        _proofJobId = proofJobId;
         _proofStatusMessage = message;
       });
       ScaffoldMessenger.of(context).showSnackBar(
@@ -313,7 +310,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       case 'firing':
         return 'Firing';
       case 'running':
-        return 'Firing';
+        return 'Running';
       case 'booking':
         return 'Booking';
       case 'finished':
@@ -2048,13 +2045,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ],
             if (_proofJobId != null) ...[
               const SizedBox(height: 8),
-              StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-                stream: FirebaseFirestore.instance
-                    .collection('jobs')
-                    .doc(_proofJobId)
-                    .snapshots(),
+              StreamBuilder<Map<String, dynamic>?>(
+                stream: _firebaseService.watchJob(_proofJobId!),
                 builder: (context, snapshot) {
-                  final data = snapshot.data?.data() ?? const <String, dynamic>{};
+                  final data = snapshot.data ?? const <String, dynamic>{};
                   final status = (data['status'] ?? '').toString();
                   final state = (data['state'] ?? '').toString();
                   final result = (data['result'] ?? '').toString();
