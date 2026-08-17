@@ -5,6 +5,7 @@ import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/services/booking_prefetch_service.dart';
 import 'package:fairway_sniper/services/agent_base_url.dart';
 import 'package:fairway_sniper/services/safe_proof_builder.dart';
+import 'package:fairway_sniper/services/safe_proof_status.dart';
 import 'package:fairway_sniper/services/weather_service.dart';
 import 'package:fairway_sniper/services/golf_news_service.dart';
 import 'package:fairway_sniper/models/booking_job.dart';
@@ -45,6 +46,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   bool _proofRunning = false;
   String? _proofJobId;
   String? _proofStatusMessage;
+  StreamSubscription<Map<String, dynamic>?>? _proofWatchSub;
 
   @override
   void initState() {
@@ -59,6 +61,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
+    _proofWatchSub?.cancel();
     _newsScrollController.dispose();
     super.dispose();
   }
@@ -310,6 +313,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Future<void> _runSafeProductionProof(List<BookingJob> jobs) async {
     if (_proofRunning) return;
+    _proofWatchSub?.cancel();
     final uid = _firebaseService.currentUserId;
     if (uid == null) {
       _showSnack('Not logged in');
@@ -352,12 +356,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _proofJobId = proofJobId;
         _proofStatusMessage = message;
       });
+      _watchSafeProofUntilTerminal(proofJobId);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(message), duration: const Duration(seconds: 8)),
       );
     } catch (e) {
       if (!mounted) return;
       setState(() {
+        _proofRunning = false;
         _proofStatusMessage = 'Proof failed to start: $e';
       });
       ScaffoldMessenger.of(context).showSnackBar(
@@ -367,13 +373,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
           duration: const Duration(seconds: 10),
         ),
       );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _proofRunning = false;
-        });
-      }
     }
+  }
+
+  void _watchSafeProofUntilTerminal(String proofJobId) {
+    _proofWatchSub?.cancel();
+    _proofWatchSub = _firebaseService.watchJob(proofJobId).listen((data) {
+      if (!mounted || data == null) return;
+      final view = classifySafeProofStatus(data);
+      if (!view.isTerminal) return;
+      setState(() {
+        _proofRunning = false;
+        _proofStatusMessage = view.title;
+      });
+      _proofWatchSub?.cancel();
+      _proofWatchSub = null;
+    }, onError: (Object error) {
+      if (!mounted) return;
+      setState(() {
+        _proofRunning = false;
+        _proofStatusMessage = 'Proof watch failed: $error';
+      });
+    });
   }
 
   String _proofDisplayText(String jobId, Map<String, dynamic> data) {
@@ -382,18 +403,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final result = (data['result'] ?? '').toString();
     final error = (data['error_message'] ?? '').toString();
     final boundary = data['prebook_boundary'];
-    final reached =
-        boundary is Map && boundary['prebookBoundaryReached'] == true;
-    final failed = status == 'error' || state == 'error';
-    final pass = reached || result == 'DRY_RUN_PREBOOK_REACHED';
+    final view = classifySafeProofStatus(data);
     final shortId = jobId.length <= 6 ? jobId : jobId.substring(0, 6);
-    final title = pass
-        ? 'SAFE PRODUCTION PROOF: PASS'
-        : failed
-            ? 'SAFE PRODUCTION PROOF: FAIL'
-            : 'Safe production proof running';
     final parts = <String>[
-      title,
+      view.title,
       'Job $shortId: ${status.toUpperCase()}${state.isNotEmpty ? ' / ${state.toUpperCase()}' : ''}${result.isNotEmpty ? ' / $result' : ''}',
       if (data['proof_template_job_id'] != null)
         'Template: ${data['proof_template_job_id']}',
@@ -2174,7 +2187,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     )
                   : const Icon(Icons.play_arrow),
               label: Text(_proofRunning
-                  ? 'Starting proof...'
+                  ? 'Proof running...'
                   : 'Run Safe Production Proof'),
             ),
             if (_proofStatusMessage != null) ...[

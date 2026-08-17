@@ -69,11 +69,26 @@ function fakePage({
   };
 }
 
+function verified(playerNum, requested, selected = requested, includeFlag = true) {
+  return {
+    playerNum,
+    requested,
+    numericId: true,
+    strategy: 'select-by-id',
+    fieldExists: true,
+    disabled: false,
+    hasRequestedValue: true,
+    selectSucceeded: true,
+    selectedValueAfterSelect: selected,
+    ...(includeFlag ? { selectedRequestedValue: selected === requested } : {}),
+  };
+}
+
 test('valid dry-run form with enabled confirm reaches pre-book boundary', async () => {
   const boundary = await validatePrebookBoundary(fakePage(), {
     players: ['42'],
     openSlots: 2,
-    confirmResult: { filled: ['42'] },
+    confirmResult: { filled: ['42'], fieldDiagnostics: [verified(2, '42')] },
     candidateTime: '11:12',
     teeSelected: '1ST TEE',
   });
@@ -152,7 +167,14 @@ test('four-player prebook boundary passes with three additional players and four
     players: ['101', '202', '303'],
     partySize: 4,
     openSlots: 4,
-    confirmResult: { filled: ['101', '202', '303'] },
+    confirmResult: {
+      filled: ['101', '202', '303'],
+      fieldDiagnostics: [
+        verified(2, '101'),
+        verified(3, '202'),
+        verified(4, '303'),
+      ],
+    },
     candidateTime: '11:12',
     teeSelected: 1,
   });
@@ -162,6 +184,7 @@ test('four-player prebook boundary passes with three additional players and four
   assert.equal(boundary.openSlots, 4);
   assert.equal(boundary.partySize, 4);
   assert.deepEqual(boundary.playersExpected, ['101', '202', '303']);
+  assert.deepEqual(boundary.playersVerified, ['101', '202', '303']);
 });
 
 test('four-player prebook boundary rejects three open slots', async () => {
@@ -169,7 +192,14 @@ test('four-player prebook boundary rejects three open slots', async () => {
     players: ['101', '202', '303'],
     partySize: 4,
     openSlots: 3,
-    confirmResult: { filled: ['101', '202', '303'] },
+    confirmResult: {
+      filled: ['101', '202', '303'],
+      fieldDiagnostics: [
+        verified(2, '101'),
+        verified(3, '202'),
+        verified(4, '303'),
+      ],
+    },
     candidateTime: '11:12',
     teeSelected: 1,
   });
@@ -183,7 +213,14 @@ test('four-player prebook boundary rejects unknown capacity', async () => {
     players: ['101', '202', '303'],
     partySize: 4,
     openSlots: null,
-    confirmResult: { filled: ['101', '202', '303'] },
+    confirmResult: {
+      filled: ['101', '202', '303'],
+      fieldDiagnostics: [
+        verified(2, '101'),
+        verified(3, '202'),
+        verified(4, '303'),
+      ],
+    },
     candidateTime: '11:12',
     teeSelected: 1,
   });
@@ -197,13 +234,87 @@ test('four-player prebook boundary rejects missing additional player', async () 
     players: ['101', '202'],
     partySize: 4,
     openSlots: 4,
-    confirmResult: { filled: ['101', '202'] },
+    confirmResult: {
+      filled: ['101', '202'],
+      fieldDiagnostics: [
+        verified(2, '101'),
+        verified(3, '202'),
+      ],
+    },
     candidateTime: '11:12',
     teeSelected: 1,
   });
 
   assert.equal(boundary.prebookBoundaryReached, false);
   assert.equal(boundary.error, 'players-missing-before-confirm');
+});
+
+test('selected player value mismatch fails exact ID proof', async () => {
+  const boundary = await validatePrebookBoundary(fakePage(), {
+    players: ['101', '202', '303'],
+    partySize: 4,
+    openSlots: 4,
+    confirmResult: {
+      filled: ['101', '202', '303'],
+      fieldDiagnostics: [
+        verified(2, '101'),
+        verified(3, '202', '999'),
+        verified(4, '303'),
+      ],
+    },
+  });
+
+  assert.equal(boundary.prebookBoundaryReached, false);
+  assert.equal(boundary.error, 'players-missing-before-confirm');
+  assert.deepEqual(boundary.playersVerified, ['101', '303']);
+});
+
+test('missing selectedRequestedValue fails exact ID proof', async () => {
+  const boundary = await validatePrebookBoundary(fakePage(), {
+    players: ['101', '202', '303'],
+    partySize: 4,
+    openSlots: 4,
+    confirmResult: {
+      filled: ['101', '202', '303'],
+      fieldDiagnostics: [
+        verified(2, '101'),
+        verified(3, '202', '202', false),
+        verified(4, '303'),
+      ],
+    },
+  });
+
+  assert.equal(boundary.prebookBoundaryReached, false);
+  assert.equal(boundary.error, 'players-missing-before-confirm');
+});
+
+test('numeric ID strategy failure cannot be rescued by fuzzy filled count', async () => {
+  const boundary = await validatePrebookBoundary(fakePage(), {
+    players: ['101', '202', '303'],
+    partySize: 4,
+    openSlots: 4,
+    confirmResult: {
+      filled: ['101', '202', '303'],
+      fieldDiagnostics: [
+        verified(2, '101'),
+        {
+          playerNum: 3,
+          requested: '202',
+          numericId: true,
+          strategy: 'select-by-id',
+          fieldExists: true,
+          hasRequestedValue: false,
+          selectSucceeded: false,
+          selectedRequestedValue: false,
+        },
+        verified(4, '303'),
+      ],
+    },
+  });
+
+  assert.equal(boundary.prebookBoundaryReached, false);
+  assert.equal(boundary.error, 'players-missing-before-confirm');
+  assert.deepEqual(boundary.playersVerified, ['101', '303']);
 });
 
 test('global Book button outside member booking form is rejected', async () => {

@@ -3026,8 +3026,10 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = null, dryRu
     try {
       console.log(`    🔍 Player ${playerNum}: "${playerName}"...`);
 
+      const isNumericPlayerId = /^\d+$/.test(playerName);
+
       // Strategy 0: Select by ID (preferred for sniper jobs)
-      if (/^\d+$/.test(playerName)) {
+      if (isNumericPlayerId) {
         const selectId = `#member_booking_form_player_${playerNum}`;
         const selectElem = page.locator(selectId).first();
         if (await selectElem.count()) {
@@ -3054,7 +3056,16 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = null, dryRu
               };
             }, playerName)
             .catch((error) => ({ error: error?.message || String(error) }));
-          result.fieldDiagnostics.push({ playerNum, requested: playerName, ...fieldInfo });
+          result.fieldDiagnostics.push({
+            playerNum,
+            requested: playerName,
+            numericId: true,
+            strategy: 'select-by-id',
+            fieldExists: true,
+            selectSucceeded: false,
+            selectedRequestedValue: false,
+            ...fieldInfo,
+          });
           if (fieldInfo?.disabled) {
             console.log(`    ⚠️ Player ${playerNum}: field ${selectId} is disabled`);
             continue;
@@ -3077,6 +3088,7 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = null, dryRu
               .catch(() => null);
             const diag = result.fieldDiagnostics[result.fieldDiagnostics.length - 1];
             if (diag && selectedAfter) {
+              diag.selectSucceeded = true;
               diag.selectedValueAfterSelect = selectedAfter.selectedValue;
               diag.selectedTextAfterSelect = selectedAfter.selectedText;
               diag.selectedRequestedValue = selectedAfter.selectedValue === String(playerName);
@@ -3084,13 +3096,31 @@ async function fillPlayersAndConfirm(page, players = [], openSlots = null, dryRu
             console.log(
               `    ✅ Player ${playerNum}: ${playerName} (select by id)`,
             );
-            result.filled.push(playerName);
-            filled = true;
+            if (selectedAfter?.selectedValue === String(playerName)) {
+              result.filled.push(playerName);
+              filled = true;
+            } else {
+              console.log(`    Player ${playerNum}: selected value did not match ${playerName}`);
+            }
           } catch (e) {
             console.log(
               `    ℹ️ Strategy 0 (select by id) failed: ${e.message.substring(0, 50)}`,
             );
           }
+        } else {
+          result.fieldDiagnostics.push({
+            playerNum,
+            requested: playerName,
+            numericId: true,
+            strategy: 'select-by-id',
+            fieldExists: false,
+            selectSucceeded: false,
+            selectedRequestedValue: false,
+          });
+        }
+        if (!filled) {
+          console.log(`    Numeric member ID ${playerName} was not exactly verified; fuzzy fallback disabled`);
+          continue;
         }
       }
 

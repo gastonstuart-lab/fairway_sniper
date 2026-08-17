@@ -166,3 +166,22 @@ test('proof success requires reached candidate to match expected proof candidate
   assert(agentSource.includes('proof-boundary-proof-candidate-tee-mismatch'));
   assert.match(agentSource, /reachedDryRunBoundary =[\s\S]*boundaryConsistency\.ok/);
 });
+
+test('numeric member IDs are exact Strategy-0 only', () => {
+  assert(agentSource.includes('const isNumericPlayerId = /^\\d+$/.test(playerName);'));
+  assert(agentSource.includes("strategy: 'select-by-id'"));
+  assert(agentSource.includes('fieldExists: false'));
+  assert(agentSource.includes('selectSucceeded: false'));
+  assert(agentSource.includes('selectedRequestedValue: false'));
+  assert(agentSource.includes('fuzzy fallback disabled'));
+  assert.match(agentSource, /if \(!filled\) \{[\s\S]*?fuzzy fallback disabled[\s\S]*?continue;/);
+});
+
+test('prebook evidence uses exact verified player IDs', () => {
+  assert(agentSource.includes('selectedValueAfterSelect'));
+  const boundarySource = fs.readFileSync(path.join(repoRoot, 'agent', 'prebook_boundary.js'), 'utf8');
+  assert(boundarySource.includes('playersVerified'));
+  assert(boundarySource.includes('exactPlayersVerified'));
+  assert(!boundarySource.includes('selectedRequestedValue === undefined'));
+  assert(!boundarySource.includes('filled.length >= expected.length'));
+});

@@ -36,11 +36,16 @@ function boundaryError(evidence) {
   return null;
 }
 
-function playerDiagnosticsOk(fieldDiagnostics = []) {
-  return fieldDiagnostics.every((diag) => {
-    if (!diag || diag.selectedRequestedValue === undefined) return true;
-    return diag.selectedRequestedValue === true;
-  });
+function verifiedPlayersFromDiagnostics(fieldDiagnostics = []) {
+  return fieldDiagnostics
+    .filter((diag) => diag?.selectedRequestedValue === true)
+    .map((diag) => String(diag.selectedValueAfterSelect ?? diag.requested ?? '').trim())
+    .filter(Boolean);
+}
+
+function exactPlayersVerified(expected = [], verified = []) {
+  if (expected.length !== verified.length) return false;
+  return expected.every((player, index) => String(player) === String(verified[index]));
 }
 
 export function buildPrebookBoundaryEvidence({
@@ -63,8 +68,8 @@ export function buildPrebookBoundaryEvidence({
 } = {}) {
   const expected = Array.isArray(playersExpected) ? playersExpected : [];
   const filled = Array.isArray(playersFilled) ? playersFilled : [];
-  const playersFilledOk =
-    filled.length >= expected.length && playerDiagnosticsOk(fieldDiagnostics);
+  const verified = verifiedPlayersFromDiagnostics(fieldDiagnostics);
+  const playersFilledOk = exactPlayersVerified(expected, verified);
   const evidence = {
     prebookBoundaryReached: false,
     bookingFormVisible: Boolean(bookingFormVisible),
@@ -73,6 +78,7 @@ export function buildPrebookBoundaryEvidence({
     finalControlNotClicked: true,
     playersExpected: expected,
     playersFilled: filled,
+    playersVerified: verified,
     playersFilledOk,
     capacityValidated: Boolean(capacityValidated),
     capacityError,
