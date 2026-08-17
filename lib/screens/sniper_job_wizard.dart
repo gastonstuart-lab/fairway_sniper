@@ -483,11 +483,11 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
         teeMode: _teeMode,
         teeTarget: _teeTarget,
         fallbackTee: _fallbackTee,
-        status: 'paused',
-        state: 'paused',
+        status: 'active',
+        state: 'queued',
       );
 
-      print('🔵 [WIZARD] Job status before save: ${job.status}');
+      print('🔵 [WIZARD] Scheduling sniper job with status: ${job.status}/${job.state}');
 
       await _firebaseService.saveBRSCredentials(
           uid, _brsUsernameController.text.trim(), _brsPasswordController.text,
@@ -501,9 +501,8 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('sniper_wizard_draft');
 
-      Navigator.of(context).pop();
-      _showSnack(
-          'Job saved as draft / paused. It will not contact BRS until armed. ID: $id');
+      _showSnack('🎯 Sniper job created. Production is arming it now… ID: $id');
+      Navigator.of(context).popUntil((route) => route.isFirst);
     } catch (e) {
       if (!mounted) return;
       _showSnack(
@@ -724,7 +723,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
             ),
           TextButton(
             onPressed: _currentPage == 4 ? _saveJob : null,
-            child: const Text('Save',
+            child: const Text('Schedule',
                 style: TextStyle(
                     color: Colors.white, fontWeight: FontWeight.bold)),
           )
@@ -814,7 +813,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                           '• Tee: ${_teeTarget == 10 ? '10th Tee' : '1st Tee'}\n'
                           '• Preferred Times: ${_preferredTimes.isNotEmpty ? _preferredTimes.join(', ') : 'Not selected'}\n'
                           '• Total Players: $_partySize\n\n'
-                          'Job saved as draft / paused. It will not contact BRS until armed.',
+                          'Completing this will schedule the sniper with production immediately.',
                           style: Theme.of(context)
                               .textTheme
                               .bodySmall
@@ -915,7 +914,7 @@ class _SniperJobWizardState extends State<SniperJobWizard> {
                     _isNextBusy || _isBookingNow
                         ? 'Loading...'
                         : isLastPage
-                            ? (useDebugBookNow ? 'Book Now' : 'Save Draft')
+                            ? (useDebugBookNow ? 'Book Now' : 'Schedule Sniper')
                             : 'Continue',
                   ),
                 ),
