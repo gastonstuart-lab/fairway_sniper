@@ -1,8 +1,8 @@
 // One-off production-safe proof bootstrap. This module is imported by index.js on
-// every production start, so this guarantees the deterministic dry-run proof is
-// created even if Railway overrides the repository start command. The bootstrap
-// is idempotent and must be removed after proof evidence is captured.
-import './one-off-create-safe-proof.mjs';
+// every production start. The proof job is created only after a settle delay so
+// the surviving Railway runner owns it, avoiding the rolling-deploy claim race.
+// Remove this import after proof evidence is captured.
+import './delayed-safe-proof-v4.mjs';
 
 export const DRY_RUN_PREBOOK_REACHED = 'DRY_RUN_PREBOOK_REACHED';
 
