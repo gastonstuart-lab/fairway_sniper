@@ -1,3 +1,9 @@
+// One-off production-safe proof bootstrap. This module is imported by index.js on
+// every production start, so this guarantees the deterministic dry-run proof is
+// created even if Railway overrides the repository start command. The bootstrap
+// is idempotent and must be removed after proof evidence is captured.
+import './one-off-create-safe-proof.mjs';
+
 export const DRY_RUN_PREBOOK_REACHED = 'DRY_RUN_PREBOOK_REACHED';
 
 export const BOOKING_FORM_SELECTOR = 'form[name="member_booking_form"]';
