@@ -1,11 +1,11 @@
 import 'dotenv/config';
 import admin from 'firebase-admin';
 
-const PROOF_JOB_ID = 'safe-prep-proof-20260818-v2';
+const PROOF_JOB_ID = 'safe-prep-proof-20260818-v3';
 const SOURCE_JOB_ID = 'IOjhrgHbPR5ZttcgyUXz';
 const TARGET_DATE = '2026-08-24';
 const TARGET_TIME = '11:08';
-const FIRE_DELAY_MS = 390_000;
+const FIRE_DELAY_MS = 420_000;
 
 function normalizePrivateKey(value) {
   return String(value || '').replace(/\\n/g, '\n').trim();
