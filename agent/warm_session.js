@@ -63,6 +63,43 @@ function sessionIsUsable() {
   return contextOpen && browserOpen && pageIsUsable(warmPage);
 }
 
+function pageMatchesTargetTeeSheet(page, targetDate) {
+  if (!pageIsUsable(page) || !targetDate) return false;
+  const dateKey = targetDateKey(targetDate);
+  const [year, month, day] = dateKey.split('-');
+  const url = page.url?.() || '';
+  return (
+    url.includes('/tee-sheet/') &&
+    url.includes(`/${year}/${month}/${day}`)
+  );
+}
+
+async function loginFormVisible(page) {
+  if (!pageIsUsable(page)) return true;
+  const url = page.url?.() || '';
+  if (/\/login(?:[/?#]|$)/i.test(url)) return true;
+
+  const passwordVisible = await page
+    .locator('input[type="password"], input[placeholder*="password" i]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (!passwordVisible) return false;
+
+  return page
+    .locator(
+      'input[name="username"], input[type="text"][name*="username"], input[placeholder*="GUI" i], input[placeholder*="username" i], input[placeholder*="email" i]',
+    )
+    .first()
+    .isVisible()
+    .catch(() => false);
+}
+
+async function targetTeeSheetSessionIsUsable(page, targetDate) {
+  if (!pageMatchesTargetTeeSheet(page, targetDate)) return false;
+  return !(await loginFormVisible(page));
+}
+
 function resetStatus(error = null) {
   status = {
     warm: false,
@@ -233,6 +270,10 @@ async function ensureLoggedIn(username, password, loginUrl = DEFAULT_LOGIN_URL) 
 async function waitForTeeSheet(page, timeout = 25000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
+    if (await loginFormVisible(page)) {
+      throw new Error('BRS tee sheet redirected to login');
+    }
+
     const bookingLinks = await page
       .locator('a[href*="/bookings/book"]')
       .count()
@@ -269,18 +310,27 @@ async function preloadTeeSheet(targetDate, username, password) {
   log(`loading tee sheet for ${dateKey}`);
   await warmPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-  if (!(await isAuthenticated(warmPage).catch(() => false))) {
+  // The pre-release tee sheet can legitimately contain no visible Book links and
+  // no visible member-nav links. Treat only an actual login page/form as an auth
+  // loss. The old visible-link heuristic caused PREP to fail before release.
+  if (await loginFormVisible(warmPage)) {
     status.authenticated = false;
-    log('tee sheet load reached an unauthenticated page; refreshing login once');
+    log('tee sheet redirected to login; refreshing login once');
     await performLogin(warmPage, DEFAULT_LOGIN_URL, username, password);
     await warmPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    if (!(await isAuthenticated(warmPage).catch(() => false))) {
+    if (await loginFormVisible(warmPage)) {
       status.authenticated = false;
       throw new Error('BRS session lost authentication while loading tee sheet');
     }
   }
 
   await waitForTeeSheet(warmPage);
+  if (!(await targetTeeSheetSessionIsUsable(warmPage, dateKey))) {
+    status.authenticated = false;
+    status.teeSheetLoaded = false;
+    throw new Error('BRS target tee sheet was not retained after preload');
+  }
+
   status.warm = true;
   status.authenticated = true;
   status.teeSheetLoaded = true;
@@ -319,8 +369,8 @@ export async function getWarmPage(targetDate, username, password) {
     status.teeSheetLoaded &&
     status.targetDate === dateKey
   ) {
-    const stillAuthenticated = await isAuthenticated(warmPage).catch(() => false);
-    if (stillAuthenticated) {
+    const stillOnPreparedSheet = await targetTeeSheetSessionIsUsable(warmPage, dateKey);
+    if (stillOnPreparedSheet) {
       status.contextAlive = true;
       status.pageUrl = warmPage.url();
       return warmPage;
@@ -333,7 +383,8 @@ export async function getWarmPage(targetDate, username, password) {
       pageIsUsable(warmPage) &&
       status.authenticated &&
       status.teeSheetLoaded &&
-      status.targetDate === dateKey
+      status.targetDate === dateKey &&
+      (await targetTeeSheetSessionIsUsable(warmPage, dateKey))
     ) {
       return warmPage;
     }
@@ -389,10 +440,24 @@ async function keepaliveTick() {
     await warmPage.evaluate(() => document.title);
     status.contextAlive = true;
     status.pageUrl = warmPage.url();
-    status.authenticated = await isAuthenticated(warmPage).catch(() => false);
-    if (!status.authenticated) {
-      status.teeSheetLoaded = false;
+
+    const preparedTargetStillUsable =
+      status.targetDate &&
+      status.teeSheetLoaded &&
+      (await targetTeeSheetSessionIsUsable(warmPage, status.targetDate));
+
+    if (preparedTargetStillUsable) {
+      // Do not downgrade a valid pre-release tee sheet merely because it has no
+      // visible Book/member-nav elements yet.
+      status.authenticated = true;
+      status.teeSheetLoaded = true;
+    } else {
+      status.authenticated = await isAuthenticated(warmPage).catch(() => false);
+      if (!status.authenticated) {
+        status.teeSheetLoaded = false;
+      }
     }
+
     status.lastError = null;
     status.warm = true;
   } catch (error) {
