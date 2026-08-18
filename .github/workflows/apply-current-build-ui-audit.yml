@@ -1,16 +1,22 @@
 name: apply-current-build-ui-audit
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - ui/current-build-reliability-audit
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ui/current-build-reliability-audit
+          fetch-depth: 0
       - name: Apply audited UI reliability patch
         shell: bash
         run: |
@@ -126,3 +132,11 @@ jobs:
 
           Path('.github/workflows/apply-current-build-ui-audit.yml').unlink()
           PY
+      - name: Commit UI reliability fixes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix current-build wizard readability"
+          git push origin HEAD:ui/current-build-reliability-audit
