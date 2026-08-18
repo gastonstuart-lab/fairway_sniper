@@ -7,4 +7,4 @@ cmds = ["cd agent && npm ci && npx playwright install --with-deps chromium"]
 [phases.build]
 
 [start]
-cmd = "cd agent && node one-off-create-safe-proof.mjs && node index.js"
+cmd = "cd agent && node index.js"
