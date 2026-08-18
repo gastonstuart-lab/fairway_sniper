@@ -22,14 +22,17 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
-          import textwrap
 
           workflow = Path('.github/workflows/apply-current-build-ui-audit.yml').read_text()
           marker = "python3 <<'PY'\n"
           if marker not in workflow:
               raise SystemExit('embedded patch script not found')
           body = workflow.split(marker, 1)[1].split('\n          PY', 1)[0]
-          exec(compile(textwrap.dedent(body), '<ui-audit-patch>', 'exec'))
+          body = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in body.splitlines()
+          )
+          exec(compile(body, '<ui-audit-patch>', 'exec'))
           PY
           rm -f .github/workflows/run-current-build-ui-audit-on-pr.yml
           rm -f UI_AUDIT_TRIGGER.md
