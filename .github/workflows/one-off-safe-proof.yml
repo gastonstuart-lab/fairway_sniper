@@ -1,0 +1,236 @@
+name: one-off-safe-prep-proof
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  safe-prep-proof:
+    if: github.head_ref == 'ops/safe-proof-20260818'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUNTIME_BASE: https://fairwaysniper-production.up.railway.app
+      SOURCE_JOB_ID: IOjhrgHbPR5ZttcgyUXz
+      TARGET_DATE: '2026-08-24'
+      TARGET_TIME: '11:08'
+      FIRE_DELAY_SECONDS: '360'
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+      FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
+      FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+
+      - name: Confirm deployed repaired runtime
+        run: |
+          set -euo pipefail
+          expected='3b697daa6b1a141513761fc40f2705c9e9899cfd'
+          for attempt in $(seq 1 30); do
+            body="$(curl -fsS --max-time 10 "$RUNTIME_BASE/api/version" || true)"
+            deployed="$(printf '%s' "$body" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("gitHash") or "")
+except Exception: print("")')"
+            echo "attempt=$attempt deployed=${deployed:-unavailable}"
+            if [ "$deployed" = "$expected" ]; then exit 0; fi
+            sleep 10
+          done
+          echo 'Repaired merge is not the live Railway deployment.' >&2
+          exit 1
+
+      - name: Confirm Firebase admin secrets are available
+        run: |
+          set -euo pipefail
+          test -n "$FIREBASE_PROJECT_ID" || { echo 'MISSING_FIREBASE_PROJECT_ID'; exit 2; }
+          test -n "$FIREBASE_CLIENT_EMAIL" || { echo 'MISSING_FIREBASE_CLIENT_EMAIL'; exit 2; }
+          test -n "$FIREBASE_PRIVATE_KEY" || { echo 'MISSING_FIREBASE_PRIVATE_KEY'; exit 2; }
+          echo 'Firebase Admin credentials available to workflow.'
+
+      - name: Install Firebase tooling without Playwright browser install
+        working-directory: agent
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Create one safe proof job from tonight's live template
+        id: create
+        working-directory: agent
+        run: |
+          node --input-type=module <<'NODE'
+          import admin from 'firebase-admin';
+          import fs from 'node:fs';
+
+          const projectId = process.env.FIREBASE_PROJECT_ID;
+          const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+          const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+          admin.initializeApp({ credential: admin.credential.cert({ projectId, clientEmail, privateKey }) });
+          const db = admin.firestore();
+          const sourceId = process.env.SOURCE_JOB_ID;
+          const sourceSnap = await db.collection('jobs').doc(sourceId).get();
+          if (!sourceSnap.exists) throw new Error('source-live-job-not-found');
+          const source = sourceSnap.data() || {};
+          const ownerUid = source.ownerUid || source.owner_uid;
+          if (!ownerUid && !(source.brs_email && source.brs_password)) {
+            throw new Error('source-job-has-no-credential-path');
+          }
+          const partySize = Number(source.party_size ?? source.partySize ?? 1);
+          const players = Array.isArray(source.players) ? source.players : [];
+          if (players.length !== Math.max(0, partySize - 1)) {
+            throw new Error(`party-player-count-mismatch:${partySize}:${players.length}`);
+          }
+          const now = Date.now();
+          const fireAt = new Date(now + Number(process.env.FIRE_DELAY_SECONDS) * 1000);
+          const targetDate = process.env.TARGET_DATE;
+          const [y,m,d] = targetDate.split('-').map(Number);
+          const targetPlay = new Date(Date.UTC(y, m - 1, d));
+          const payload = {
+            ownerUid: ownerUid || null,
+            mode: 'sniper',
+            status: 'active',
+            state: 'queued',
+            club: source.club || 'galgorm',
+            tz: source.tz || source.timezone || 'Europe/London',
+            release_day: source.release_day || source.releaseDay || 'Wednesday',
+            release_time_local: source.release_time_local || source.releaseTimeLocal || '19:20',
+            target_day: 'Monday',
+            target_date: targetDate,
+            target_play_date: admin.firestore.Timestamp.fromDate(targetPlay),
+            preferred_times: [process.env.TARGET_TIME],
+            players,
+            party_size: partySize,
+            tee: 1,
+            tee_target: 1,
+            tee_mode: source.tee_mode || source.teeMode || 'single',
+            fallback_tee: false,
+            dry_run: true,
+            proof_run: true,
+            proof_label: 'safe_production_proof',
+            proof_template_job_id: sourceId,
+            proof_candidate_date: targetDate,
+            proof_candidate_time: process.env.TARGET_TIME,
+            proof_candidate_tee: 1,
+            proof_party_size: partySize,
+            proof_fire_delay_ms: Number(process.env.FIRE_DELAY_SECONDS) * 1000,
+            proof_fire_time_override_utc: admin.firestore.Timestamp.fromDate(fireAt),
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp(),
+          };
+          if (source.brs_email && source.brs_password) {
+            payload.brs_email = source.brs_email;
+            payload.brs_password = source.brs_password;
+          }
+          const ref = await db.collection('jobs').add(payload);
+          fs.writeFileSync('../proof-job-id.txt', ref.id + '\n');
+          fs.writeFileSync('../proof-created.json', JSON.stringify({ jobId: ref.id, targetDate, targetTime: process.env.TARGET_TIME, fireAt: fireAt.toISOString(), partySize, playersCount: players.length }, null, 2));
+          console.log(`SAFE_PROOF_JOB_ID=${ref.id}`);
+          console.log(`SAFE_PROOF_FIRE_AT=${fireAt.toISOString()}`);
+          NODE
+
+      - name: Observe PREP, pre-fire verification and FIRE read-only
+        run: |
+          set -euo pipefail
+          JOB_ID="$(tr -d '\r\n' < proof-job-id.txt)"
+          echo "Watching safe proof $JOB_ID"
+          ready_seen=0
+          prefire_seen=0
+          fire_seen=0
+          bad_fire_auth=0
+          for attempt in $(seq 1 120); do
+            curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$JOB_ID/status" -o proof-status.json || true
+            curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$JOB_ID/events" -o proof-events.json || true
+            python3 - <<'PY'
+          import json, os
+          def load(path):
+              try:
+                  with open(path, encoding='utf-8') as f: return json.load(f)
+              except Exception: return {}
+          s=load('proof-status.json'); e=load('proof-events.json')
+          events=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          print('STATUS', {k:s.get(k) for k in ['status','state','warmState','brsAuthenticated','secondsUntilPrep','secondsUntilFire','result','errorMessage','lastAgentEvent','lastAgentError']})
+          print('EVENTS', events[-12:])
+          PY
+            if python3 - <<'PY'
+          import json
+          try: s=json.load(open('proof-status.json'))
+          except Exception: raise SystemExit(1)
+          ok=(s.get('warmState')=='ready' and s.get('brsAuthenticated') is True)
+          raise SystemExit(0 if ok else 1)
+          PY
+            then ready_seen=1; fi
+            if python3 - <<'PY'
+          import json
+          try: e=json.load(open('proof-events.json'))
+          except Exception: raise SystemExit(1)
+          types=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          raise SystemExit(0 if 'PREFIRE_VERIFY_FIRED' in types else 1)
+          PY
+            then prefire_seen=1; fi
+            if python3 - <<'PY'
+          import json
+          try: e=json.load(open('proof-events.json'))
+          except Exception: raise SystemExit(1)
+          types=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          raise SystemExit(0 if 'FIRE_TIMER_FIRED' in types else 1)
+          PY
+            then fire_seen=1; fi
+            if python3 - <<'PY'
+          import json
+          try: e=json.load(open('proof-events.json'))
+          except Exception: raise SystemExit(1)
+          types=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          bad=any(t in types for t in ['BRS_NOT_READY_AT_FIRE_TIME','AUTH_FAILED_AT_FIRE','WARMUP_ERROR_AT_FIRE'])
+          raise SystemExit(0 if bad else 1)
+          PY
+            then bad_fire_auth=1; fi
+            if [ "$ready_seen" -eq 1 ] && [ "$prefire_seen" -eq 1 ] && [ "$fire_seen" -eq 1 ]; then break; fi
+            sleep 5
+          done
+          echo "ready_seen=$ready_seen prefire_seen=$prefire_seen fire_seen=$fire_seen bad_fire_auth=$bad_fire_auth"
+          test "$ready_seen" -eq 1
+          test "$prefire_seen" -eq 1
+          test "$fire_seen" -eq 1
+          test "$bad_fire_auth" -eq 0
+
+      - name: Assert safe-proof boundary and no live booking
+        working-directory: agent
+        run: |
+          node --input-type=module <<'NODE'
+          import admin from 'firebase-admin';
+          import fs from 'node:fs';
+          const projectId=process.env.FIREBASE_PROJECT_ID;
+          const clientEmail=process.env.FIREBASE_CLIENT_EMAIL;
+          const privateKey=String(process.env.FIREBASE_PRIVATE_KEY||'').replace(/\\n/g,'\n');
+          if (!admin.apps.length) admin.initializeApp({credential:admin.credential.cert({projectId,clientEmail,privateKey})});
+          const db=admin.firestore();
+          const jobId=fs.readFileSync('../proof-job-id.txt','utf8').trim();
+          const snap=await db.collection('jobs').doc(jobId).get();
+          if (!snap.exists) throw new Error('proof-job-disappeared');
+          const j=snap.data()||{};
+          if (j.dry_run !== true || j.proof_run !== true) throw new Error('proof-safety-flags-lost');
+          if (j.booked_time || j.bookedTime) throw new Error('UNSAFE:proof-created-booking');
+          const events=await db.collection('jobs').doc(jobId).collection('events').orderBy('at','asc').get();
+          const types=events.docs.map(d=>d.data()?.type).filter(Boolean);
+          if (!types.includes('READY')) throw new Error('READY-not-observed');
+          if (!types.includes('PREFIRE_VERIFY_FIRED')) throw new Error('PREFIRE_VERIFY-not-observed');
+          if (!types.includes('FIRE_TIMER_FIRED')) throw new Error('FIRE-not-observed');
+          if (types.includes('BRS_NOT_READY_AT_FIRE_TIME')) throw new Error('fire-required-auth-recovery');
+          fs.writeFileSync('../proof-final.json', JSON.stringify({jobId,status:j.status,state:j.state,result:j.result||null,bookedTime:j.booked_time||j.bookedTime||null,lastAgentEvent:j.last_agent_event||null,lastAgentError:j.last_agent_error||null,eventTypes:types},null,2));
+          console.log('SAFE_PREP_PROOF_ACCEPTANCE=PASS');
+          console.log('No live booking was created.');
+          NODE
+
+      - name: Upload proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: safe-prep-proof-evidence
+          path: |
+            proof-job-id.txt
+            proof-created.json
+            proof-status.json
+            proof-events.json
+            proof-final.json
+          if-no-files-found: ignore
