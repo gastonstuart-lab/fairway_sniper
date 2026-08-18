@@ -16,25 +16,26 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('lib/screens/mode_selection_screen.dart')
           text = path.read_text()
-          import_old = "import 'package:fairway_sniper/theme/app_spacing.dart';\n"
-          import_new = "import 'package:fairway_sniper/theme/app_spacing.dart';\nimport 'package:fairway_sniper/theme.dart';\n"
-          if import_old not in text:
-              raise SystemExit('mode selection: spacing import not found')
-          text = text.replace(import_old, import_new, 1)
-          old = """  void _startNormal() {
-            Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const NewJobWizard()));
-          }
 
-          void _startSniper() {
-            Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const SniperJobWizard()));
-          }
-          """
-          new = """  void _startNormal() {
+          spacing_import = "import 'package:fairway_sniper/theme/app_spacing.dart';\n"
+          if spacing_import not in text:
+              raise SystemExit('mode selection: spacing import not found')
+          if "import 'package:fairway_sniper/theme.dart';" not in text:
+              text = text.replace(
+                  spacing_import,
+                  spacing_import + "import 'package:fairway_sniper/theme.dart';\n",
+                  1,
+              )
+
+          normal_pattern = re.compile(
+              r"  void _startNormal\(\) \{.*?^  \}",
+              re.MULTILINE | re.DOTALL,
+          )
+          normal_replacement = """  void _startNormal() {
             Navigator.of(context).push(
               MaterialPageRoute(
                 builder: (_) => Theme(
@@ -43,9 +44,16 @@ jobs:
                 ),
               ),
             );
-          }
+          }"""
+          text, normal_count = normal_pattern.subn(normal_replacement, text, count=1)
+          if normal_count != 1:
+              raise SystemExit(f'mode selection: expected one normal launcher, got {normal_count}')
 
-          void _startSniper() {
+          sniper_pattern = re.compile(
+              r"  void _startSniper\(\) \{.*?^  \}",
+              re.MULTILINE | re.DOTALL,
+          )
+          sniper_replacement = """  void _startSniper() {
             Navigator.of(context).push(
               MaterialPageRoute(
                 builder: (_) => Theme(
@@ -54,88 +62,14 @@ jobs:
                 ),
               ),
             );
-          }
-          """
-          if old not in text:
-              raise SystemExit('mode selection: wizard launch block not found')
-          path.write_text(text.replace(old, new, 1))
+          }"""
+          text, sniper_count = sniper_pattern.subn(sniper_replacement, text, count=1)
+          if sniper_count != 1:
+              raise SystemExit(f'mode selection: expected one sniper launcher, got {sniper_count}')
 
-          path = Path('lib/screens/sniper_job_wizard.dart')
-          text = path.read_text()
-          old = """          if (kDebugMode)
-            TextButton(
-              onPressed: _sniperTestRunning ? null : _runSniperTest,
-              child: Text(
-                _sniperTestRunning ? 'Testing...' : 'Sniper Test (4m)',
-                style: const TextStyle(color: Colors.white),
-              ),
-            ),
-          TextButton(
-            onPressed: _currentPage == 4 ? _saveJob : null,
-            child: const Text('Schedule',
-                style: TextStyle(
-                    color: Colors.white, fontWeight: FontWeight.bold)),
-          )
-          """
-          new = """          if (kDebugMode)
-            TextButton(
-              style: TextButton.styleFrom(
-                foregroundColor: Theme.of(context).colorScheme.onSurface,
-                disabledForegroundColor: Theme.of(context)
-                    .colorScheme
-                    .onSurface
-                    .withValues(alpha: 0.38),
-              ),
-              onPressed: _sniperTestRunning ? null : _runSniperTest,
-              child: Text(
-                _sniperTestRunning ? 'Testing...' : 'Sniper Test (4m)',
-              ),
-            ),
-          TextButton(
-            style: TextButton.styleFrom(
-              foregroundColor: Theme.of(context).colorScheme.onSurface,
-              disabledForegroundColor: Theme.of(context)
-                  .colorScheme
-                  .onSurface
-                  .withValues(alpha: 0.38),
-            ),
-            onPressed: _currentPage == 4 ? _saveJob : null,
-            child: const Text(
-              'Schedule',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-          )
-          """
-          if old not in text:
-              raise SystemExit('sniper wizard: appbar actions block not found')
-          path.write_text(text.replace(old, new, 1))
+          path.write_text(text)
 
-          path = Path('lib/screens/dashboard_screen.dart')
-          text = path.read_text()
-          old = """                        // Delete button
-                        IconButton(
-          """
-          new = """                        // Active sniper timers live in the production process, so do
-                        // not show a misleading delete affordance while one is live.
-                        if (!(isSniper && isLiveJob))
-                          IconButton(
-          """
-          if old not in text:
-              raise SystemExit('dashboard: delete button marker not found')
-          text = text.replace(old, new, 1)
-          old = """                          tooltip: isSniper && isLiveJob
-                              ? 'Scheduled sniper cannot be deleted while active'
-                              : 'Delete Job',
-                          onPressed: isSniper && isLiveJob ? null : () async {
-          """
-          new = """                          tooltip: 'Delete Job',
-                          onPressed: () async {
-          """
-          if old not in text:
-              raise SystemExit('dashboard: delete disabled logic not found')
-          path.write_text(text.replace(old, new, 1))
-
-          Path('test/screens/current_build_ui_reliability_test.dart').write_text(r'''import 'dart:io';
+          Path('test/screens/current_build_ui_reliability_test.dart').write_text("""import 'dart:io';
 
           import 'package:flutter_test/flutter_test.dart';
 
@@ -143,65 +77,52 @@ jobs:
             test('booking wizards launch under a readable dark theme', () {
               final source =
                   File('lib/screens/mode_selection_screen.dart').readAsStringSync();
+              expect(source, contains("import 'package:fairway_sniper/theme.dart';"));
               expect(source, contains('data: darkTheme'));
               expect(source, contains('child: const NewJobWizard()'));
               expect(source, contains('child: const SniperJobWizard()'));
             });
-
-            test('sniper wizard app bar exposes a real disabled state', () {
-              final source =
-                  File('lib/screens/sniper_job_wizard.dart').readAsStringSync();
-              expect(source, contains('disabledForegroundColor'));
-              expect(source, isNot(contains("style: const TextStyle(color: Colors.white)")));
-            });
-
-            test('active sniper card hides delete affordance', () {
-              final source =
-                  File('lib/screens/dashboard_screen.dart').readAsStringSync();
-              expect(source, contains('if (!(isSniper && isLiveJob))'));
-              expect(source, isNot(contains("tooltip: isSniper && isLiveJob")));
-            });
           }
-          ''')
+          """)
 
-          Path('CURRENT_BUILD_UI_RELIABILITY_AUDIT.md').write_text(r'''# Fairway Sniper current-build UI reliability audit
+          Path('CURRENT_BUILD_UI_RELIABILITY_AUDIT.md').write_text("""# Fairway Sniper current-build UI reliability audit
 
           Audit target: `main` at `f8537f59b620f7aaa386e32326cc0a3804e562d6`.
 
-          This pass deliberately avoids a visual redesign. Its goal is to make the current build readable and operationally truthful without touching the proven booking engine.
+          This pass deliberately avoids redesigning the product. The goal is to make the current build readable before visual redesign work, without touching the proven booking engine.
 
-          ## Verified issues fixed
+          ## Verified blocker fixed
 
-          - `ThemeMode.system` could be light while both booking wizards render hard-coded dark surfaces. Their inherited headings/helper text could therefore become dark-on-dark. Both wizards now launch beneath the app dark theme.
-          - Sniper Wizard AppBar actions previously forced white text even while the surrounding system theme could be light and even when `Schedule` was disabled. They now use theme-aware enabled/disabled foregrounds.
-          - A live scheduled sniper showed a red trash icon even though deletion was disabled. The icon looked actionable. Live sniper jobs now hide the delete affordance entirely.
+          The application uses `ThemeMode.system`, but both booking wizards render intentionally hard-coded dark surfaces (`Colors.black` in Normal Booking and `#1a1a1a` in Sniper Booking). On a computer using the light system theme, inherited headings, labels and helper text could therefore resolve to the light theme's dark foreground and become difficult or impossible to read on the dark wizard surface.
 
-          ## Screen review
+          The two wizard routes now receive the app's existing `darkTheme` above the wizard widget itself. This keeps the current dark wizard design intact while ensuring every inherited `Theme.of(context)` inside those flows resolves to readable dark-theme foregrounds, fields, chips, cards and disabled states.
 
-          - Login: explicit foreground/background treatment; no blocking contrast defect found.
-          - Mode selection: responsive desktop/narrow layout; no booking blocker found.
-          - Normal wizard: dark surface; fixed inherited-theme mismatch at launch.
-          - Sniper wizard: dark surface; fixed inherited-theme mismatch and AppBar disabled-state clarity.
-          - Dashboard: production states/countdowns remain unchanged; fixed misleading live-sniper delete affordance.
-          - Player selector/editor: used inside the now-consistent dark wizard theme; no logic changes made.
-          - Course info: no booking-path blocker found.
-          - Admin dashboard: cosmetic inconsistency deferred; not part of user booking path.
+          ## Whole-app source review
+
+          - Login: explicit white hero foreground and explicit dark text on the white login card; no blocking contrast defect found.
+          - Mode selection: responsive desktop/narrow layout; wizard launch point was the correct place to fix the theme mismatch.
+          - Normal booking wizard: hard-coded black shell with inherited theme text; fixed by the route-level dark theme.
+          - Sniper booking wizard: hard-coded dark shell with inherited theme text; fixed by the route-level dark theme.
+          - Dashboard: live production state, PREP/FIRE times and countdown are already surfaced; no booking logic changed in this audit.
+          - Shared player selector/editor: both are used by these wizard flows and now inherit the consistent dark route theme.
+          - Course information: no booking-path blocker found in source review.
+          - Admin dashboard: styling is less consistent but is not part of the normal booking path; cosmetic work is deferred.
 
           ## Explicitly unchanged
 
           - Node/Railway booking engine
           - PREP/FIRE scheduling
-          - BRS session/login automation
-          - player IDs / party capacity validation
-          - tee/slot selection
+          - BRS login/session automation
+          - player IDs and capacity validation
+          - tee and slot selection
           - Firestore job schema
-          - dry-run proof boundary
-          - real final-submit path
+          - safe proof boundary
+          - final real booking submission logic
 
           ## Deployment rule
 
-          Do not merge/deploy this branch while the currently scheduled real sniper is waiting to fire. CI/review on this draft PR is safe; production remains frozen.
-          ''')
+          This draft branch must not be merged or deployed while the currently scheduled real sniper is waiting to fire. CI and review are safe; production remains frozen.
+          """)
 
           Path('.github/workflows/apply-current-build-ui-audit.yml').unlink()
           PY
