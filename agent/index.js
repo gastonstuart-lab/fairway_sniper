@@ -938,6 +938,14 @@ const CONFIG = {
     process.env.SNIPER_FIRE_WARMUP_WAIT_MS || '15000',
     10,
   ),
+  SNIPER_PREP_RETRY_INTERVAL_MS: Number.parseInt(
+    process.env.SNIPER_PREP_RETRY_INTERVAL_MS || '15000',
+    10,
+  ),
+  SNIPER_PREFIRE_VERIFY_LEAD_MS: Number.parseInt(
+    process.env.SNIPER_PREFIRE_VERIFY_LEAD_MS || '30000',
+    10,
+  ),
   SNIPER_FALLBACK_WINDOW_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_WINDOW_MINUTES || '10', 10),
   SNIPER_FALLBACK_STEP_MINUTES: Number.parseInt(process.env.SNIPER_FALLBACK_STEP_MINUTES || '10', 10),
   SNIPER_NEAREST_SLOT_WINDOW_MINUTES: Number.parseInt(
@@ -1857,6 +1865,8 @@ async function scheduleClaimedJob(job) {
     runnerInstanceId: AGENT_ID,
     prepTimer: null,
     fireTimer: null,
+    warmRetryTimer: null,
+    preFireVerifyTimer: null,
     bookingAttempted: false,
     cachedJob: job,
     cachedCreds: null,
@@ -1868,8 +1878,11 @@ async function scheduleClaimedJob(job) {
   const runPrepWarmup = async (reason = 'prep-timer') => {
     const entry = jobTimers.get(jobId);
     if (!entry) return null;
-    if (entry.warmState === 'ready' && warmPage) return warmPage;
     if (warmupPromise) return warmupPromise;
+    if (entry.warmRetryTimer?.timeoutId) {
+      clearTimeout(entry.warmRetryTimer.timeoutId);
+      entry.warmRetryTimer = null;
+    }
 
     warmupPromise = (async () => {
       const creds = await resolveJobCredentials(job);
@@ -1938,6 +1951,58 @@ async function scheduleClaimedJob(job) {
       });
 
     return warmupPromise;
+  };
+
+  const scheduleWarmupRetry = async (reason, error) => {
+    const entry = jobTimers.get(jobId);
+    if (!entry || entry.bookingAttempted) return false;
+    const retryDelayMs = Math.max(1000, CONFIG.SNIPER_PREP_RETRY_INTERVAL_MS);
+    const retryAtMs = Date.now() + retryDelayMs;
+    if (retryAtMs >= fireMs) return false;
+    if (entry.warmRetryTimer?.timeoutId) return true;
+
+    const retryTimerId = nextTimerId('prep-retry');
+    const retryTimeoutId = setTimeout(async () => {
+      const latest = jobTimers.get(jobId);
+      if (!latest || latest.bookingAttempted) return;
+      latest.warmRetryTimer = null;
+      await fsAddJobEvent(jobId, 'WARMUP_RETRY_FIRED', {
+        timerId: retryTimerId,
+        reason,
+      });
+      try {
+        await runPrepWarmupWithRetry('prep-retry');
+      } catch (_error) {
+        // The failed retry is logged by runPrepWarmup; the next retry is scheduled there.
+      }
+    }, retryDelayMs);
+    retryTimeoutId.unref?.();
+
+    entry.warmRetryTimer = {
+      timerId: retryTimerId,
+      timeoutId: retryTimeoutId,
+      state: 'registered',
+      scheduledStartAt: new Date(retryAtMs).toISOString(),
+      delayMs: retryDelayMs,
+      reason,
+    };
+    await fsAddJobEvent(jobId, 'WARMUP_RETRY_SCHEDULED', {
+      timerId: retryTimerId,
+      scheduledStartAt: new Date(retryAtMs).toISOString(),
+      retryDelayMs,
+      reason,
+      error: error?.message || String(error),
+    });
+    return true;
+  };
+
+  const runPrepWarmupWithRetry = async (reason = 'prep-timer') => {
+    try {
+      return await runPrepWarmup(reason);
+    } catch (error) {
+      await scheduleWarmupRetry(reason, error);
+      throw error;
+    }
   };
 
   const fireNow = async (source = 'fire-timer') => {
@@ -2123,6 +2188,8 @@ async function scheduleClaimedJob(job) {
       const latest = jobTimers.get(jobId);
       if (latest?.prepTimer?.timeoutId) clearTimeout(latest.prepTimer.timeoutId);
       if (latest?.fireTimer?.timeoutId) clearTimeout(latest.fireTimer.timeoutId);
+      if (latest?.warmRetryTimer?.timeoutId) clearTimeout(latest.warmRetryTimer.timeoutId);
+      if (latest?.preFireVerifyTimer?.timeoutId) clearTimeout(latest.preFireVerifyTimer.timeoutId);
       jobTimers.delete(jobId);
     }
   };
@@ -2143,7 +2210,7 @@ async function scheduleClaimedJob(job) {
     });
     await fsUpdateJob(jobId, { state: 'warming' });
     try {
-      await runPrepWarmup('prep-timer');
+      await runPrepWarmupWithRetry('prep-timer');
     } catch (_error) {
       // warm-up failure is already recorded; fire timer still executes independently
     }
@@ -2154,6 +2221,32 @@ async function scheduleClaimedJob(job) {
   const fireTimeoutId = setTimeout(async () => {
     await fireNow('fire-timer');
   }, fireDelayMs);
+
+  const preFireVerifyTimerId = nextTimerId('pre-fire-verify');
+  const preFireVerifyMs = fireMs - Math.max(1000, CONFIG.SNIPER_PREFIRE_VERIFY_LEAD_MS);
+  const preFireVerifyInstallAtMs = Date.now();
+  const preFireVerifyDelayMs = Math.max(0, preFireVerifyMs - preFireVerifyInstallAtMs);
+  const preFireVerifyTimeoutId =
+    preFireVerifyMs > preFireVerifyInstallAtMs
+      ? setTimeout(async () => {
+          const entry = jobTimers.get(jobId);
+          if (!entry || entry.bookingAttempted) return;
+          if (entry.preFireVerifyTimer) {
+            entry.preFireVerifyTimer.state = 'fired';
+            entry.preFireVerifyTimer.firedAt = new Date().toISOString();
+          }
+          await fsAddJobEvent(jobId, 'PREFIRE_VERIFY_FIRED', {
+            timerId: preFireVerifyTimerId,
+            scheduledStartAt: new Date(preFireVerifyMs).toISOString(),
+          });
+          try {
+            await runPrepWarmupWithRetry('pre-fire-verify');
+          } catch (_error) {
+            // The fire timer remains authoritative and can still recover if needed.
+          }
+        }, preFireVerifyDelayMs)
+      : null;
+  preFireVerifyTimeoutId?.unref?.();
 
   const prepTimerInstalledAtUtc = new Date(prepTimerInstalledAtMs).toISOString();
   const fireTimerInstalledAtUtc = new Date(fireTimerInstalledAtMs).toISOString();
@@ -2180,6 +2273,15 @@ async function scheduleClaimedJob(job) {
     delayMs: fireDelayMs,
     fireTimerInstallLagMs,
   };
+  if (preFireVerifyTimeoutId) {
+    timerEntry.preFireVerifyTimer = {
+      timerId: preFireVerifyTimerId,
+      timeoutId: preFireVerifyTimeoutId,
+      state: 'registered',
+      scheduledStartAt: new Date(preFireVerifyMs).toISOString(),
+      delayMs: preFireVerifyDelayMs,
+    };
+  }
 
   if (prepMs <= prepTimerInstalledAtMs) timerEntry.prepTimer.recovered = true;
   if (fireMs <= fireTimerInstalledAtMs) timerEntry.fireTimer.recovered = true;

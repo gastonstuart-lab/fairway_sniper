@@ -13,6 +13,7 @@ const safeProofBuilderSource = fs.readFileSync(
   path.join(repoRoot, 'lib', 'services', 'safe_proof_builder.dart'),
   'utf8',
 );
+const warmSessionSource = fs.readFileSync(path.join(repoRoot, 'agent', 'warm_session.js'), 'utf8');
 
 function functionBody(source, name) {
   const start = source.indexOf(`async function ${name}`);
@@ -38,6 +39,47 @@ test('scheduler registers PREP and FIRE timers before warm-up can block', () => 
   assert(timerSet < warmStart, 'timer must be registered before warm-up starts');
   assert(prepTimeoutSet < prepTimerCreate, 'prep timeout must be installed before diagnostic writes');
   assert(fireTimeoutSet < fireTimerCreate, 'fire timeout must be installed before diagnostic writes');
+});
+
+test('failed PREP warm-up retries before FIRE instead of waiting for fire recovery', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('SNIPER_PREP_RETRY_INTERVAL_MS'));
+  assert(body.includes('WARMUP_RETRY_SCHEDULED'));
+  assert(body.includes('WARMUP_RETRY_FIRED'));
+  assert(body.includes('runPrepWarmupWithRetry'));
+  assert.match(body, /retryAtMs >= fireMs[\s\S]*return false/);
+  assert.match(body, /await runPrepWarmupWithRetry\('prep-timer'\)/);
+});
+
+test('healthy prepared sessions are verified before FIRE and reused by the fire path', () => {
+  const body = functionBody(agentSource, 'scheduleClaimedJob');
+  assert(body.includes('SNIPER_PREFIRE_VERIFY_LEAD_MS'));
+  assert(body.includes('PREFIRE_VERIFY_FIRED'));
+  assert.match(body, /await runPrepWarmupWithRetry\('pre-fire-verify'\)/);
+  assert(!body.includes("if (entry.warmState === 'ready' && warmPage) return warmPage;"));
+  assert.match(body, /let fireWarmPage = warmPage;[\s\S]*if \(!fireWarmPage\)/);
+});
+
+test('warm session uses the known-good persistent browser profile', () => {
+  assert(warmSessionSource.includes("path.join(agentDir, '.session', 'profile')"));
+  assert(warmSessionSource.includes('chromium.launchPersistentContext(profileDir'));
+  assert(!warmSessionSource.includes('warmBrowser = await chromium.launch({'));
+  assert(!warmSessionSource.includes('warmContext = await warmBrowser.newContext();'));
+});
+
+test('PREP tee-sheet auth loss is repaired before declaring warm-up failure', () => {
+  assert(warmSessionSource.includes('tee sheet load reached an unauthenticated page; refreshing login once'));
+  assert.match(warmSessionSource, /await performLogin\(warmPage, DEFAULT_LOGIN_URL, username, password\);[\s\S]*await warmPage\.goto\(url/);
+  assert.match(warmSessionSource, /throw new Error\('BRS session lost authentication while loading tee sheet'\)/);
+});
+
+test('live booking success still requires BRS confirmation after final Create Booking click', () => {
+  const directBody = functionBody(agentSource, 'tryDirectBookingHref');
+  const verifyBody = functionBody(agentSource, 'verifyBookingConfirmation');
+  assert(directBody.includes('const verification = await verifyBookingConfirmation(page, time, 8000);'));
+  assert.match(directBody, /booked:\s*verification\.confirmed\s*&&\s*!confirmationBlocked/);
+  assert(verifyBody.includes("const confirmed = ['text', 'bookings-page'].includes(verificationSignal);"));
+  assert(verifyBody.includes("verificationSignal = 'row-unavailable';"));
 });
 
 function finalDelay(targetMs, installedAtMs) {

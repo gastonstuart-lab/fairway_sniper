@@ -1,4 +1,11 @@
 import { chromium } from '@playwright/test';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const agentDir = path.dirname(__filename);
+const profileDir = path.join(agentDir, '.session', 'profile');
 
 let warmBrowser = null;
 let warmContext = null;
@@ -50,6 +57,12 @@ function browserIsUsable(browser) {
   return Boolean(browser && browser.isConnected?.());
 }
 
+function sessionIsUsable() {
+  const contextOpen = Boolean(warmContext && !warmContext.isClosed?.());
+  const browserOpen = !warmBrowser || browserIsUsable(warmBrowser);
+  return contextOpen && browserOpen && pageIsUsable(warmPage);
+}
+
 function resetStatus(error = null) {
   status = {
     warm: false,
@@ -79,19 +92,23 @@ async function disposeBrokenSession() {
 }
 
 async function ensureContext() {
-  if (browserIsUsable(warmBrowser) && warmContext && pageIsUsable(warmPage)) {
+  if (sessionIsUsable()) {
     status.contextAlive = true;
     return warmContext;
   }
 
   await disposeBrokenSession();
-  log('launching reusable Chromium session');
-  warmBrowser = await chromium.launch({
+  await fs.promises.mkdir(profileDir, { recursive: true }).catch(() => {});
+  log('launching persistent reusable Chromium session');
+  warmContext = await chromium.launchPersistentContext(profileDir, {
     headless: true,
     args: ['--disable-blink-features=AutomationControlled'],
   });
-  warmContext = await warmBrowser.newContext();
-  warmPage = await warmContext.newPage();
+  warmBrowser = warmContext.browser?.() || null;
+  [warmPage] = warmContext.pages();
+  if (!warmPage) {
+    warmPage = await warmContext.newPage();
+  }
 
   status.warm = true;
   status.authenticated = false;
@@ -241,7 +258,7 @@ async function waitForTeeSheet(page, timeout = 25000) {
   throw new Error('Tee sheet not detected after preload wait');
 }
 
-async function preloadTeeSheet(targetDate) {
+async function preloadTeeSheet(targetDate, username, password) {
   await ensureContext();
   if (!pageIsUsable(warmPage)) {
     throw new Error('Warm browser page is unavailable');
@@ -254,7 +271,13 @@ async function preloadTeeSheet(targetDate) {
 
   if (!(await isAuthenticated(warmPage).catch(() => false))) {
     status.authenticated = false;
-    throw new Error('BRS session lost authentication while loading tee sheet');
+    log('tee sheet load reached an unauthenticated page; refreshing login once');
+    await performLogin(warmPage, DEFAULT_LOGIN_URL, username, password);
+    await warmPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    if (!(await isAuthenticated(warmPage).catch(() => false))) {
+      status.authenticated = false;
+      throw new Error('BRS session lost authentication while loading tee sheet');
+    }
   }
 
   await waitForTeeSheet(warmPage);
@@ -272,7 +295,7 @@ async function preloadTeeSheet(targetDate) {
 async function initWarmFlow(targetDate, username, password) {
   try {
     await ensureLoggedIn(username, password);
-    await preloadTeeSheet(targetDate);
+    await preloadTeeSheet(targetDate, username, password);
     status.lastError = null;
     return warmPage;
   } catch (error) {
@@ -333,8 +356,7 @@ export async function closeWarmSession() {
 }
 
 export function getWarmStatus() {
-  const contextAlive =
-    browserIsUsable(warmBrowser) && Boolean(warmContext) && pageIsUsable(warmPage);
+  const contextAlive = sessionIsUsable();
   const pageUrl = pageIsUsable(warmPage) ? warmPage.url() : null;
 
   return {
@@ -350,8 +372,7 @@ export function getWarmStatus() {
 }
 
 async function keepaliveTick() {
-  const contextAlive =
-    browserIsUsable(warmBrowser) && Boolean(warmContext) && pageIsUsable(warmPage);
+  const contextAlive = sessionIsUsable();
   if (!contextAlive) {
     status.warm = false;
     status.authenticated = false;
