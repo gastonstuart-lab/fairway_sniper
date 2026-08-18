@@ -1,0 +1,70 @@
+name: production-runtime-smoke
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  verify-railway-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for Railway to deploy this commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          VERSION_URL: https://fairwaysniper-production.up.railway.app/api/version
+        run: |
+          set -euo pipefail
+          echo "Waiting for Railway deployment of ${EXPECTED_SHA}"
+          for attempt in $(seq 1 30); do
+            body="$(curl -fsS --max-time 10 "$VERSION_URL" || true)"
+            deployed="$(printf '%s' "$body" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("gitHash") or "")
+except Exception:
+    print("")')"
+            echo "attempt=${attempt} deployed=${deployed:-unavailable}"
+            if [ "$deployed" = "$EXPECTED_SHA" ]; then
+              echo "Railway is running the expected commit."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Railway did not report the expected commit within the deployment window."
+          exit 1
+
+      - name: Verify runner and Firebase runtime state
+        env:
+          STATUS_URL: https://fairwaysniper-production.up.railway.app/api/runtime-status
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 15 "$STATUS_URL" -o runtime-status.json
+          python3 - <<'PY'
+          import json
+          with open('runtime-status.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          required = {
+              'success': True,
+              'firebaseAdminReady': True,
+              'firestoreConnected': True,
+              'agentRunMain': True,
+              'sniperRunnerStarted': True,
+          }
+          failures = [f"{key}={data.get(key)!r}" for key, expected in required.items() if data.get(key) != expected]
+          if failures:
+              raise SystemExit('Runtime smoke failed: ' + ', '.join(failures))
+          print('Runtime smoke passed')
+          print('deployment=', data.get('deployment'))
+          print('brsBrowserStatus=', data.get('brsBrowserStatus'))
+          print('lastRunnerError=', data.get('lastRunnerError'))
+          PY
+
+      - name: Upload runtime snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-runtime-status-${{ github.sha }}
+          path: runtime-status.json
+          if-no-files-found: ignore
