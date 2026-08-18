@@ -5,6 +5,7 @@ import 'package:fairway_sniper/services/firebase_service.dart';
 import 'package:fairway_sniper/widgets/brs_credentials_modal.dart';
 import 'package:fairway_sniper/theme/app_colors.dart';
 import 'package:fairway_sniper/theme/app_spacing.dart';
+import 'package:fairway_sniper/theme.dart';
 
 class ModeSelectionScreen extends StatefulWidget {
   const ModeSelectionScreen({super.key});
@@ -42,14 +43,26 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
   }
 
   void _startNormal() {
-    Navigator.of(context)
-        .push(MaterialPageRoute(builder: (_) => const NewJobWizard()));
-  }
+  Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => Theme(
+        data: darkTheme,
+        child: const NewJobWizard(),
+      ),
+    ),
+  );
+}
 
   void _startSniper() {
-    Navigator.of(context)
-        .push(MaterialPageRoute(builder: (_) => const SniperJobWizard()));
-  }
+  Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => Theme(
+        data: darkTheme,
+        child: const SniperJobWizard(),
+      ),
+    ),
+  );
+}
 
   Future<void> _editSavedCreds() async {
     final uid = _firebaseService.currentUserId;
