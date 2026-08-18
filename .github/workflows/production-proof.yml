@@ -28,6 +28,8 @@ jobs:
         run: node --check index.js
       - name: Syntax check warm-session module
         run: node --check warm_session.js
+      - name: Syntax check one-off safe proof bootstrap
+        run: node --check one-off-create-safe-proof.mjs
       - name: Run safety and readiness contracts
         run: npm run test:safety
 
