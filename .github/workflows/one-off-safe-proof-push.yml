@@ -1,0 +1,195 @@
+name: one-off-safe-prep-proof-push
+
+on:
+  push:
+    branches:
+      - ops/safe-proof-20260818
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  safe-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUNTIME_BASE: https://fairwaysniper-production.up.railway.app
+      EXPECTED_SHA: 3b697daa6b1a141513761fc40f2705c9e9899cfd
+      SOURCE_JOB_ID: IOjhrgHbPR5ZttcgyUXz
+      TARGET_DATE: '2026-08-24'
+      TARGET_TIME: '11:08'
+      FIRE_DELAY_SECONDS: '360'
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+      FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
+      FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialise evidence
+        run: echo 'SAFE PREP PROOF STARTED' > proof-result.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+
+      - name: Check required Firebase Admin secrets
+        run: |
+          if [ -z "$FIREBASE_PROJECT_ID" ] || [ -z "$FIREBASE_CLIENT_EMAIL" ] || [ -z "$FIREBASE_PRIVATE_KEY" ]; then
+            echo 'SAFE PREP PROOF BLOCKED: GitHub Firebase Admin secrets are not configured.' | tee proof-result.txt
+            exit 2
+          fi
+
+      - name: Install agent dependencies without browser postinstall
+        working-directory: agent
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Create and observe real deployed safe proof
+        working-directory: agent
+        run: |
+          node --input-type=module <<'NODE'
+          import admin from 'firebase-admin';
+          import fs from 'node:fs';
+
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+          const base = process.env.RUNTIME_BASE;
+          const expectedSha = process.env.EXPECTED_SHA;
+          const sourceId = process.env.SOURCE_JOB_ID;
+          const targetDate = process.env.TARGET_DATE;
+          const targetTime = process.env.TARGET_TIME;
+          const fireDelayMs = Number(process.env.FIRE_DELAY_SECONDS) * 1000;
+          const out = (line) => { console.log(line); fs.appendFileSync('../proof-result.txt', line + '\n'); };
+
+          const version = await fetch(`${base}/api/version`).then(r => r.json());
+          if (version.gitHash !== expectedSha) throw new Error(`wrong-production-sha:${version.gitHash}`);
+          out(`DEPLOYED_SHA=${version.gitHash}`);
+
+          const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+          admin.initializeApp({credential: admin.credential.cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey,
+          })});
+          const db = admin.firestore();
+          const sourceSnap = await db.collection('jobs').doc(sourceId).get();
+          if (!sourceSnap.exists) throw new Error('source-live-job-not-found');
+          const source = sourceSnap.data() || {};
+          const ownerUid = source.ownerUid || source.owner_uid || null;
+          const partySize = Number(source.party_size ?? source.partySize ?? 1);
+          const players = Array.isArray(source.players) ? source.players : [];
+          if (players.length !== Math.max(0, partySize - 1)) throw new Error('party-player-count-mismatch');
+          if (!ownerUid && !(source.brs_email && source.brs_password)) throw new Error('no-credential-path');
+
+          const fireAt = new Date(Date.now() + fireDelayMs);
+          const [y,m,d] = targetDate.split('-').map(Number);
+          const proof = {
+            ownerUid,
+            mode: 'sniper', status: 'active', state: 'queued',
+            club: source.club || 'galgorm',
+            tz: source.tz || source.timezone || 'Europe/London',
+            release_day: source.release_day || source.releaseDay || 'Wednesday',
+            release_time_local: source.release_time_local || source.releaseTimeLocal || '19:20',
+            target_day: 'Monday', target_date: targetDate,
+            target_play_date: admin.firestore.Timestamp.fromDate(new Date(Date.UTC(y,m-1,d))),
+            preferred_times: [targetTime], players, party_size: partySize,
+            tee: 1, tee_target: 1, tee_mode: source.tee_mode || source.teeMode || 'single', fallback_tee: false,
+            dry_run: true, proof_run: true, proof_label: 'safe_production_proof',
+            proof_template_job_id: sourceId, proof_candidate_date: targetDate,
+            proof_candidate_time: targetTime, proof_candidate_tee: 1, proof_party_size: partySize,
+            proof_fire_delay_ms: fireDelayMs,
+            proof_fire_time_override_utc: admin.firestore.Timestamp.fromDate(fireAt),
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp(),
+          };
+          if (source.brs_email && source.brs_password) {
+            proof.brs_email = source.brs_email;
+            proof.brs_password = source.brs_password;
+          }
+          const proofRef = await db.collection('jobs').add(proof);
+          const jobId = proofRef.id;
+          fs.writeFileSync('../proof-job-id.txt', jobId + '\n');
+          out(`PROOF_JOB_ID=${jobId}`);
+          out(`PROOF_FIRE_AT=${fireAt.toISOString()}`);
+          out(`PROOF_TARGET=${targetDate} ${targetTime} TEE1 DRY_RUN=true PROOF_RUN=true`);
+
+          let readySeen = false, prefireSeen = false, fireSeen = false, badFireAuth = false;
+          let lastStatus = {}, eventTypes = [];
+          const deadline = Date.now() + 9 * 60 * 1000;
+          while (Date.now() < deadline) {
+            try {
+              lastStatus = await fetch(`${base}/api/firestore/jobs/${jobId}/status`).then(r => r.json());
+              const ev = await fetch(`${base}/api/firestore/jobs/${jobId}/events`).then(r => r.json());
+              eventTypes = (ev.events || []).map(e => e.type).filter(Boolean);
+              readySeen ||= eventTypes.includes('READY');
+              prefireSeen ||= eventTypes.includes('PREFIRE_VERIFY_FIRED');
+              fireSeen ||= eventTypes.includes('FIRE_TIMER_FIRED');
+              badFireAuth ||= eventTypes.includes('BRS_NOT_READY_AT_FIRE_TIME');
+              console.log(JSON.stringify({state:lastStatus.state,warm:lastStatus.warmState,auth:lastStatus.brsAuthenticated,untilFire:lastStatus.secondsUntilFire,last:lastStatus.lastAgentEvent,readySeen,prefireSeen,fireSeen,badFireAuth}));
+              if (readySeen && prefireSeen && fireSeen) break;
+            } catch (e) { console.log('poll-error', e.message); }
+            await sleep(5000);
+          }
+
+          // Give the fire callback a moment to record any immediate auth-recovery signal.
+          if (fireSeen) await sleep(8000);
+          try {
+            const ev = await fetch(`${base}/api/firestore/jobs/${jobId}/events`).then(r => r.json());
+            eventTypes = (ev.events || []).map(e => e.type).filter(Boolean);
+            badFireAuth ||= eventTypes.includes('BRS_NOT_READY_AT_FIRE_TIME');
+          } catch {}
+
+          const finalSnap = await db.collection('jobs').doc(jobId).get();
+          const finalJob = finalSnap.data() || {};
+          const bookedTime = finalJob.booked_time || finalJob.bookedTime || null;
+          const evidence = {
+            jobId, deployedSha: version.gitHash, fireAt: fireAt.toISOString(), targetDate, targetTime,
+            readySeen, prefireSeen, fireSeen, badFireAuth,
+            status: finalJob.status || null, state: finalJob.state || null, result: finalJob.result || null,
+            bookedTime, lastAgentEvent: finalJob.last_agent_event || null,
+            lastAgentError: finalJob.last_agent_error || null, eventTypes,
+          };
+          fs.writeFileSync('../proof-final.json', JSON.stringify(evidence, null, 2));
+          out(`READY_SEEN=${readySeen}`);
+          out(`PREFIRE_VERIFY_SEEN=${prefireSeen}`);
+          out(`FIRE_SEEN=${fireSeen}`);
+          out(`BRS_NOT_READY_AT_FIRE_TIME=${badFireAuth}`);
+          out(`BOOKED_TIME=${bookedTime ?? 'null'}`);
+
+          if (finalJob.dry_run !== true || finalJob.proof_run !== true) throw new Error('proof-safety-flags-lost');
+          if (bookedTime) throw new Error('unsafe-proof-created-booking');
+          if (!readySeen) throw new Error('READY-not-observed');
+          if (!prefireSeen) throw new Error('PREFIRE_VERIFY-not-observed');
+          if (!fireSeen) throw new Error('FIRE-not-observed');
+          if (badFireAuth) throw new Error('FIRE-required-auth-recovery');
+          out('SAFE_PREP_PROOF_ACCEPTANCE=PASS');
+          NODE
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-off-safe-prep-proof-evidence
+          path: |
+            proof-result.txt
+            proof-job-id.txt
+            proof-final.json
+          if-no-files-found: ignore
+
+      - name: Report result to PR 12
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status='${{ job.status }}'
+          body="One-off safe PREP proof workflow finished: **${status}**."
+          if [ -f proof-result.txt ]; then
+            body="$body
+
+\`\`\`
+$(tail -n 30 proof-result.txt)
+\`\`\`"
+          fi
+          gh api repos/${{ github.repository }}/issues/12/comments -f body="$body"
