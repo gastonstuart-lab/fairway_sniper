@@ -315,7 +315,7 @@ async function preloadTeeSheet(targetDate, username, password) {
   // loss. The old visible-link heuristic caused PREP to fail before release.
   if (await loginFormVisible(warmPage)) {
     status.authenticated = false;
-    log('tee sheet redirected to login; refreshing login once');
+    log('tee sheet load reached an unauthenticated page; refreshing login once');
     await performLogin(warmPage, DEFAULT_LOGIN_URL, username, password);
     await warmPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     if (await loginFormVisible(warmPage)) {
