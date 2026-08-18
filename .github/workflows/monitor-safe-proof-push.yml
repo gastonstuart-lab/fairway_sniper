@@ -1,0 +1,113 @@
+name: monitor-safe-prep-proof-push
+
+on:
+  push:
+    branches:
+      - ops/monitor-safe-proof-v2
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUNTIME_BASE: https://fairwaysniper-production.up.railway.app
+      EXPECTED_SHA: a98ddd305765efd3b60f8f764301ec48d703b985
+      PROOF_JOB_ID: safe-prep-proof-20260818-v2
+    steps:
+      - name: Monitor deployed proof
+        run: |
+          set -u
+          : > proof-report.txt
+          pass=0
+          for attempt in $(seq 1 170); do
+            version="$(curl -fsS --max-time 10 "$RUNTIME_BASE/api/version" 2>/dev/null || true)"
+            deployed="$(printf '%s' "$version" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("gitHash") or "")
+except Exception: print("")')"
+            echo "DEPLOYED_SHA=${deployed:-unavailable}" | tee -a proof-report.txt
+            if [ "$deployed" != "$EXPECTED_SHA" ]; then sleep 5; continue; fi
+
+            sc="$(curl -sS --max-time 10 -o proof-status.json -w '%{http_code}' "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/status" || true)"
+            ec="$(curl -sS --max-time 10 -o proof-events.json -w '%{http_code}' "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/events" || true)"
+            echo "POLL=$attempt STATUS_HTTP=$sc EVENTS_HTTP=$ec" | tee -a proof-report.txt
+            if [ "$sc" != 200 ] || [ "$ec" != 200 ]; then sleep 5; continue; fi
+
+            python3 - <<'PY' | tee -a proof-report.txt
+          import json
+          s=json.load(open('proof-status.json'))
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          keys=['status','state','dryRun','proofRun','warmState','brsAuthenticated','secondsUntilPrep','secondsUntilFire','fireTimerDriftMs','bookingHotPathDeltaMs','firstBrsActionDeltaMs','result','bookedTime','lastAgentEvent','lastAgentError','errorMessage']
+          print('STATUS='+json.dumps({k:s.get(k) for k in keys}, sort_keys=True))
+          print('EVENTS='+json.dumps(t[-20:]))
+          PY
+
+            if python3 - <<'PY'
+          import json
+          s=json.load(open('proof-status.json'))
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          required=['READY','PREFIRE_VERIFY_FIRED','FIRE_TIMER_FIRED']
+          bad=['BRS_NOT_READY_AT_FIRE_TIME','AUTH_FAILED_AT_FIRE','WARMUP_ERROR_AT_FIRE']
+          ok=(s.get('dryRun') is True and s.get('proofRun') is True and s.get('bookedTime') is None and all(x in t for x in required) and not any(x in t for x in bad))
+          raise SystemExit(0 if ok else 1)
+          PY
+            then
+              sleep 10
+              curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/status" -o proof-status.json
+              curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/events" -o proof-events.json
+              if python3 - <<'PY'
+          import json
+          s=json.load(open('proof-status.json'))
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          required=['READY','PREFIRE_VERIFY_FIRED','FIRE_TIMER_FIRED']
+          bad=['BRS_NOT_READY_AT_FIRE_TIME','AUTH_FAILED_AT_FIRE','WARMUP_ERROR_AT_FIRE']
+          ok=(s.get('dryRun') is True and s.get('proofRun') is True and s.get('bookedTime') is None and all(x in t for x in required) and not any(x in t for x in bad))
+          print('FINAL_STATUS='+json.dumps({k:s.get(k) for k in ['status','state','dryRun','proofRun','warmState','brsAuthenticated','fireTimerDriftMs','bookingHotPathDeltaMs','firstBrsActionDeltaMs','result','bookedTime','lastAgentEvent','lastAgentError','errorMessage']}, sort_keys=True))
+          print('FINAL_EVENTS='+json.dumps(t))
+          print('SAFE_PREP_PROOF_ACCEPTANCE=' + ('PASS' if ok else 'FAIL'))
+          raise SystemExit(0 if ok else 1)
+          PY
+              then pass=1; fi
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$pass" -ne 1 ]; then
+            echo 'SAFE_PREP_PROOF_ACCEPTANCE=FAIL_OR_TIMEOUT' | tee -a proof-report.txt
+            exit 1
+          fi
+          echo 'SAFE_PREP_PROOF_ACCEPTANCE=PASS' | tee -a proof-report.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: safe-prep-proof-push-evidence
+          path: |
+            proof-report.txt
+            proof-status.json
+            proof-events.json
+          if-no-files-found: ignore
+
+      - name: Report to PR 14
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body="Safe PREP proof monitor finished: **${{ job.status }}**."
+          if [ -f proof-report.txt ]; then
+            body="$body
+
+\`\`\`
+$(tail -n 45 proof-report.txt)
+\`\`\`"
+          fi
+          gh api repos/${{ github.repository }}/issues/14/comments -f body="$body"
