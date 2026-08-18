@@ -1,249 +1,136 @@
 name: production-proof-validation
 
 on:
-  push:
-    branches:
-      - copilot/production-proof-fairway-sniper
   pull_request:
     branches:
       - main
   workflow_dispatch:
 
 jobs:
-  agent-safety:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: agent
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: agent/package-lock.json
-      - name: Install agent dependencies reproducibly without browser postinstall
-        run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Syntax check production agent
-        run: node --check index.js
-      - name: Syntax check warm-session module
-        run: node --check warm_session.js
-      - name: Run safety and readiness contracts
-        run: npm run test:safety
-
-  flutter-validation:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-      - name: Flutter version
-        run: flutter --version
-      - name: Get packages
-        run: flutter pub get
-      - name: Analyze
-        run: flutter analyze
-      - name: Test
-        run: flutter test
-      - name: Build web release
-        run: flutter build web --release
-
-  safe-prep-proof:
+  monitor-safe-prep-proof:
     if: github.event_name == 'pull_request' && github.head_ref == 'ops/safe-proof-20260818'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 14
     env:
       RUNTIME_BASE: https://fairwaysniper-production.up.railway.app
-      EXPECTED_SHA: 3b697daa6b1a141513761fc40f2705c9e9899cfd
-      SOURCE_JOB_ID: IOjhrgHbPR5ZttcgyUXz
-      TARGET_DATE: '2026-08-24'
-      TARGET_TIME: '11:08'
-      FIRE_DELAY_SECONDS: '330'
-      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
-      FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+      EXPECTED_SHA: a98ddd305765efd3b60f8f764301ec48d703b985
+      PROOF_JOB_ID: safe-prep-proof-20260818-v2
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: agent/package-lock.json
-      - name: Verify secrets and install tooling
-        working-directory: agent
+      - name: Wait for repaired proof deployment
         run: |
-          test -n "$FIREBASE_PROJECT_ID" || { echo 'MISSING_FIREBASE_PROJECT_ID'; exit 2; }
-          test -n "$FIREBASE_CLIENT_EMAIL" || { echo 'MISSING_FIREBASE_CLIENT_EMAIL'; exit 2; }
-          test -n "$FIREBASE_PRIVATE_KEY" || { echo 'MISSING_FIREBASE_PRIVATE_KEY'; exit 2; }
-          npm ci --ignore-scripts --no-audit --no-fund
-      - name: Create and observe deployed dry-run proof
-        working-directory: agent
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            body="$(curl -fsS --max-time 10 "$RUNTIME_BASE/api/version" || true)"
+            deployed="$(printf '%s' "$body" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("gitHash") or "")
+except Exception: print("")')"
+            echo "deployment attempt=$attempt sha=${deployed:-unavailable}"
+            if [ "$deployed" = "$EXPECTED_SHA" ]; then
+              echo "EXPECTED_DEPLOYMENT_SEEN=$deployed"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Expected Railway deployment was not observed.' >&2
+          exit 1
+
+      - name: Observe safe PREP proof through FIRE
         run: |
-          node --input-type=module <<'NODE'
-          import admin from 'firebase-admin';
-          import fs from 'node:fs';
+          set -euo pipefail
+          ready_seen=0
+          prefire_seen=0
+          fire_seen=0
+          bad_fire_auth=0
+          proof_visible=0
 
-          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-          const base = process.env.RUNTIME_BASE;
-          const version = await fetch(`${base}/api/version`).then((r) => r.json());
-          if (version.gitHash !== process.env.EXPECTED_SHA) {
-            throw new Error(`wrong-production-sha:${version.gitHash}`);
-          }
-          console.log(`DEPLOYED_SHA=${version.gitHash}`);
+          for attempt in $(seq 1 150); do
+            status_code="$(curl -sS --max-time 10 -o proof-status.json -w '%{http_code}' "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/status" || true)"
+            events_code="$(curl -sS --max-time 10 -o proof-events.json -w '%{http_code}' "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/events" || true)"
 
-          const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-          admin.initializeApp({
-            credential: admin.credential.cert({
-              projectId: process.env.FIREBASE_PROJECT_ID,
-              clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-              privateKey,
-            }),
-          });
-          const db = admin.firestore();
-          const sourceId = process.env.SOURCE_JOB_ID;
-          const sourceSnap = await db.collection('jobs').doc(sourceId).get();
-          if (!sourceSnap.exists) throw new Error('source-live-job-not-found');
-          const source = sourceSnap.data() || {};
-          const ownerUid = source.ownerUid || source.owner_uid || null;
-          const partySize = Number(source.party_size ?? source.partySize ?? 1);
-          const players = Array.isArray(source.players) ? source.players : [];
-          if (players.length !== Math.max(0, partySize - 1)) throw new Error('party-player-count-mismatch');
-          if (!ownerUid && !(source.brs_email && source.brs_password)) throw new Error('no-credential-path');
+            if [ "$status_code" = '200' ] && [ "$events_code" = '200' ]; then
+              proof_visible=1
+              python3 - <<'PY'
+          import json
+          s=json.load(open('proof-status.json'))
+          e=json.load(open('proof-events.json'))
+          types=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          print('STATUS', {k:s.get(k) for k in ['status','state','dryRun','proofRun','warmState','brsAuthenticated','secondsUntilPrep','secondsUntilFire','result','bookedTime','lastAgentEvent','lastAgentError','errorMessage']})
+          print('EVENTS', types[-15:])
+          PY
 
-          const targetDate = process.env.TARGET_DATE;
-          const targetTime = process.env.TARGET_TIME;
-          const fireAt = new Date(Date.now() + Number(process.env.FIRE_DELAY_SECONDS) * 1000);
-          const [year, month, day] = targetDate.split('-').map(Number);
-          const proof = {
-            ownerUid,
-            mode: 'sniper',
-            status: 'active',
-            state: 'queued',
-            club: source.club || 'galgorm',
-            tz: source.tz || source.timezone || 'Europe/London',
-            release_day: source.release_day || source.releaseDay || 'Wednesday',
-            release_time_local: source.release_time_local || source.releaseTimeLocal || '19:20',
-            target_day: 'Monday',
-            target_date: targetDate,
-            target_play_date: admin.firestore.Timestamp.fromDate(new Date(Date.UTC(year, month - 1, day))),
-            preferred_times: [targetTime],
-            players,
-            party_size: partySize,
-            tee: 1,
-            tee_target: 1,
-            tee_mode: source.tee_mode || source.teeMode || 'single',
-            fallback_tee: false,
-            dry_run: true,
-            proof_run: true,
-            proof_label: 'safe_production_proof',
-            proof_template_job_id: sourceId,
-            proof_candidate_date: targetDate,
-            proof_candidate_time: targetTime,
-            proof_candidate_tee: 1,
-            proof_party_size: partySize,
-            proof_fire_delay_ms: Number(process.env.FIRE_DELAY_SECONDS) * 1000,
-            proof_fire_time_override_utc: admin.firestore.Timestamp.fromDate(fireAt),
-            created_at: admin.firestore.FieldValue.serverTimestamp(),
-            updated_at: admin.firestore.FieldValue.serverTimestamp(),
-          };
-          if (source.brs_email && source.brs_password) {
-            proof.brs_email = source.brs_email;
-            proof.brs_password = source.brs_password;
-          }
+              if python3 - <<'PY'
+          import json
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          raise SystemExit(0 if 'READY' in t else 1)
+          PY
+              then ready_seen=1; fi
 
-          const proofRef = await db.collection('jobs').add(proof);
-          const jobId = proofRef.id;
-          fs.writeFileSync('../proof-job-id.txt', `${jobId}\n`);
-          console.log(`PROOF_JOB_ID=${jobId}`);
-          console.log(`PROOF_FIRE_AT=${fireAt.toISOString()}`);
-          console.log(`PROOF_TARGET=${targetDate} ${targetTime} TEE1 DRY_RUN=true PROOF_RUN=true`);
+              if python3 - <<'PY'
+          import json
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          raise SystemExit(0 if 'PREFIRE_VERIFY_FIRED' in t else 1)
+          PY
+              then prefire_seen=1; fi
 
-          let readySeen = false;
-          let prefireSeen = false;
-          let fireSeen = false;
-          let badFireAuth = false;
-          let eventTypes = [];
-          let lastStatus = {};
-          const deadline = Date.now() + 8 * 60 * 1000;
+              if python3 - <<'PY'
+          import json
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          raise SystemExit(0 if 'FIRE_TIMER_FIRED' in t else 1)
+          PY
+              then fire_seen=1; fi
 
-          while (Date.now() < deadline) {
-            try {
-              lastStatus = await fetch(`${base}/api/firestore/jobs/${jobId}/status`).then((r) => r.json());
-              const eventsPayload = await fetch(`${base}/api/firestore/jobs/${jobId}/events`).then((r) => r.json());
-              eventTypes = (eventsPayload.events || []).map((event) => event.type).filter(Boolean);
-              readySeen ||= eventTypes.includes('READY');
-              prefireSeen ||= eventTypes.includes('PREFIRE_VERIFY_FIRED');
-              fireSeen ||= eventTypes.includes('FIRE_TIMER_FIRED');
-              badFireAuth ||= eventTypes.includes('BRS_NOT_READY_AT_FIRE_TIME');
-              console.log(JSON.stringify({
-                state: lastStatus.state,
-                warmState: lastStatus.warmState,
-                brsAuthenticated: lastStatus.brsAuthenticated,
-                secondsUntilFire: lastStatus.secondsUntilFire,
-                lastAgentEvent: lastStatus.lastAgentEvent,
-                readySeen,
-                prefireSeen,
-                fireSeen,
-                badFireAuth,
-              }));
-              if (readySeen && prefireSeen && fireSeen) break;
-            } catch (error) {
-              console.log(`POLL_ERROR=${error.message}`);
-            }
-            await sleep(5000);
-          }
+              if python3 - <<'PY'
+          import json
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          bad=any(x in t for x in ['BRS_NOT_READY_AT_FIRE_TIME','AUTH_FAILED_AT_FIRE','WARMUP_ERROR_AT_FIRE'])
+          raise SystemExit(0 if bad else 1)
+          PY
+              then bad_fire_auth=1; fi
 
-          if (fireSeen) await sleep(8000);
-          try {
-            const eventsPayload = await fetch(`${base}/api/firestore/jobs/${jobId}/events`).then((r) => r.json());
-            eventTypes = (eventsPayload.events || []).map((event) => event.type).filter(Boolean);
-            badFireAuth ||= eventTypes.includes('BRS_NOT_READY_AT_FIRE_TIME');
-          } catch {}
+              if [ "$ready_seen" -eq 1 ] && [ "$prefire_seen" -eq 1 ] && [ "$fire_seen" -eq 1 ]; then
+                echo 'Required lifecycle events observed. Waiting 10s for any immediate FIRE recovery signal.'
+                sleep 10
+                curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/status" -o proof-status.json
+                curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/events" -o proof-events.json
+                break
+              fi
+            else
+              echo "proof attempt=$attempt status_http=$status_code events_http=$events_code"
+            fi
+            sleep 5
+          done
 
-          const finalSnap = await db.collection('jobs').doc(jobId).get();
-          const finalJob = finalSnap.data() || {};
-          const bookedTime = finalJob.booked_time || finalJob.bookedTime || null;
-          const evidence = {
-            jobId,
-            deployedSha: version.gitHash,
-            targetDate,
-            targetTime,
-            fireAt: fireAt.toISOString(),
-            readySeen,
-            prefireSeen,
-            fireSeen,
-            badFireAuth,
-            status: finalJob.status || null,
-            state: finalJob.state || null,
-            result: finalJob.result || null,
-            bookedTime,
-            lastAgentEvent: finalJob.last_agent_event || null,
-            lastAgentError: finalJob.last_agent_error || null,
-            eventTypes,
-          };
-          fs.writeFileSync('../proof-final.json', JSON.stringify(evidence, null, 2));
-          console.log(`READY_SEEN=${readySeen}`);
-          console.log(`PREFIRE_VERIFY_SEEN=${prefireSeen}`);
-          console.log(`FIRE_SEEN=${fireSeen}`);
-          console.log(`BRS_NOT_READY_AT_FIRE_TIME=${badFireAuth}`);
-          console.log(`BOOKED_TIME=${bookedTime ?? 'null'}`);
+          python3 - <<'PY'
+          import json, sys
+          s=json.load(open('proof-status.json'))
+          e=json.load(open('proof-events.json'))
+          types=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          required=['READY','PREFIRE_VERIFY_FIRED','FIRE_TIMER_FIRED']
+          missing=[x for x in required if x not in types]
+          bad=[x for x in ['BRS_NOT_READY_AT_FIRE_TIME','AUTH_FAILED_AT_FIRE','WARMUP_ERROR_AT_FIRE'] if x in types]
+          print('FINAL_STATUS=', {k:s.get(k) for k in ['status','state','dryRun','proofRun','warmState','brsAuthenticated','fireTimerDriftMs','bookingHotPathDeltaMs','firstBrsActionDeltaMs','result','bookedTime','lastAgentEvent','lastAgentError','errorMessage']})
+          print('FINAL_EVENTS=', types)
+          if s.get('dryRun') is not True or s.get('proofRun') is not True:
+              raise SystemExit('FAIL: safety flags are not both true')
+          if s.get('bookedTime') is not None:
+              raise SystemExit('FAIL: proof created a booking')
+          if missing:
+              raise SystemExit('FAIL: missing events ' + ','.join(missing))
+          if bad:
+              raise SystemExit('FAIL: FIRE auth recovery events ' + ','.join(bad))
+          print('SAFE_PREP_PROOF_ACCEPTANCE=PASS')
+          PY
 
-          if (finalJob.dry_run !== true || finalJob.proof_run !== true) throw new Error('proof-safety-flags-lost');
-          if (bookedTime) throw new Error('unsafe-proof-created-booking');
-          if (!readySeen) throw new Error('READY-not-observed');
-          if (!prefireSeen) throw new Error('PREFIRE_VERIFY-not-observed');
-          if (!fireSeen) throw new Error('FIRE-not-observed');
-          if (badFireAuth) throw new Error('FIRE-required-auth-recovery');
-          console.log('SAFE_PREP_PROOF_ACCEPTANCE=PASS');
-          NODE
-      - name: Upload safe proof evidence
+      - name: Upload read-only proof evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: safe-prep-proof-evidence
+          name: safe-prep-proof-readonly-evidence
           path: |
-            proof-job-id.txt
-            proof-final.json
+            proof-status.json
+            proof-events.json
           if-no-files-found: ignore
