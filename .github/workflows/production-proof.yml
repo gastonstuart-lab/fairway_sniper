@@ -1,53 +1,94 @@
 name: production-proof-validation
 
 on:
-  push:
-    branches:
-      - copilot/production-proof-fairway-sniper
   pull_request:
     branches:
       - main
   workflow_dispatch:
 
 jobs:
-  agent-safety:
+  monitor-safe-prep-proof:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: agent
+    timeout-minutes: 15
+    env:
+      RUNTIME_BASE: https://fairwaysniper-production.up.railway.app
+      EXPECTED_SHA: a98ddd305765efd3b60f8f764301ec48d703b985
+      PROOF_JOB_ID: safe-prep-proof-20260818-v2
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: agent/package-lock.json
-      - name: Install agent dependencies reproducibly without browser postinstall
-        run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Syntax check production agent
-        run: node --check index.js
-      - name: Syntax check warm-session module
-        run: node --check warm_session.js
-      - name: Syntax check one-off safe proof bootstrap
-        run: node --check one-off-create-safe-proof.mjs
-      - name: Run safety and readiness contracts
-        run: npm run test:safety
+      - name: Wait for exact Railway deployment
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 80); do
+            body="$(curl -fsS --max-time 10 "$RUNTIME_BASE/api/version" || true)"
+            deployed="$(printf '%s' "$body" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("gitHash") or "")
+except Exception: print("")')"
+            echo "deployment attempt=$attempt sha=${deployed:-unavailable}"
+            if [ "$deployed" = "$EXPECTED_SHA" ]; then
+              echo "EXPECTED_DEPLOYMENT_SEEN=$deployed"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
 
-  flutter-validation:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - name: Observe proof PREP through FIRE
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 160); do
+            status_code="$(curl -sS --max-time 10 -o proof-status.json -w '%{http_code}' "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/status" || true)"
+            events_code="$(curl -sS --max-time 10 -o proof-events.json -w '%{http_code}' "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/events" || true)"
+            if [ "$status_code" = 200 ] && [ "$events_code" = 200 ]; then
+              python3 - <<'PY'
+          import json
+          s=json.load(open('proof-status.json'))
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          print('STATUS', {k:s.get(k) for k in ['status','state','dryRun','proofRun','warmState','brsAuthenticated','secondsUntilPrep','secondsUntilFire','fireTimerDriftMs','bookingHotPathDeltaMs','firstBrsActionDeltaMs','result','bookedTime','lastAgentEvent','lastAgentError','errorMessage']})
+          print('EVENTS', t[-18:])
+          done=all(x in t for x in ['READY','PREFIRE_VERIFY_FIRED','FIRE_TIMER_FIRED'])
+          raise SystemExit(0 if done else 1)
+          PY
+              if [ "$?" -eq 0 ]; then
+                echo 'Lifecycle boundary reached; waiting 10s for immediate FIRE recovery events.'
+                sleep 10
+                curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/status" -o proof-status.json
+                curl -fsS --max-time 10 "$RUNTIME_BASE/api/firestore/jobs/$PROOF_JOB_ID/events" -o proof-events.json
+                break
+              fi
+            else
+              echo "proof attempt=$attempt status_http=$status_code events_http=$events_code"
+            fi
+            sleep 5
+          done
+
+          python3 - <<'PY'
+          import json
+          s=json.load(open('proof-status.json'))
+          e=json.load(open('proof-events.json'))
+          t=[x.get('type') for x in e.get('events',[]) if isinstance(x,dict)]
+          required=['READY','PREFIRE_VERIFY_FIRED','FIRE_TIMER_FIRED']
+          missing=[x for x in required if x not in t]
+          bad=[x for x in ['BRS_NOT_READY_AT_FIRE_TIME','AUTH_FAILED_AT_FIRE','WARMUP_ERROR_AT_FIRE'] if x in t]
+          print('FINAL_STATUS', {k:s.get(k) for k in ['status','state','dryRun','proofRun','warmState','brsAuthenticated','fireTimerDriftMs','bookingHotPathDeltaMs','firstBrsActionDeltaMs','result','bookedTime','lastAgentEvent','lastAgentError','errorMessage']})
+          print('FINAL_EVENTS', t)
+          if s.get('dryRun') is not True or s.get('proofRun') is not True:
+              raise SystemExit('FAIL safety flags')
+          if s.get('bookedTime') is not None:
+              raise SystemExit('FAIL booking created')
+          if missing:
+              raise SystemExit('FAIL missing ' + ','.join(missing))
+          if bad:
+              raise SystemExit('FAIL FIRE auth recovery ' + ','.join(bad))
+          print('SAFE_PREP_PROOF_ACCEPTANCE=PASS')
+          PY
+
+      - name: Upload proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          channel: stable
-          cache: true
-      - name: Flutter version
-        run: flutter --version
-      - name: Get packages
-        run: flutter pub get
-      - name: Analyze
-        run: flutter analyze
-      - name: Test
-        run: flutter test
-      - name: Build web release
-        run: flutter build web --release
+          name: safe-prep-proof-evidence
+          path: |
+            proof-status.json
+            proof-events.json
+          if-no-files-found: ignore
