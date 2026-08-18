@@ -14,7 +14,7 @@
     "test:player-directory": "pwsh -NoProfile -File ./test-fetch-player-directory.ps1",
     "test:snipe-check": "pwsh -NoProfile -Command \"$body = @{ username = $env:BRS_USERNAME; password = $env:BRS_PASSWORD; targetDate = (Get-Date).ToString('yyyy-MM-dd'); preferredTimes = @(); players = @(); checkOnly = $true } | ConvertTo-Json; Invoke-RestMethod -Uri 'http://localhost:3000/api/snipe' -Method Post -ContentType 'application/json' -Body $body | ConvertTo-Json -Depth 6\"",
     "test:snipe-preview": "pwsh -NoProfile -Command \"$body = @{ username = $env:BRS_USERNAME; password = $env:BRS_PASSWORD; targetDate = (Get-Date).ToString('yyyy-MM-dd'); preferredTimes = @(); players = @(); previewBooking = $true } | ConvertTo-Json; Invoke-RestMethod -Uri 'http://localhost:3000/api/snipe' -Method Post -ContentType 'application/json' -Body $body | ConvertTo-Json -Depth 6\"",
-    "test:safety": "node --test tests/slot_policy.test.js tests/tee_data_policy.test.js tests/safe_availability.test.js tests/run_log_timing.test.js tests/release_watcher_gate.test.js tests/production_readiness_contract.test.js tests/prebook_boundary.test.js tests/pre_release_warm_auth.test.js",
+    "test:safety": "node --test tests/slot_policy.test.js tests/tee_data_policy.test.js tests/safe_availability.test.js tests/run_log_timing.test.js tests/release_watcher_gate.test.js tests/production_readiness_contract.test.js tests/prebook_boundary.test.js tests/pre_release_warm_auth.test.js tests/live_safe_prep_proof_v4.test.js",
     "validate:tee": "node scripts/validate-tee-scrape.mjs"
   },
   "dependencies": {
